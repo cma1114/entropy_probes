@@ -45,9 +45,28 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
-PAIRED_DATA_PATH = "introspection_paired_data.json"
-DIRECT_ACTIVATIONS_PATH = "introspection_direct_activations.npz"
-META_ACTIVATIONS_PATH = "introspection_meta_activations.npz"
+DATASET_NAME = "SimpleMC"
+
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
+
+
+def get_model_short_name(model_name: str) -> str:
+    """Extract a short, filesystem-safe name from a model path."""
+    if "/" in model_name:
+        parts = model_name.split("/")
+        return parts[-1]
+    return model_name
+
+
+def get_output_prefix() -> str:
+    """Generate output filename prefix based on config."""
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection")
 
 # Experiment config
 NUM_QUESTIONS_TO_TEST = None  # None = use all
@@ -351,7 +370,8 @@ class SteeringHook:
     """Hook that adds a steering vector to activations at a specific layer."""
 
     def __init__(self, steering_vector: torch.Tensor, multiplier: float):
-        self.steering_vector = steering_vector
+        # Ensure normalized so multiplier has consistent meaning across directions
+        self.steering_vector = steering_vector / steering_vector.norm()
         self.multiplier = multiplier
         self.handle = None
 
@@ -1306,9 +1326,17 @@ def print_results_summary(results: Dict, score_stats: Dict):
 def main():
     print(f"Device: {DEVICE}")
 
+    # Generate output prefix
+    output_prefix = get_output_prefix()
+    print(f"Output prefix: {output_prefix}")
+
+    # Compute input/output paths from prefix
+    paired_data_path = f"{output_prefix}_paired_data.json"
+    meta_activations_path = f"{output_prefix}_meta_activations.npz"
+
     # Load paired data
-    print(f"\nLoading paired data from {PAIRED_DATA_PATH}...")
-    with open(PAIRED_DATA_PATH, "r") as f:
+    print(f"\nLoading paired data from {paired_data_path}...")
+    with open(paired_data_path, "r") as f:
         paired_data = json.load(f)
 
     questions = paired_data["questions"]
@@ -1336,7 +1364,7 @@ def main():
 
     # Load activations
     print(f"\nLoading activations...")
-    meta_acts_data = np.load(META_ACTIVATIONS_PATH)
+    meta_acts_data = np.load(meta_activations_path)
 
     if NUM_QUESTIONS_TO_TEST is not None:
         meta_activations = {
@@ -1376,9 +1404,9 @@ def main():
             k: v for k, v in layer_results.items() if k != "directions"
         }
 
-    with open("introspection_direction_results.json", "w") as f:
+    with open(f"{output_prefix}_direction_results.json", "w") as f:
         json.dump(results_to_save, f, indent=2)
-    print("Saved introspection_direction_results.json")
+    print(f"Saved {output_prefix}_direction_results.json")
 
     # Save directions separately (they're large)
     directions_to_save = {
@@ -1386,11 +1414,11 @@ def main():
         for layer_idx in results["layer_results"]
     }
     np.savez_compressed(
-        "introspection_direction_vectors.npz",
+        f"{output_prefix}_direction_vectors.npz",
         **{f"layer_{l}_{d}": np.array(directions_to_save[l][d])
            for l in directions_to_save for d in ["introspection", "entropy", "confidence"]}
     )
-    print("Saved introspection_direction_vectors.npz")
+    print(f"Saved {output_prefix}_direction_vectors.npz")
 
     # Save introspection scores for further analysis
     scores_data = {
@@ -1401,9 +1429,9 @@ def main():
         "meta_responses": meta_responses,
         "score_stats": score_stats,
     }
-    with open("introspection_scores_data.json", "w") as f:
+    with open(f"{output_prefix}_scores_data.json", "w") as f:
         json.dump(scores_data, f, indent=2)
-    print("Saved introspection_scores_data.json")
+    print(f"Saved {output_prefix}_scores_data.json")
 
     # Print summary
     print_results_summary(results, score_stats)
@@ -1415,7 +1443,7 @@ def main():
 
     plot_introspection_analysis(
         results, introspection_scores, direct_entropies, confidence_z_plot, meta_responses,
-        output_prefix="introspection_direction"
+        output_prefix=output_prefix
     )
 
     print("\n✓ Introspection direction analysis complete!")
@@ -1432,6 +1460,7 @@ def main():
         print(f"\nLoading model: {BASE_MODEL_NAME}")
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, token=HF_TOKEN)
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"  # Left-pad for proper batched generation
 
         model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_NAME,
@@ -1475,17 +1504,17 @@ def main():
         steering_analysis = analyze_steering_results(steering_results)
 
         # Save steering results
-        with open("introspection_direction_steering_results.json", "w") as f:
+        with open(f"{output_prefix}_steering_results.json", "w") as f:
             json.dump(steering_results, f, indent=2, default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
-        print("Saved introspection_direction_steering_results.json")
+        print(f"Saved {output_prefix}_steering_results.json")
 
-        with open("introspection_direction_steering_analysis.json", "w") as f:
+        with open(f"{output_prefix}_steering_analysis.json", "w") as f:
             json.dump(steering_analysis, f, indent=2)
-        print("Saved introspection_direction_steering_analysis.json")
+        print(f"Saved {output_prefix}_steering_analysis.json")
 
         # Print and plot steering results
         print_steering_summary(steering_analysis)
-        plot_steering_results(steering_analysis, output_prefix="introspection_direction")
+        plot_steering_results(steering_analysis, output_prefix=output_prefix)
 
         print("\n✓ Steering experiment complete!")
 

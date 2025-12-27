@@ -36,6 +36,10 @@ MAX_PROMPT_LENGTH = 500  # tokens
 CHECKPOINT_INTERVAL = 500  # Save checkpoint every N prompts
 SEED = 42
 
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -44,7 +48,10 @@ torch.manual_seed(SEED)
 def get_output_prefix() -> str:
     """Generate output filename prefix based on config."""
     model_short = get_model_short_name(BASE_MODEL_NAME)
-    return f"{model_short}_nexttoken"
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_nexttoken")
+    return str(OUTPUTS_DIR / f"{model_short}_nexttoken")
 
 
 def load_diverse_texts(num_samples: int) -> List[str]:

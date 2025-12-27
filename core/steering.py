@@ -26,20 +26,27 @@ class SteeringHook:
 
     def __init__(
         self,
-        direction: np.ndarray,
+        direction,
         multiplier: float = 1.0,
         position: str = "last"
     ):
         """
         Args:
-            direction: (hidden_dim,) direction vector to add
+            direction: (hidden_dim,) direction vector to add (will be normalized).
+                       Can be numpy array or torch tensor.
             multiplier: Scalar to multiply direction by
             position: Which token position to steer:
                 - "last": Only the last token
                 - "all": All tokens
                 - int: Specific position index
         """
-        self.direction = torch.tensor(direction, dtype=torch.float32)
+        # Convert to tensor if needed, then normalize
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, dtype=torch.float32)
+        else:
+            direction = direction.float().cpu()
+        # Ensure normalized so multiplier has consistent meaning across directions
+        self.direction = direction / direction.norm()
         self.multiplier = multiplier
         self.position = position
         self._device_set = False
@@ -89,17 +96,22 @@ class AblationHook:
 
     def __init__(
         self,
-        direction: np.ndarray,
+        direction,
         position: str = "last"
     ):
         """
         Args:
-            direction: (hidden_dim,) normalized direction to ablate
+            direction: (hidden_dim,) direction to ablate (will be normalized).
+                       Can be numpy array or torch tensor.
             position: Which token position to ablate ("last", "all", or int)
         """
+        # Convert to tensor if needed, then normalize
+        if isinstance(direction, np.ndarray):
+            direction = torch.tensor(direction, dtype=torch.float32)
+        else:
+            direction = direction.float().cpu()
         # Ensure normalized
-        direction = direction / np.linalg.norm(direction)
-        self.direction = torch.tensor(direction, dtype=torch.float32)
+        self.direction = direction / direction.norm()
         self.position = position
         self._device_set = False
 

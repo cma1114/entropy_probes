@@ -106,6 +106,35 @@ class LinearProbe:
             return float(self.pca.explained_variance_ratio_.sum())
         return None
 
+    def get_direction(self, in_pca_space: bool = False) -> np.ndarray:
+        """
+        Extract the direction vector from a fitted probe.
+
+        The direction indicates what the probe is "looking for" in activation space.
+        For entropy probes, moving along this direction should correspond to
+        changing predicted entropy.
+
+        Args:
+            in_pca_space: If True, return direction in PCA space (if PCA was used).
+                         Otherwise, return in original activation space.
+
+        Returns:
+            Normalized direction vector
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Probe not fitted. Call fit() first.")
+
+        if in_pca_space or self.pca is None:
+            direction = self.probe.coef_.copy()
+        else:
+            # Project back to original space through PCA
+            pca_direction = self.probe.coef_
+            direction = self.pca.inverse_transform(pca_direction.reshape(1, -1)).flatten()
+            # Undo standardization scaling
+            direction = direction / self.scaler.scale_
+
+        return direction / np.linalg.norm(direction)
+
 
 def train_and_evaluate_probe(
     X_train: np.ndarray,

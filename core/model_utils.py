@@ -101,7 +101,9 @@ def load_model_and_tokenizer(
     base_model_name: str,
     adapter_path: Optional[str] = None,
     device_map: str = "auto",
-    torch_dtype: Optional[torch.dtype] = None
+    torch_dtype: Optional[torch.dtype] = None,
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False
 ) -> Tuple:
     """
     Load a model and tokenizer, optionally with a PEFT adapter.
@@ -111,6 +113,8 @@ def load_model_and_tokenizer(
         adapter_path: Optional path to PEFT adapter
         device_map: Device mapping strategy
         torch_dtype: Data type (auto-detected if None)
+        load_in_4bit: Load model in 4-bit quantization (recommended for 70B+ models)
+        load_in_8bit: Load model in 8-bit quantization
 
     Returns:
         Tuple of (model, tokenizer, num_layers)
@@ -120,14 +124,45 @@ def load_model_and_tokenizer(
 
     print(f"Loading model: {base_model_name}")
 
+    # Build quantization config if requested
+    quantization_config = None
+    if load_in_4bit or load_in_8bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            if load_in_4bit:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch_dtype,
+                    bnb_4bit_use_double_quant=True,  # Nested quantization for memory savings
+                    bnb_4bit_quant_type="nf4"  # NormalFloat4 for better quality
+                )
+                print("  Using 4-bit quantization (NF4)")
+            else:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=True  # Allow CPU offload if needed
+                )
+                print("  Using 8-bit quantization (with CPU offload if needed)")
+        except ImportError:
+            print("  Warning: bitsandbytes not installed, falling back to fp16")
+            print("  Install with: pip install bitsandbytes")
+            quantization_config = None
+
     tokenizer = AutoTokenizer.from_pretrained(base_model_name, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Left-pad for proper batched generation
+
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "device_map": device_map,
+        "token": HF_TOKEN
+    }
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        torch_dtype=torch_dtype,
-        device_map=device_map,
-        token=HF_TOKEN
+        **model_kwargs
     )
 
     if adapter_path:

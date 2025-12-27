@@ -19,6 +19,7 @@ Output files:
 import torch
 import numpy as np
 import json
+from pathlib import Path
 from tqdm import tqdm
 from typing import List, Dict, Tuple, Optional
 import matplotlib.pyplot as plt
@@ -37,11 +38,34 @@ load_dotenv()
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-PAIRED_DATA_PATH = "introspection_paired_data.json"
-META_ACTIVATIONS_PATH = "introspection_meta_activations.npz"
-OUTPUT_PREFIX = "introspection"
+BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
+DATASET_NAME = "SimpleMC"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
+
+
+def get_model_short_name(model_name: str) -> str:
+    """Extract a short, filesystem-safe name from a model path."""
+    if "/" in model_name:
+        parts = model_name.split("/")
+        return parts[-1]
+    return model_name
+
+
+def get_output_prefix() -> str:
+    """Generate output filename prefix based on config."""
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection")
+
+
 SEED = 42
 
 # Probe training config
@@ -303,99 +327,130 @@ def plot_results(results: Dict, score_stats: Dict, output_prefix: str):
     """Create visualization of probe results."""
     layers = sorted(results["layer_results"].keys())
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
     # Extract data
     test_r2 = [results["layer_results"][l]["test_r2"] for l in layers]
     null_95th = [results["layer_results"][l]["null_r2_95th"] for l in layers]
     p_values = [results["layer_results"][l]["p_value"] for l in layers]
 
-    # Plot 1: R² with significance threshold
-    ax1 = axes[0, 0]
-    ax1.plot(layers, test_r2, 'o-', label='Test R²', linewidth=2, color='green')
-    ax1.plot(layers, null_95th, '--', color='gray', alpha=0.7, label='95th percentile null')
-    ax1.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-    ax1.set_xlabel('Layer')
-    ax1.set_ylabel('Test R²')
-    ax1.set_title('Introspection Probe Performance\n(Above dashed line = significant at p<0.05)')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3)
-
-    # Plot 2: P-values
-    ax2 = axes[0, 1]
-    p_values_clipped = [max(p, 1e-4) for p in p_values]  # Clip for log scale
-    ax2.semilogy(layers, p_values_clipped, 'o-', linewidth=2, color='green')
-    ax2.axhline(y=0.05, color='red', linestyle='--', label='p=0.05')
-    ax2.axhline(y=0.01, color='orange', linestyle='--', label='p=0.01')
-    ax2.set_xlabel('Layer')
-    ax2.set_ylabel('p-value (log scale)')
-    ax2.set_title('Statistical Significance by Layer')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(1e-4, 1.1)
-
-    # Plot 3: R² vs null distribution for best layer
     best_info = find_best_layers(results)
     best_layer = best_info["layer"]
     best_r2 = best_info["test_r2"]
-
-    ax3 = axes[1, 0]
-    # We don't have the full null distribution saved, so just show the summary
-    null_mean = results["layer_results"][best_layer]["null_r2_mean"]
-    null_std = results["layer_results"][best_layer]["null_r2_std"]
-    null_95 = results["layer_results"][best_layer]["null_r2_95th"]
-
-    ax3.bar(['Observed R²', 'Null mean', 'Null 95th'],
-            [best_r2, null_mean, null_95],
-            color=['green', 'gray', 'red'], alpha=0.7)
-    ax3.set_ylabel('R²')
-    ax3.set_title(f'Best Layer ({best_layer}): Observed vs Null Distribution')
-    ax3.grid(True, alpha=0.3, axis='y')
-
-    # Plot 4: Summary
-    ax4 = axes[1, 1]
-    ax4.axis('off')
-
-    # Count significant layers
     sig_layers = [l for l in layers if results["layer_results"][l]["significant_p05"]]
 
-    summary = f"""
-INTROSPECTION PROBE ANALYSIS
+    # Find first significant layer for shading
+    first_sig = min(sig_layers) if sig_layers else None
 
-Behavioral Statistics:
-  Entropy-Confidence Correlation: {score_stats['correlation_entropy_confidence']:.4f}
-  ({score_stats['correlation_interpretation']})
-  Fraction aligned: {score_stats['fraction_aligned']:.1%}
+    # Create figure with custom layout: 2 plots on top, 1 wide plot + text on bottom
+    fig = plt.figure(figsize=(12, 10))
 
-Probe Results:
-  Best layer: {best_layer}
-  Best R²: {best_r2:.4f}
-  p-value: {best_info['p_value']:.4f}
+    # Top row: two equal plots
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax2 = fig.add_subplot(2, 2, 2)
+    # Bottom row: R² across layers (wider) and summary text
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax4 = fig.add_subplot(2, 2, 4)
 
-  Significant layers (p<0.05): {len(sig_layers)} / {len(layers)}
-  {sig_layers if sig_layers else 'None'}
+    # Plot 1: R² by layer with significance shading
+    ax1.plot(layers, test_r2, 'o-', label='Test R²', linewidth=2, color='green', markersize=4)
+    ax1.plot(layers, null_95th, '--', color='red', alpha=0.7, linewidth=1.5, label='95th pct null')
+    ax1.axhline(y=0, color='black', linestyle='-', alpha=0.3)
 
-Interpretation:
-"""
-    if "warning" in best_info:
-        summary += f"  ⚠ {best_info['warning']}\n"
-        summary += "  The introspection signal may be too weak to detect."
-    elif best_r2 > 0.1:
-        summary += "  ✓ Strong introspection signal detected!\n"
-        summary += "  Model has internal representation of alignment."
-    elif best_r2 > 0.05:
-        summary += "  ⚠ Moderate introspection signal.\n"
-        summary += "  Some alignment information present."
+    # Shade significant region
+    if first_sig is not None:
+        ax1.axvspan(first_sig - 0.5, max(layers) + 0.5, alpha=0.1, color='green',
+                    label=f'Significant (layers {first_sig}+)')
+
+    ax1.set_xlabel('Layer')
+    ax1.set_ylabel('Test R²')
+    ax1.set_title('Probe Performance by Layer')
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot 2: P-values
+    p_values_clipped = [max(p, 1e-4) for p in p_values]
+    ax2.semilogy(layers, p_values_clipped, 'o-', linewidth=2, color='green', markersize=4)
+    ax2.axhline(y=0.05, color='red', linestyle='--', linewidth=1.5, label='p=0.05')
+    ax2.axhline(y=0.01, color='orange', linestyle='--', linewidth=1.5, label='p=0.01')
+    ax2.set_xlabel('Layer')
+    ax2.set_ylabel('p-value (log scale)')
+    ax2.set_title('Statistical Significance')
+    ax2.legend(loc='upper right', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(1e-4, 1.1)
+
+    # Plot 3: Zoomed view of significant layers (or all if none significant)
+    if sig_layers:
+        zoom_layers = [l for l in layers if l >= first_sig - 5]
+        zoom_r2 = [results["layer_results"][l]["test_r2"] for l in zoom_layers]
+        zoom_null = [results["layer_results"][l]["null_r2_95th"] for l in zoom_layers]
     else:
-        summary += "  ✗ Weak introspection signal.\n"
-        summary += "  Little alignment information in activations."
+        zoom_layers = layers
+        zoom_r2 = test_r2
+        zoom_null = null_95th
+
+    ax3.plot(zoom_layers, zoom_r2, 'o-', label='Test R²', linewidth=2, color='green', markersize=5)
+    ax3.plot(zoom_layers, zoom_null, '--', color='red', alpha=0.7, linewidth=1.5, label='95th pct null')
+    ax3.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+
+    # Mark best layer
+    ax3.scatter([best_layer], [best_r2], color='red', s=100, zorder=5,
+                edgecolor='black', linewidth=1.5, label=f'Best: L{best_layer}')
+
+    ax3.set_xlabel('Layer')
+    ax3.set_ylabel('Test R²')
+    title = 'Significant Layers (zoomed)' if sig_layers else 'All Layers'
+    ax3.set_title(title)
+    ax3.legend(loc='best', fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    # Plot 4: Summary text box (constrained width)
+    ax4.axis('off')
+
+    # Build interpretation
+    if "warning" in best_info:
+        interpretation = f"Warning: {best_info['warning']}"
+    elif best_r2 > 0.1:
+        interpretation = "Strong introspection signal detected"
+    elif best_r2 > 0.05:
+        interpretation = "Moderate introspection signal"
+    else:
+        interpretation = "Weak introspection signal"
+
+    # Format significant layers compactly
+    if sig_layers:
+        if len(sig_layers) > 10:
+            sig_str = f"{sig_layers[0]}-{sig_layers[-1]}"
+        else:
+            sig_str = str(sig_layers)
+    else:
+        sig_str = "None"
+
+    summary_lines = [
+        "SUMMARY",
+        "",
+        "Behavioral:",
+        f"  Entropy-Conf corr: {score_stats['correlation_entropy_confidence']:.3f}",
+        f"  Fraction aligned: {score_stats['fraction_aligned']:.1%}",
+        "",
+        "Probe Results:",
+        f"  Best layer: {best_layer}",
+        f"  Best R²: {best_r2:.4f}",
+        f"  p-value: {best_info['p_value']:.4f}",
+        "",
+        f"Significant layers: {len(sig_layers)}/{len(layers)}",
+        f"  {sig_str}",
+        "",
+        f"Interpretation:",
+        f"  {interpretation}",
+    ]
+    summary = "\n".join(summary_lines)
 
     ax4.text(0.05, 0.95, summary, transform=ax4.transAxes, fontsize=10,
              verticalalignment='top', fontfamily='monospace',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5, pad=0.5))
 
     plt.tight_layout()
-    plt.savefig(f"{output_prefix}_probe_results.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_prefix}_probe_results.png", dpi=150, bbox_inches='tight')
     print(f"Saved {output_prefix}_probe_results.png")
     plt.close()
 
@@ -446,9 +501,17 @@ def print_results(results: Dict, score_stats: Dict):
 def main():
     print(f"Device: {DEVICE}")
 
+    # Generate output prefix
+    output_prefix = get_output_prefix()
+    print(f"Output prefix: {output_prefix}")
+
+    # Compute input/output paths from prefix
+    paired_data_path = f"{output_prefix}_paired_data.json"
+    meta_activations_path = f"{output_prefix}_meta_activations.npz"
+
     # Load paired data
-    print(f"\nLoading paired data from {PAIRED_DATA_PATH}...")
-    with open(PAIRED_DATA_PATH, "r") as f:
+    print(f"\nLoading paired data from {paired_data_path}...")
+    with open(paired_data_path, "r") as f:
         paired_data = json.load(f)
 
     direct_entropies = np.array(paired_data["direct_entropies"])
@@ -465,8 +528,8 @@ def main():
     print(f"  Fraction aligned: {score_stats['fraction_aligned']:.1%}")
 
     # Load meta activations
-    print(f"\nLoading meta activations from {META_ACTIVATIONS_PATH}...")
-    meta_acts_data = np.load(META_ACTIVATIONS_PATH)
+    print(f"\nLoading meta activations from {meta_activations_path}...")
+    meta_acts_data = np.load(meta_activations_path)
     meta_activations = {
         int(k.split("_")[1]): meta_acts_data[k]
         for k in meta_acts_data.files if k.startswith("layer_")
@@ -509,7 +572,7 @@ def main():
             return obj.tolist()
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    output_results = f"{OUTPUT_PREFIX}_probe_results.json"
+    output_results = f"{output_prefix}_probe_results.json"
     with open(output_results, "w") as f:
         json.dump(results_to_save, f, indent=2, default=json_serializer)
     print(f"\nSaved {output_results}")
@@ -519,13 +582,13 @@ def main():
     for layer_idx, layer_results in results["layer_results"].items():
         directions[f"layer_{layer_idx}_introspection"] = np.array(layer_results["direction"])
 
-    output_directions = f"{OUTPUT_PREFIX}_probe_directions.npz"
+    output_directions = f"{output_prefix}_probe_directions.npz"
     np.savez_compressed(output_directions, **directions)
     print(f"Saved {output_directions}")
 
     # Print and plot results
     print_results(results, score_stats)
-    plot_results(results, score_stats, OUTPUT_PREFIX)
+    plot_results(results, score_stats, output_prefix)
 
     print("\n✓ Introspection probe analysis complete!")
 

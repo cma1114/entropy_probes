@@ -1,6 +1,6 @@
 # Introspection Experiments
 
-This repository contains tools for studying whether language models can introspect on their own uncertainty. The core question: when a model reports confidence, is it actually accessing internal representations of its own entropy?
+This repository contains tools for studying whether language models can introspect on their own uncertainty. The core question: when a model chooses to answer or delegate/pass, or reports confidence, is it actually accessing internal representations of its own entropy?
 
 ## Quick Start
 
@@ -67,12 +67,22 @@ The core introspection test. For each question:
 python run_introspection_experiment.py
 ```
 
-**Outputs:**
-- `introspection_paired_data.json` - Questions, entropies, confidences
-- `introspection_direct_activations.npz` - Direct prompt activations
-- `introspection_meta_activations.npz` - Meta prompt activations
-- `introspection_probe_results.json` - Probe performance by layer
-- `introspection_results.png` - Visualization
+**Meta-judgment task types:** Configure `META_TASK` at the top of the script:
+
+- `META_TASK = "confidence"` (default) - Explicit confidence rating on S-Z scale (<5% to >90%)
+- `META_TASK = "delegate"` - Answer vs Delegate choice; confidence = P(Answer)
+
+The delegate task asks "Would you answer this yourself or delegate to a teammate who answers 50% correctly?" This operationalizes confidence as the model's willingness to answer rather than an explicit self-report.
+
+When using `META_TASK = "delegate"`, output files include `_delegate` suffix (e.g., `*_introspection_delegate_*`).
+
+**Outputs:** (prefixed with model and dataset, e.g., `Llama-3.1-8B-Instruct_SimpleMC_introspection_`)
+- `*_paired_data.json` - Questions, entropies, confidences
+- `*_direct_activations.npz` - Direct prompt activations
+- `*_meta_activations.npz` - Meta prompt activations
+- `*_probe_results.json` - Probe performance by layer
+- `*_entropy_directions.npz` - Entropy probe directions for steering (per layer)
+- `*_results.png` - Visualization
 
 **Key metrics:**
 - `direct_to_direct R²` - Can we predict entropy from direct activations? (sanity check)
@@ -81,28 +91,49 @@ python run_introspection_experiment.py
 
 For focused transfer analysis with permutation testing, also see `run_introspection_probe.py`.
 
-### 4. Steering/ablation with the entropy direction
+### 4. Steering/ablation with probe directions
 
 **Script:** `run_introspection_steering.py`
 
-Tests whether steering along the entropy direction affects the model's confidence-entropy alignment:
-- Loads probe directions from `run_introspection_probe.py`
+Tests whether steering along a probe direction affects the model's confidence-entropy alignment:
+- Loads probe directions (entropy or introspection score)
 - Adds scaled direction to activations during meta prompts
 - Measures change in alignment (does steering make confidence match entropy better?)
 - Compares to random orthogonal control directions
 
-```bash
-# First, train probes and extract directions
-python run_introspection_probe.py
+**Configuration options:**
 
-# Then run steering experiment
+1. `DIRECTION_TYPE` - Which probe direction to use:
+   - `"entropy"` (default) - Uses entropy probe directions from `run_introspection_experiment.py` (direct activations → entropy). Tests whether the direct→meta transfer direction is causal.
+   - `"introspection"` - Uses introspection score directions from `run_introspection_probe.py` (meta activations → introspection_score). Tests whether the calibration direction is causal.
+
+2. `META_TASK` - Which meta-judgment task to run steering on:
+   - `"confidence"` (default) - Explicit confidence rating on S-Z scale
+   - `"delegate"` - Answer vs Delegate choice; confidence = P(Answer)
+
+   **Important:** `META_TASK` should match the setting used in `run_introspection_experiment.py` to load the correct data files.
+
+```bash
+# Option A: Confidence task with entropy directions
+python run_introspection_experiment.py  # META_TASK = "confidence"
+python run_introspection_steering.py    # META_TASK = "confidence", DIRECTION_TYPE = "entropy"
+
+# Option B: Delegate task with entropy directions
+# In run_introspection_experiment.py, set META_TASK = "delegate"
+python run_introspection_experiment.py
+# In run_introspection_steering.py, set META_TASK = "delegate", DIRECTION_TYPE = "entropy"
 python run_introspection_steering.py
 ```
 
-**Outputs:**
-- `introspection_steering_results.json` - Per-question steering effects
-- `introspection_steering_analysis.json` - Summary statistics
-- `introspection_steering_results.png` - Visualization
+**Outputs:** (prefixed with model and dataset, e.g., `Llama-3.1-8B-Instruct_SimpleMC_introspection_`)
+- `*_steering_entropy_results.json` - Per-question steering effects (entropy direction)
+- `*_steering_entropy_analysis.json` - Summary statistics
+- `*_steering_entropy_results.png` - Visualization
+- `*_ablation_entropy_results.json` - Ablation experiment results
+- `*_ablation_entropy_analysis.json` - Ablation summary
+
+For introspection direction, outputs use `_steering_results.json` (no `_entropy` suffix).
+For delegate task, outputs include `_delegate` in the prefix (e.g., `*_introspection_delegate_steering_entropy_results.json`).
 
 ### 5. Introspection mapping direction (entropy → judgment)
 
@@ -130,16 +161,94 @@ direction = mean(well_calibrated) - mean(miscalibrated)
 python run_contrastive_direction.py
 ```
 
-**Outputs:**
-- `contrastive_direction_results.json` - Statistics and layer analysis
-- `contrastive_directions.npz` - Direction vectors for each layer
-- `contrastive_direction_results.png` - Visualization
+**Outputs:** (prefixed with model and dataset, e.g., `Llama-3.1-8B-Instruct_SimpleMC_contrastive_`)
+- `*_results.json` - Statistics and layer analysis
+- `*_directions.npz` - Direction vectors for each layer
+- `*_results.png` - Visualization
 
 Both approaches are also available in `core/probes.py`:
 - `train_introspection_mapping_probe()` - Regression approach
 - `compute_contrastive_direction()` - Contrastive approach
 
 These give similar directions when the relationship is roughly linear (the regression approach is a softer version of the contrastive approach).
+
+### 6. Direction Analysis and Comparison
+
+**Script:** `analyze_directions.py`
+
+Analyzes and compares probe directions across experiments:
+- Loads all direction files for a model
+- Computes pairwise cosine similarities between direction types
+- Runs logit lens analysis (projects directions through unembedding to see what tokens they point toward)
+- Generates visualizations
+
+```bash
+python analyze_directions.py                    # Auto-detect directions in outputs/
+python analyze_directions.py --layer 15         # Focus on specific layer
+```
+
+**Outputs:**
+- `*_direction_analysis.json` - Full analysis results
+- `*_direction_similarity_layer{N}.png` - Similarity matrix at layer N
+- `*_direction_similarity_across_layers.png` - How similarities evolve across layers
+- `*_logit_lens_{source}_{name}.png` - Token heatmaps across layers
+
+**Direction files saved by probe scripts:**
+
+| Script | Output File | Direction Type |
+|--------|-------------|----------------|
+| `nexttoken_entropy_probe.py` | `*_nexttoken_entropy_directions.npz` | Next-token entropy |
+| `mc_entropy_probe.py` | `*_mc_entropy_directions.npz` | MC answer entropy |
+| `run_introspection_experiment.py` | `*_introspection_entropy_directions.npz` | Direct→entropy probe |
+| `run_contrastive_direction.py` | `*_contrastive_directions.npz` | Contrastive (high/low conf) |
+
+**Logit lens interpretation:**
+For a direction `d` at layer L, the logit lens computes `d @ lm_head.weight.T` to see what tokens the direction "points toward." This helps interpret what the model is representing along that direction.
+
+### 7. Shared vs Unique Direction Transfer Analysis
+
+**Script:** `analyze_shared_unique.py`
+
+Tests whether the model uses a general or domain-specific uncertainty signal when performing meta-judgment. This script:
+1. Loads MC entropy directions from multiple datasets (e.g., SimpleMC, TriviaMC, GPQA)
+2. Decomposes each direction into:
+   - **Shared component:** Average of normalized MC directions (what's common across datasets)
+   - **Unique component:** Residual after projecting out the shared component (dataset-specific)
+3. Trains 1D probes along these directions on direct activations
+4. Tests whether those probes transfer to meta activations
+
+**Key question:** When the model judges its own confidence, is it using:
+- The **shared** uncertainty signal? (general uncertainty representation)
+- The **unique** dataset-specific signal? (domain-specific calibration)
+
+**Prerequisites:**
+```bash
+# Step 1: Run mc_entropy_probe.py on at least 2 datasets
+# (Edit DATASET_NAME in mc_entropy_probe.py for each)
+python mc_entropy_probe.py  # SimpleMC
+python mc_entropy_probe.py  # TriviaMC (change DATASET_NAME)
+python mc_entropy_probe.py  # GPQA (change DATASET_NAME)
+
+# Step 2: Run introspection experiment on the dataset you want to test
+python run_introspection_experiment.py  # With matching DATASET_NAME
+```
+
+**Usage:**
+```bash
+python analyze_shared_unique.py --dataset SimpleMC
+```
+
+**Outputs:**
+- `*_shared_unique_directions.npz` - Decomposed direction vectors (shared + unique per dataset)
+- `*_shared_unique_stats.json` - Decomposition statistics (variance explained, pairwise similarities)
+- `*_{dataset}_shared_unique_transfer.json` - Transfer test results for the specified dataset
+- `*_{dataset}_shared_unique_transfer.png` - Visualization of transfer results
+
+**Key metrics:**
+- **Variance explained by shared:** How much of each MC direction is captured by the shared component
+- **Direct R²:** How well does each direction predict entropy on direct activations
+- **Meta R²:** How well does the probe transfer to meta activations (the introspection test)
+- **Transfer ratio:** Meta R² / Direct R² (1.0 = perfect transfer)
 
 ---
 
@@ -224,7 +333,11 @@ NUM_QUESTIONS = 500
 SEED = 42
 ```
 
-Output files automatically include model/dataset info via `get_run_name()`.
+Output files automatically include model/dataset info. When using a LoRA adapter, set `MODEL_NAME` to the adapter path:
+
+```python
+MODEL_NAME = "path/to/my-adapter"  # Outputs: Llama-3.1-8B-Instruct_adapter-my-adapter_SimpleMC_*
+```
 
 ---
 
@@ -255,22 +368,44 @@ questions = load_question_set("questions_500.json")
 
 ## Typical Workflow
 
+### Quick start (entropy direction steering)
+
+```bash
+# 1. Run introspection experiment (extracts activations, trains probes, saves directions)
+python run_introspection_experiment.py
+
+# 2. Run steering/ablation with entropy directions
+python run_introspection_steering.py  # Uses DIRECTION_TYPE = "entropy" by default
+```
+
+### Full workflow
+
 1. **Run introspection experiment:**
    ```bash
    python run_introspection_experiment.py
    ```
+   This outputs probe results, activations, AND entropy directions.
 
-2. **Train focused probe:**
+2. **Steering with entropy direction:**
    ```bash
-   python run_introspection_probe.py  # Get directions
+   # Set DIRECTION_TYPE = "entropy" in run_introspection_steering.py
+   python run_introspection_steering.py
+   ```
+   Tests if the entropy probe direction is causal for confidence judgments.
+
+3. **(Optional) Train introspection score probe:**
+   ```bash
+   python run_introspection_probe.py
+   ```
+   Trains probe on meta activations → introspection_score with permutation tests.
+
+4. **(Optional) Steering with introspection direction:**
+   ```bash
+   # Set DIRECTION_TYPE = "introspection" in run_introspection_steering.py
+   python run_introspection_steering.py
    ```
 
-3. **Steering experiment:**
-   ```bash
-   python run_introspection_steering.py  # Test intervention
-   ```
-
-4. **Mapping direction analysis:**
+5. **(Optional) Mapping direction analysis:**
    ```bash
    python run_introspection_direction_experiment.py
    # Or: python run_contrastive_direction.py

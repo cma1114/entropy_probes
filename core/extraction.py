@@ -89,24 +89,20 @@ class BatchedExtractor:
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
-        # Get last token index for each item in batch
-        seq_lengths = attention_mask.sum(dim=1)  # (batch_size,)
-
+        # With left-padding, the last position (-1) is always the final real token
         # Extract activations at last token for each batch item
         all_layer_activations = []
         for batch_idx in range(batch_size):
-            last_idx = seq_lengths[batch_idx] - 1
             item_activations = {}
             for layer_idx, acts in self.activations.items():
-                item_activations[layer_idx] = acts[batch_idx, last_idx, :].cpu().numpy()
+                item_activations[layer_idx] = acts[batch_idx, -1, :].cpu().numpy()
             all_layer_activations.append(item_activations)
 
         # Extract logits and compute probabilities for each batch item
         all_probs = []
         all_entropies = []
         for batch_idx in range(batch_size):
-            last_idx = seq_lengths[batch_idx] - 1
-            final_logits = outputs.logits[batch_idx, last_idx, :]
+            final_logits = outputs.logits[batch_idx, -1, :]
             option_logits = final_logits[option_token_ids]
             probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
             entropy = compute_entropy_from_probs(probs)
@@ -179,13 +175,10 @@ def extract_activations_only(
         with torch.no_grad():
             model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
-        # Extract at last token
-        seq_len = attention_mask.sum().item()
-        last_idx = seq_len - 1
-
+        # Extract at last token (position -1 with left-padding)
         result = {}
         for layer_idx, acts in activations.items():
-            result[layer_idx] = acts[0, last_idx, :].cpu().numpy()
+            result[layer_idx] = acts[0, -1, :].cpu().numpy()
 
         return result
 

@@ -3,59 +3,68 @@ Run entropy prediction experiment on multiple-choice questions.
 
 This script:
 1. Loads MC questions from dataset file
-2. Formats them exactly like capabilities_test.py does
-3. Runs them through the model to get probability distributions over answer tokens (A, B, C, D)
-4. Computes entropy from those probabilities
-5. Extracts activations from all layers
-6. Trains linear probes to predict entropy from each layer
+2. Formats them and runs through the model to get probability distributions over answer tokens
+3. Computes entropy from those probabilities
+4. Extracts activations from all layers
+5. Trains linear probes to predict entropy from each layer
+
+Usage:
+    python mc_entropy_probe.py             # Full run
+    python mc_entropy_probe.py --plot-only # Load saved activations, retrain probes, plot
 """
 
+import argparse
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import json
 from pathlib import Path
 from tqdm import tqdm
 from typing import List, Dict, Tuple
 import matplotlib.pyplot as plt
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-import os
-from dotenv import load_dotenv
+from joblib import Parallel, delayed
 import random
 
-load_dotenv()
-HF_TOKEN = os.environ.get("HF_TOKEN")
+from core import (
+    DEVICE,
+    load_model_and_tokenizer,
+    get_model_short_name,
+    LinearProbe,
+    compute_entropy_from_probs,
+)
 
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
-DATASET_NAME = "SimpleMC"  # Dataset to load: SimpleMC, MMLU, GPQA, etc.
-NUM_QUESTIONS = 500
+MODEL_NAME = BASE_MODEL_NAME  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###
+DATASET_NAME = "SimpleMC"
+NUM_QUESTIONS = 447 if DATASET_NAME.startswith("GP") else 500
 MAX_PROMPT_LENGTH = 2000  # Multiple choice prompts can be longer
-DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 SEED = 42
 
-
-def get_output_prefix() -> str:
-    """Generate output filename prefix based on config."""
-    model_short = MODEL_NAME.split("/")[-1]
-    return f"{model_short}_{DATASET_NAME}_mc"
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
 
 # Probe training config
 TRAIN_SPLIT = 0.8
-PROBE_ALPHA = 1000.0  # Ridge regression regularization
+PROBE_ALPHA = 1000.0
 USE_PCA = True
 PCA_COMPONENTS = 100
+N_BOOTSTRAP = 100  # Number of bootstrap iterations for confidence intervals
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# MC setup prompt (from capabilities_test.py)
+# MC setup prompt
 MC_SETUP_PROMPT = "I'm going to ask you a series of multiple-choice questions. For each one, select the answer you think is best. Respond only with the letter of your choice; do NOT output any other text."
+
+
+def get_output_prefix() -> str:
+    """Generate output filename prefix based on config."""
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_mc")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_mc")
 
 
 def load_questions(dataset_name: str, num_questions: int = None) -> List[Dict]:
@@ -71,16 +80,7 @@ def load_questions(dataset_name: str, num_questions: int = None) -> List[Dict]:
 
 
 def _present_question(question_data: Dict) -> str:
-    """
-    Format a question for display exactly as base_game_class.py does.
-
-    Args:
-        question_data: Dict with 'question' and 'options' keys
-                      options must be a dict {A: opt1, B: opt2, ...}
-
-    Returns:
-        Formatted question string
-    """
+    """Format a question for display."""
     formatted_question = ""
     formatted_question += "-" * 30 + "\n"
     formatted_question += "Question:\n"
@@ -95,18 +95,14 @@ def _present_question(question_data: Dict) -> str:
     return formatted_question
 
 
-def format_mc_question(question: Dict) -> Tuple[str, List[str]]:
+def format_mc_prompt(question: Dict, tokenizer) -> Tuple[str, List[str], List[int]]:
     """
-    Format a multiple-choice question exactly as capabilities_test.py does.
-
-    Args:
-        question: Dict with 'question' and 'options' keys
-                  options must be a dict {A: opt1, B: opt2, ...}
+    Format a multiple-choice question and get option token IDs.
 
     Returns:
-        Tuple of (formatted_prompt, option_keys)
+        Tuple of (full_prompt, option_keys, option_token_ids)
     """
-    # Get the formatted question text (what would be shown to user)
+    # Get the formatted question text
     q_text = _present_question(question)
 
     # Get option keys from the question
@@ -121,260 +117,187 @@ def format_mc_question(question: Dict) -> Tuple[str, List[str]]:
 
     llm_prompt = q_text + f"\nYour choice ({options_str}): "
 
-    return llm_prompt, options
-
-
-def compute_entropy_from_probs(probs: List[float]) -> float:
-    """
-    Compute entropy from a probability distribution.
-
-    Args:
-        probs: List of probabilities
-
-    Returns:
-        Entropy value (float)
-    """
-    probs = np.array(probs)
-    # Normalize to sum to 1
-    probs = probs / probs.sum()
-    # Filter out zero probabilities to avoid log(0)
-    probs = probs[probs > 0]
-    entropy = -(probs * np.log(probs)).sum()
-    return float(entropy)
-
-
-def get_answer_option_probs(
-    model,
-    tokenizer,
-    full_prompt: str,
-    option_keys: List[str]
-) -> List[float]:
-    """
-    Get probability distribution over answer option tokens (A, B, C, D, etc.).
-
-    Args:
-        model: The language model
-        tokenizer: The tokenizer
-        full_prompt: The full formatted prompt (setup + question + options + "Your choice (A, B, C, or D): ")
-        option_keys: List of option letters (e.g., ['A', 'B', 'C', 'D'])
-
-    Returns:
-        List of probabilities for each option
-    """
     # Apply chat template
     messages = [
         {"role": "system", "content": MC_SETUP_PROMPT},
-        {"role": "user", "content": full_prompt}
+        {"role": "user", "content": llm_prompt}
     ]
-    prompt = tokenizer.apply_chat_template(
+    full_prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    # Tokenize
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(DEVICE)
-
-    # Forward pass
-    with torch.no_grad():
-        outputs = model(**inputs, use_cache=False)
-
-    # Get logits at last position
-    final_logits = outputs.logits[0, -1, :]  # [vocab_size]
-
     # Get token IDs for answer options
-    option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in option_keys]
+    option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in options]
 
-    # Extract logits for these tokens
-    option_logits = final_logits[option_token_ids]
-
-    # Convert to probabilities
-    option_probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
-
-    return option_probs.tolist()
+    return full_prompt, options, option_token_ids
 
 
-def build_dataset_with_entropies(
+def extract_mc_activations_and_entropy(
     questions: List[Dict],
     model,
-    tokenizer
-) -> List[Dict]:
-    """
-    Process all questions: format them, get probabilities, compute entropies.
-
-    Returns:
-        List of dicts with 'prompt', 'entropy', 'probabilities', etc.
-    """
-    print(f"Processing {len(questions)} questions to compute entropies...")
-
-    dataset = []
-
-    for i, question in enumerate(tqdm(questions)):
-        # Format question
-        full_question, option_keys = format_mc_question(question)
-
-        # Get probabilities over answer options
-        probs = get_answer_option_probs(model, tokenizer, full_question, option_keys)
-
-        # Compute entropy
-        entropy = compute_entropy_from_probs(probs)
-
-        # Create full prompt for activation extraction (setup + question)
-        messages = [
-            {"role": "system", "content": MC_SETUP_PROMPT},
-            {"role": "user", "content": full_question}
-        ]
-        full_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-
-        dataset.append({
-            "prompt": full_prompt,
-            "entropy": entropy,
-            "probabilities": probs,
-            "question_id": i,
-            "question": question.get("question", ""),
-            "correct_answer": question.get("correct_answer", ""),
-            "options": option_keys
-        })
-
-        # Clear memory periodically
-        if (i + 1) % 100 == 0:
-            torch.cuda.empty_cache()
-
-    print(f"Processed {len(dataset)} questions")
-
-    # Print entropy statistics
-    entropies = [d["entropy"] for d in dataset]
-    print(f"  Entropy range: [{min(entropies):.3f}, {max(entropies):.3f}]")
-    print(f"  Entropy mean: {np.mean(entropies):.3f}")
-    print(f"  Entropy std: {np.std(entropies):.3f}")
-
-    return dataset
-
-
-class ActivationExtractor:
-    """Extract activations from all layers of a model."""
-
-    def __init__(self, model, num_layers: int):
-        self.model = model
-        self.num_layers = num_layers
-        self.activations = {}
-        self.hooks = []
-
-    def _make_hook(self, layer_idx: int):
-        """Create a hook function for a specific layer."""
-        def hook(module, input, output):
-            # Store the output (residual stream after this layer)
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-            else:
-                hidden_states = output
-            self.activations[layer_idx] = hidden_states.detach()
-        return hook
-
-    def register_hooks(self):
-        """Register forward hooks on all layers."""
-        # Handle both regular and PEFT models
-        if hasattr(self.model, 'get_base_model'):
-            # PEFT model - use get_base_model()
-            base = self.model.get_base_model()
-            layers = base.model.layers
-        else:
-            # Regular model
-            layers = self.model.model.layers
-
-        for i, layer in enumerate(layers):
-            hook = self._make_hook(i)
-            handle = layer.register_forward_hook(hook)
-            self.hooks.append(handle)
-
-    def remove_hooks(self):
-        """Remove all registered hooks."""
-        for handle in self.hooks:
-            handle.remove()
-        self.hooks = []
-
-    def extract(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[int, torch.Tensor]:
-        """
-        Extract activations from all layers for a single input.
-
-        Returns:
-            Dict mapping layer_idx -> activation tensor at last token position
-        """
-        self.activations = {}
-
-        with torch.no_grad():
-            _ = self.model(input_ids=input_ids, attention_mask=attention_mask)
-
-        # Extract last token position activations from each layer
-        last_token_idx = attention_mask.sum() - 1
-        layer_activations = {}
-
-        for layer_idx, acts in self.activations.items():
-            # acts shape: (batch_size=1, seq_len, hidden_dim)
-            last_token_act = acts[0, last_token_idx, :].cpu().numpy()
-            layer_activations[layer_idx] = last_token_act
-
-        return layer_activations
-
-
-def extract_all_activations(
-    dataset: List[Dict],
-    model,
     tokenizer,
-    num_layers: int
-) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+    num_layers: int,
+    batch_size: int = 8
+) -> Tuple[Dict[int, np.ndarray], np.ndarray, List[Dict]]:
     """
-    Extract activations from all layers for all prompts in dataset.
+    Extract activations and compute entropy in a single forward pass per question.
+
+    Args:
+        questions: List of question dicts
+        model: The model
+        tokenizer: The tokenizer
+        num_layers: Number of layers
+        batch_size: Batch size for forward passes (default 8, reduce for large models)
 
     Returns:
-        activations: Dict mapping layer_idx -> array of shape (num_prompts, hidden_dim)
-        entropies: Array of shape (num_prompts,)
+        activations: Dict mapping layer_idx -> array of shape (num_questions, hidden_dim)
+        entropies: Array of shape (num_questions,)
+        metadata: List of dicts with question info, probabilities, etc.
     """
-    print(f"Extracting activations from {num_layers} layers for {len(dataset)} prompts...")
-
-    extractor = ActivationExtractor(model, num_layers)
-    extractor.register_hooks()
+    print(f"Processing {len(questions)} questions with batch_size={batch_size}...")
 
     # Initialize storage
     all_layer_activations = {i: [] for i in range(num_layers)}
     all_entropies = []
+    metadata = []
+
+    # Set up hooks for activation extraction
+    # Key optimization: store only last-token activations per batch item
+    activations_cache = {}
+    current_last_indices = None  # Will be set per batch
+    hooks = []
+
+    def make_hook(layer_idx):
+        def hook(module, input, output):
+            nonlocal current_last_indices
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+            # Extract only last-token activations for each batch item
+            # current_last_indices: (batch_size,) tensor of last token positions
+            batch_size_actual = hidden_states.shape[0]
+            # Use advanced indexing to get last token for each batch item
+            last_token_acts = hidden_states[
+                torch.arange(batch_size_actual, device=hidden_states.device),
+                current_last_indices[:batch_size_actual]
+            ]  # Shape: (batch_size, hidden_dim)
+            activations_cache[layer_idx] = last_token_acts.detach()
+        return hook
+
+    # Get layers
+    if hasattr(model, 'get_base_model'):
+        base = model.get_base_model()
+        layers = base.model.layers
+    else:
+        layers = model.model.layers
+
+    # Register hooks
+    for i, layer in enumerate(layers):
+        handle = layer.register_forward_hook(make_hook(i))
+        hooks.append(handle)
 
     model.eval()
 
-    try:
-        for item in tqdm(dataset):
-            prompt = item["prompt"]
-            entropy = item["entropy"]
+    # Pre-format all prompts
+    print("Formatting prompts...")
+    formatted_data = []
+    for question in questions:
+        full_prompt, options, option_token_ids = format_mc_prompt(question, tokenizer)
+        formatted_data.append({
+            "prompt": full_prompt,
+            "options": options,
+            "option_token_ids": option_token_ids,
+            "question": question
+        })
 
-            # Tokenize
+    try:
+        # Process in batches
+        for batch_start in tqdm(range(0, len(formatted_data), batch_size)):
+            batch_end = min(batch_start + batch_size, len(formatted_data))
+            batch_items = formatted_data[batch_start:batch_end]
+            batch_prompts = [item["prompt"] for item in batch_items]
+
+            # Tokenize batch with padding
             inputs = tokenizer(
-                prompt,
+                batch_prompts,
                 return_tensors="pt",
                 truncation=True,
-                max_length=MAX_PROMPT_LENGTH
+                max_length=MAX_PROMPT_LENGTH,
+                padding=True  # Pad to longest in batch
             )
             input_ids = inputs["input_ids"].to(DEVICE)
             attention_mask = inputs["attention_mask"].to(DEVICE)
 
-            # Extract activations
-            layer_acts = extractor.extract(input_ids, attention_mask)
+            # Compute last token indices
+            # With left-padding, the last real token is always at the end of the sequence
+            # So the last token index is simply seq_len - 1 for all items in the batch
+            seq_len = input_ids.shape[1]
+            current_last_indices = torch.full(
+                (input_ids.shape[0],), seq_len - 1, device=input_ids.device, dtype=torch.long
+            )
 
-            # Store
-            for layer_idx, act in layer_acts.items():
-                all_layer_activations[layer_idx].append(act)
-            all_entropies.append(entropy)
+            # Clear cache
+            activations_cache.clear()
+
+            # Forward pass
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+
+            # Single CPU transfer: stack all layers and transfer at once
+            # activations_cache[layer_idx] is (batch_size, hidden_dim)
+            stacked = torch.stack([activations_cache[i] for i in range(num_layers)], dim=0)
+            # stacked shape: (num_layers, batch_size, hidden_dim)
+            stacked_cpu = stacked.cpu().numpy()
+
+            # Distribute to per-layer storage
+            for layer_idx in range(num_layers):
+                # stacked_cpu[layer_idx] is (batch_size, hidden_dim)
+                for batch_item_idx in range(len(batch_items)):
+                    all_layer_activations[layer_idx].append(stacked_cpu[layer_idx, batch_item_idx])
+
+            # Compute entropy for each item in batch
+            for batch_item_idx, item in enumerate(batch_items):
+                option_token_ids = item["option_token_ids"]
+                options = item["options"]
+                question = item["question"]
+
+                # Get logits at last token position for this batch item
+                last_idx = current_last_indices[batch_item_idx].item()
+                final_logits = outputs.logits[batch_item_idx, last_idx, :]
+                option_logits = final_logits[option_token_ids]
+                probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
+                entropy = compute_entropy_from_probs(probs)
+
+                # Compute accuracy
+                predicted_idx = np.argmax(probs)
+                predicted_answer = options[predicted_idx]
+                correct_answer = question.get("correct_answer", "")
+                is_correct = predicted_answer == correct_answer
+
+                all_entropies.append(entropy)
+                metadata.append({
+                    "question_id": batch_start + batch_item_idx,
+                    "question": question.get("question", ""),
+                    "correct_answer": correct_answer,
+                    "predicted_answer": predicted_answer,
+                    "is_correct": is_correct,
+                    "options": options,
+                    "probabilities": probs.tolist(),
+                    "entropy": entropy,
+                })
 
             # Clear memory
-            del inputs, input_ids, attention_mask
-            if len(all_entropies) % 100 == 0:
+            del inputs, input_ids, attention_mask, outputs, stacked, stacked_cpu
+            if (batch_start + batch_size) % 100 == 0:
                 torch.cuda.empty_cache()
 
     finally:
-        extractor.remove_hooks()
+        # Remove hooks
+        for handle in hooks:
+            handle.remove()
 
     # Convert to numpy arrays
     activations = {
@@ -383,101 +306,131 @@ def extract_all_activations(
     }
     entropies = np.array(all_entropies)
 
+    # Compute accuracy statistics
+    correct_count = sum(1 for m in metadata if m["is_correct"])
+    accuracy = correct_count / len(metadata)
+
     print(f"Extracted activations shape (per layer): {activations[0].shape}")
-    print(f"Entropies shape: {entropies.shape}")
+    print(f"Entropy range: [{entropies.min():.3f}, {entropies.max():.3f}]")
+    print(f"Entropy mean: {entropies.mean():.3f}, std: {entropies.std():.3f}")
+    print(f"Accuracy: {accuracy:.2%} ({correct_count}/{len(metadata)})")
 
-    return activations, entropies
+    return activations, entropies, metadata
 
 
-def train_probe(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray
-) -> Dict:
+def _train_probe_for_layer(
+    layer_idx: int,
+    X: np.ndarray,
+    entropies: np.ndarray,
+    n_bootstrap: int,
+    train_split: float,
+    seed: int,
+    use_pca: bool,
+    pca_components: int,
+    alpha: float
+) -> Tuple[int, Dict, np.ndarray]:
+    """Train probe for a single layer with bootstrap. Used for parallel execution.
+
+    Returns (layer_idx, results_dict, direction_vector).
+    Direction is extracted from a final probe trained on full training set.
     """
-    Train a linear probe to predict entropy from activations.
+    rng = np.random.RandomState(seed + layer_idx)
+    n = len(entropies)
 
-    Returns:
-        Dict with metrics: r2, mae, predictions
-    """
-    # Standardize features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    test_r2s = []
+    test_maes = []
 
-    # Apply PCA if enabled
-    if USE_PCA:
-        n_components = min(PCA_COMPONENTS, X_train.shape[0], X_train.shape[1])
-        pca = PCA(n_components=n_components)
-        X_train_reduced = pca.fit_transform(X_train_scaled)
-        X_test_reduced = pca.transform(X_test_scaled)
-
-        # Use reduced features
-        X_train_final = X_train_reduced
-        X_test_final = X_test_reduced
-    else:
-        X_train_final = X_train_scaled
-        X_test_final = X_test_scaled
-
-    # Train Ridge regression probe
-    probe = Ridge(alpha=PROBE_ALPHA)
-    probe.fit(X_train_final, y_train)
-
-    # Evaluate
-    y_pred_train = probe.predict(X_train_final)
-    y_pred_test = probe.predict(X_test_final)
-
-    train_r2 = r2_score(y_train, y_pred_train)
-    test_r2 = r2_score(y_test, y_pred_test)
-    train_mae = mean_absolute_error(y_train, y_pred_train)
-    test_mae = mean_absolute_error(y_test, y_pred_test)
-
-    return {
-        "train_r2": train_r2,
-        "test_r2": test_r2,
-        "train_mae": train_mae,
-        "test_mae": test_mae,
-        "predictions": y_pred_test,
-        "probe": probe,
-        "pca_variance_explained": pca.explained_variance_ratio_.sum() if USE_PCA else None
-    }
-
-
-def run_all_probes(
-    activations: Dict[int, np.ndarray],
-    entropies: np.ndarray
-) -> Dict[int, Dict]:
-    """
-    Train probes for all layers.
-
-    Returns:
-        Dict mapping layer_idx -> probe results
-    """
-    print(f"\nTraining probes for {len(activations)} layers...")
-
-    # Split data
-    indices = np.arange(len(entropies))
-    train_idx, test_idx = train_test_split(
-        indices,
-        train_size=TRAIN_SPLIT,
-        random_state=SEED
-    )
-
-    results = {}
-
-    for layer_idx in tqdm(sorted(activations.keys())):
-        X = activations[layer_idx]
+    # Bootstrap for confidence intervals
+    for _ in range(n_bootstrap):
+        # Random split
+        indices = np.arange(n)
+        rng.shuffle(indices)
+        split_idx = int(n * train_split)
+        train_idx = indices[:split_idx]
+        test_idx = indices[split_idx:]
 
         X_train = X[train_idx]
         X_test = X[test_idx]
         y_train = entropies[train_idx]
         y_test = entropies[test_idx]
 
-        probe_results = train_probe(X_train, y_train, X_test, y_test)
-        results[layer_idx] = probe_results
+        # Train probe
+        probe = LinearProbe(
+            alpha=alpha,
+            use_pca=use_pca,
+            pca_components=pca_components
+        )
+        probe.fit(X_train, y_train)
 
-    return results
+        # Evaluate
+        test_eval = probe.evaluate(X_test, y_test)
+        test_r2s.append(test_eval["r2"])
+        test_maes.append(test_eval["mae"])
+
+    # Train final probe on canonical split for direction extraction
+    rng_final = np.random.RandomState(seed)  # Same seed across layers for consistent split
+    indices = np.arange(n)
+    rng_final.shuffle(indices)
+    split_idx = int(n * train_split)
+    train_idx = indices[:split_idx]
+
+    final_probe = LinearProbe(
+        alpha=alpha,
+        use_pca=use_pca,
+        pca_components=pca_components
+    )
+    final_probe.fit(X[train_idx], entropies[train_idx])
+    direction = final_probe.get_direction()  # Always in original space
+
+    return layer_idx, {
+        "test_r2_mean": float(np.mean(test_r2s)),
+        "test_r2_std": float(np.std(test_r2s)),
+        "test_mae_mean": float(np.mean(test_maes)),
+        "test_mae_std": float(np.std(test_maes)),
+    }, direction
+
+
+def run_all_probes(
+    activations: Dict[int, np.ndarray],
+    entropies: np.ndarray,
+    n_jobs: int = -1,
+    use_pca: bool = USE_PCA,
+    pca_components: int = PCA_COMPONENTS,
+    alpha: float = PROBE_ALPHA
+) -> Tuple[Dict[int, Dict], Dict[int, np.ndarray]]:
+    """Train probes for all layers with bootstrap confidence intervals.
+
+    Returns:
+        results: Dict mapping layer index to result dict with R², MAE stats
+        directions: Dict mapping layer index to normalized direction vectors (in original space)
+    """
+    pca_str = f"PCA={pca_components}" if use_pca else "no PCA"
+    print(f"\nTraining probes for {len(activations)} layers "
+          f"({N_BOOTSTRAP} bootstrap iterations, {pca_str}, parallel across layers)...")
+
+    layer_indices = sorted(activations.keys())
+
+    # Run in parallel across layers
+    results_list = Parallel(n_jobs=n_jobs, verbose=10)(
+        delayed(_train_probe_for_layer)(
+            layer_idx,
+            activations[layer_idx],
+            entropies,
+            N_BOOTSTRAP,
+            TRAIN_SPLIT,
+            SEED,
+            use_pca,
+            pca_components,
+            alpha
+        )
+        for layer_idx in layer_indices
+    )
+
+    # Convert list of (layer_idx, result, direction) tuples to dicts
+    results = {layer_idx: result for layer_idx, result, _ in results_list}
+    directions = {layer_idx: direction for layer_idx, _, direction in results_list}
+
+    return results, directions
 
 
 def print_results(results: Dict[int, Dict]):
@@ -485,55 +438,132 @@ def print_results(results: Dict[int, Dict]):
     print("\n" + "="*80)
     print("RESULTS SUMMARY")
     print("="*80)
-    print(f"{'Layer':<8} {'Train R²':<12} {'Test R²':<12} {'Train MAE':<12} {'Test MAE':<12}")
+    print(f"{'Layer':<8} {'Test R²':<20} {'Test MAE':<20}")
     print("-"*80)
 
     for layer_idx in sorted(results.keys()):
         res = results[layer_idx]
-        print(f"{layer_idx:<8} {res['train_r2']:<12.4f} {res['test_r2']:<12.4f} "
-              f"{res['train_mae']:<12.4f} {res['test_mae']:<12.4f}")
+        r2_str = f"{res['test_r2_mean']:.4f} ± {res['test_r2_std']:.4f}"
+        mae_str = f"{res['test_mae_mean']:.4f} ± {res['test_mae_std']:.4f}"
+        print(f"{layer_idx:<8} {r2_str:<20} {mae_str:<20}")
 
     print("="*80)
 
     # Find best layer
-    best_layer = max(results.keys(), key=lambda l: results[l]["test_r2"])
-    best_r2 = results[best_layer]["test_r2"]
-    print(f"\nBest layer: {best_layer} (Test R² = {best_r2:.4f})")
-
-    # Check when it first becomes "good" (e.g., R² > 0.5)
-    good_threshold = 0.5
-    for layer_idx in sorted(results.keys()):
-        if results[layer_idx]["test_r2"] > good_threshold:
-            print(f"First layer with R² > {good_threshold}: {layer_idx} (R² = {results[layer_idx]['test_r2']:.4f})")
-            break
+    best_layer = max(results.keys(), key=lambda l: results[l]["test_r2_mean"])
+    best_r2 = results[best_layer]["test_r2_mean"]
+    best_std = results[best_layer]["test_r2_std"]
+    print(f"\nBest layer: {best_layer} (Test R² = {best_r2:.4f} ± {best_std:.4f})")
 
 
-def plot_results(results: Dict[int, Dict], output_path: str):
-    """Plot R² across layers."""
-    layers = sorted(results.keys())
-    train_r2 = [results[l]["train_r2"] for l in layers]
-    test_r2 = [results[l]["test_r2"] for l in layers]
-    train_mae = [results[l]["train_mae"] for l in layers]
-    test_mae = [results[l]["test_mae"] for l in layers]
+def plot_entropy_distribution(
+    entropies: np.ndarray,
+    metadata: List[Dict],
+    output_path: Path
+):
+    """Plot entropy distribution with accuracy breakdown."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    # R² plot
-    ax1.plot(layers, train_r2, 'o-', label='Train R²', alpha=0.7)
-    ax1.plot(layers, test_r2, 'o-', label='Test R²', alpha=0.7)
-    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='R² = 0.5')
-    ax1.set_xlabel('Layer Index')
-    ax1.set_ylabel('R² Score')
-    ax1.set_title('Entropy Predictability by Layer (Multiple Choice)')
+    # 1. Overall entropy histogram (percentage)
+    ax1 = axes[0]
+    ax1.hist(entropies, bins=30, edgecolor='black', alpha=0.7, weights=np.ones(len(entropies)) / len(entropies) * 100)
+    ax1.axvline(entropies.mean(), color='red', linestyle='--', label=f'Mean: {entropies.mean():.3f}')
+    ax1.axvline(np.median(entropies), color='orange', linestyle='--', label=f'Median: {np.median(entropies):.3f}')
+    ax1.set_xlabel('Entropy')
+    ax1.set_ylabel('Percentage')
+    ax1.set_title(f'MC Entropy Distribution (n={len(entropies)})')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # MAE plot
-    ax2.plot(layers, train_mae, 'o-', label='Train MAE', alpha=0.7)
-    ax2.plot(layers, test_mae, 'o-', label='Test MAE', alpha=0.7)
+    # 2. Entropy by correctness (percentage within each group)
+    ax2 = axes[1]
+    correct_entropies = [m["entropy"] for m in metadata if m["is_correct"]]
+    incorrect_entropies = [m["entropy"] for m in metadata if not m["is_correct"]]
+
+    if correct_entropies:
+        ax2.hist(correct_entropies, bins=20, alpha=0.6, label=f'Correct (n={len(correct_entropies)})',
+                 color='green', weights=np.ones(len(correct_entropies)) / len(correct_entropies) * 100)
+    if incorrect_entropies:
+        ax2.hist(incorrect_entropies, bins=20, alpha=0.6, label=f'Incorrect (n={len(incorrect_entropies)})',
+                 color='red', weights=np.ones(len(incorrect_entropies)) / len(incorrect_entropies) * 100)
+    ax2.set_xlabel('Entropy')
+    ax2.set_ylabel('Percentage')
+    ax2.set_title('Entropy by Correctness')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Accuracy vs entropy bins
+    ax3 = axes[2]
+    n_bins = 10
+    entropy_bins = np.linspace(entropies.min(), entropies.max(), n_bins + 1)
+    bin_accuracies = []
+    bin_centers = []
+    bin_counts = []
+
+    for i in range(n_bins):
+        bin_mask = (entropies >= entropy_bins[i]) & (entropies < entropy_bins[i + 1])
+        if i == n_bins - 1:  # Include right edge in last bin
+            bin_mask = (entropies >= entropy_bins[i]) & (entropies <= entropy_bins[i + 1])
+
+        bin_items = [m for j, m in enumerate(metadata) if bin_mask[j]]
+        if len(bin_items) > 0:
+            acc = sum(1 for m in bin_items if m["is_correct"]) / len(bin_items)
+            bin_accuracies.append(acc)
+            bin_centers.append((entropy_bins[i] + entropy_bins[i + 1]) / 2)
+            bin_counts.append(len(bin_items))
+
+    ax3.bar(bin_centers, bin_accuracies, width=(entropy_bins[1] - entropy_bins[0]) * 0.8,
+            alpha=0.7, edgecolor='black')
+    ax3.set_xlabel('Entropy')
+    ax3.set_ylabel('Accuracy')
+    ax3.set_title('Accuracy vs Entropy')
+    ax3.set_ylim(0, 1)
+    ax3.grid(True, alpha=0.3)
+
+    # Add count labels on bars
+    for x, y, c in zip(bin_centers, bin_accuracies, bin_counts):
+        ax3.text(x, y + 0.02, f'n={c}', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Entropy distribution plot saved to {output_path}")
+
+
+def plot_results(results: Dict[int, Dict], output_path: Path):
+    """Plot R² across layers with confidence intervals."""
+    layers = sorted(results.keys())
+    test_r2_mean = [results[l]["test_r2_mean"] for l in layers]
+    test_r2_std = [results[l]["test_r2_std"] for l in layers]
+    test_mae_mean = [results[l]["test_mae_mean"] for l in layers]
+    test_mae_std = [results[l]["test_mae_std"] for l in layers]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # R² plot with error bands
+    ax1.plot(layers, test_r2_mean, 'o-', label='Test R²', color='tab:blue')
+    ax1.fill_between(
+        layers,
+        np.array(test_r2_mean) - np.array(test_r2_std),
+        np.array(test_r2_mean) + np.array(test_r2_std),
+        alpha=0.3, color='tab:blue'
+    )
+    ax1.set_xlabel('Layer Index')
+    ax1.set_ylabel('R² Score')
+    ax1.set_title('MC Entropy Predictability by Layer')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # MAE plot with error bands
+    ax2.plot(layers, test_mae_mean, 'o-', label='Test MAE', color='tab:orange')
+    ax2.fill_between(
+        layers,
+        np.array(test_mae_mean) - np.array(test_mae_std),
+        np.array(test_mae_mean) + np.array(test_mae_std),
+        alpha=0.3, color='tab:orange'
+    )
     ax2.set_xlabel('Layer Index')
     ax2.set_ylabel('Mean Absolute Error')
-    ax2.set_title('Prediction Error by Layer (Multiple Choice)')
+    ax2.set_title('Prediction Error by Layer')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
@@ -542,126 +572,250 @@ def plot_results(results: Dict[int, Dict], output_path: str):
     print(f"\nPlot saved to {output_path}")
 
 
+def print_diagnostic_summary(entropies: np.ndarray, results: Dict[int, Dict]):
+    """Print diagnostic summary to help identify anomalous patterns."""
+    print("\n" + "="*80)
+    print("DIAGNOSTIC SUMMARY")
+    print("="*80)
+
+    # Entropy distribution diagnostics
+    pct_near_zero = (entropies < 0.1).sum() / len(entropies) * 100
+    pct_low = (entropies < 0.3).sum() / len(entropies) * 100
+    variance = entropies.var()
+    iqr = np.percentile(entropies, 75) - np.percentile(entropies, 25)
+
+    print(f"\nEntropy Distribution:")
+    print(f"  Mean: {entropies.mean():.3f}, Std: {entropies.std():.3f}, Variance: {variance:.4f}")
+    print(f"  Median: {np.median(entropies):.3f}, IQR: {iqr:.3f}")
+    print(f"  Range: [{entropies.min():.3f}, {entropies.max():.3f}]")
+    print(f"  % near zero (<0.1): {pct_near_zero:.1f}%")
+    print(f"  % low (<0.3): {pct_low:.1f}%")
+
+    # Early vs late layer comparison
+    layers = sorted(results.keys())
+    n_layers = len(layers)
+    early_layers = layers[:n_layers // 4]  # First quarter
+    late_layers = layers[3 * n_layers // 4:]  # Last quarter
+
+    early_r2 = np.mean([results[l]["test_r2_mean"] for l in early_layers])
+    late_r2 = np.mean([results[l]["test_r2_mean"] for l in late_layers])
+    r2_increase = late_r2 - early_r2
+
+    print(f"\nLayer R² Comparison:")
+    print(f"  Early layers (0-{early_layers[-1]}): mean R² = {early_r2:.4f}")
+    print(f"  Late layers ({late_layers[0]}-{late_layers[-1]}): mean R² = {late_r2:.4f}")
+    print(f"  R² increase (late - early): {r2_increase:.4f}")
+
+    # Flag anomalies
+    print(f"\nAnomaly Flags:")
+    flags = []
+
+    if pct_near_zero > 40:
+        flags.append(f"  ⚠ HIGH % NEAR-ZERO ENTROPY ({pct_near_zero:.1f}%) - probe may be trivially predictive")
+
+    if variance < 0.05:
+        flags.append(f"  ⚠ LOW ENTROPY VARIANCE ({variance:.4f}) - limited signal to predict")
+
+    if early_r2 > 0.5 and r2_increase < 0.1:
+        flags.append(f"  ⚠ UNIFORMLY HIGH R² - early layers already predictive (early={early_r2:.3f})")
+
+    if late_r2 < 0.3:
+        flags.append(f"  ⚠ UNIFORMLY LOW R² - even late layers poorly predictive (late={late_r2:.3f})")
+
+    if abs(r2_increase) < 0.1 and early_r2 > 0.3:
+        flags.append(f"  ⚠ FLAT R² CURVE - no clear emergence pattern")
+
+    if not flags:
+        flags.append("  ✓ No anomalies detected - typical emergence pattern")
+
+    for flag in flags:
+        print(flag)
+
+    print("="*80)
+
+
+def load_activations(activations_path: Path) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+    """Load activations from saved file."""
+    print(f"Loading activations from {activations_path}...")
+    data = np.load(activations_path)
+
+    activations = {
+        int(k.split("_")[1]): data[k]
+        for k in data.files if k.startswith("layer_")
+    }
+    entropies = data["entropies"]
+
+    print(f"Loaded {len(activations)} layers, {len(entropies)} samples")
+    return activations, entropies
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Train entropy probes on MC questions")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Skip extraction, load saved activations and retrain probes")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for forward passes (default 8, reduce for large models)")
+    parser.add_argument("--load-in-4bit", action="store_true",
+                        help="Load model in 4-bit quantization (recommended for 70B+ models)")
+    parser.add_argument("--load-in-8bit", action="store_true",
+                        help="Load model in 8-bit quantization")
+    args = parser.parse_args()
+
     print(f"Device: {DEVICE}")
-    print(f"Loading model: {BASE_MODEL_NAME}")
 
-    # Load model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, token=HF_TOKEN)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_NAME,
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        device_map="auto",
-        token=HF_TOKEN
-    )
-
-    if MODEL_NAME != BASE_MODEL_NAME:
-        try:
-            from peft import PeftModel
-            print("Loading fine-tuned model")
-            model = PeftModel.from_pretrained(model, MODEL_NAME)
-        except Exception as e:
-            print(f"Error loading fine-tuned model: {e}")
-            exit()
-
-    # Get number of layers (handle PEFT model structure)
-    if hasattr(model, 'get_base_model'):
-        # PEFT model - the base model is wrapped, access via get_base_model()
-        base = model.get_base_model()
-        num_layers = len(base.model.layers)
-    else:
-        # Regular model
-        num_layers = len(model.model.layers)
-    print(f"Model has {num_layers} layers")
-
-    # Load questions
-    questions = load_questions(DATASET_NAME, NUM_QUESTIONS)
-
-    # Apply the same post-load shuffle that capabilities_test.py does
-    random.seed(SEED)
-    random.shuffle(questions)
-
-    # Build dataset: format questions, get probabilities, compute entropies
-    dataset = build_dataset_with_entropies(questions, model, tokenizer)
-
-    # Save dataset with entropies in capabilities_test.py format
-    print("\nSaving dataset with entropies...")
-
-    # Convert to capabilities_test.py format: results dict keyed by question ID
-    results_dict = {}
-    for item in dataset:
-        q_id = questions[item["question_id"]].get("id", f"q_{item['question_id']}")
-        results_dict[q_id] = {
-            "question": item["question"],
-            "options": questions[item["question_id"]].get("options", {}),
-            "correct_answer": item["correct_answer"],
-            "probabilities": item["probabilities"],
-            "entropy": item["entropy"],
-        }
-
-    # Save in same format as capabilities_test.py
-    output_data = {
-        "subject_id": f"{DATASET_NAME}_{MODEL_NAME.split('/')[-1]}",
-        "timestamp": __import__("time").time(),
-        "results": results_dict,
-        "run_parameters": {
-            "dataset_name": DATASET_NAME,
-            "num_questions": NUM_QUESTIONS,
-            "model_name": MODEL_NAME,
-            "base_model_name": BASE_MODEL_NAME,
-            "seed": SEED,
-        }
-    }
-
-    # Generate output paths
+    # Generate output prefix
     output_prefix = get_output_prefix()
-    dataset_path = f"{output_prefix}_entropy_dataset.json"
-    activations_path = f"{output_prefix}_activations.npz"
-    probe_path = f"{output_prefix}_entropy_probe.json"
-    plot_path = f"{output_prefix}_entropy_probe.png"
+    print(f"Output prefix: {output_prefix}")
 
-    with open(dataset_path, "w") as f:
-        json.dump(output_data, f, indent=2)
-    print(f"Saved to {dataset_path}")
+    # Define output paths
+    activations_path = Path(f"{output_prefix}_activations.npz")
+    dataset_path = Path(f"{output_prefix}_entropy_dataset.json")
+    results_path = Path(f"{output_prefix}_entropy_probe.json")
+    directions_path = Path(f"{output_prefix}_entropy_directions.npz")
+    plot_path = Path(f"{output_prefix}_entropy_probe.png")
+    entropy_dist_path = Path(f"{output_prefix}_entropy_distribution.png")
 
-    # Extract activations from all layers
-    activations, entropies = extract_all_activations(
-        dataset, model, tokenizer, num_layers
-    )
+    metadata = None  # Will be loaded or computed
 
-    # Save activations for later analysis
-    print("\nSaving activations...")
-    np.savez_compressed(
-        activations_path,
-        **{f"layer_{i}": acts for i, acts in activations.items()},
-        entropies=entropies
-    )
-    print(f"Saved to {activations_path}")
+    if args.plot_only:
+        # Load existing activations
+        if not activations_path.exists():
+            raise FileNotFoundError(
+                f"Activations file not found: {activations_path}. "
+                "Run without --plot-only first."
+            )
+        activations, entropies = load_activations(activations_path)
 
-    # Train probes
-    results = run_all_probes(activations, entropies)
+        # Load metadata for entropy distribution plot
+        if dataset_path.exists():
+            with open(dataset_path) as f:
+                dataset_data = json.load(f)
+                metadata = dataset_data.get("data", [])
+    else:
+        # Full run: load model and extract activations
+        model, tokenizer, num_layers = load_model_and_tokenizer(
+            BASE_MODEL_NAME,
+            adapter_path=MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
+            load_in_4bit=args.load_in_4bit,
+            load_in_8bit=args.load_in_8bit
+        )
 
-    # Save results
-    results_to_save = {
-        layer_idx: {k: v for k, v in res.items() if k != "probe"}
-        for layer_idx, res in results.items()
+        # Load questions
+        questions = load_questions(DATASET_NAME, NUM_QUESTIONS)
+
+        # Shuffle with fixed seed for reproducibility
+        random.seed(SEED)
+        random.shuffle(questions)
+
+        # Extract activations and compute entropies in single pass
+        activations, entropies, metadata = extract_mc_activations_and_entropy(
+            questions, model, tokenizer, num_layers, batch_size=args.batch_size
+        )
+
+        # Save activations
+        print("\nSaving activations...")
+        np.savez_compressed(
+            activations_path,
+            **{f"layer_{i}": acts for i, acts in activations.items()},
+            entropies=entropies
+        )
+        print(f"Saved to {activations_path}")
+
+        # Compute accuracy stats for saving
+        correct_count = sum(1 for m in metadata if m["is_correct"])
+        accuracy = correct_count / len(metadata)
+
+        # Save dataset with metadata
+        output_data = {
+            "config": {
+                "dataset": DATASET_NAME,
+                "num_questions": NUM_QUESTIONS,
+                "base_model": BASE_MODEL_NAME,
+                "seed": SEED,
+            },
+            "stats": {
+                "accuracy": accuracy,
+                "correct_count": correct_count,
+                "total_count": len(metadata),
+                "entropy_mean": float(entropies.mean()),
+                "entropy_std": float(entropies.std()),
+                "entropy_min": float(entropies.min()),
+                "entropy_max": float(entropies.max()),
+            },
+            "data": metadata
+        }
+        with open(dataset_path, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"Saved dataset to {dataset_path}")
+
+    # Train probes (bootstrap for confidence intervals) and extract directions
+    results, directions = run_all_probes(activations, entropies)
+
+    # Save directions (include metadata for robust parsing by analysis scripts)
+    directions_data = {f"layer_{i}_entropy": d for i, d in directions.items()}
+    # Store dataset name as metadata so analysis scripts don't need to parse filenames
+    directions_data["_metadata_dataset"] = np.array(DATASET_NAME)
+    directions_data["_metadata_model"] = np.array(BASE_MODEL_NAME)
+    np.savez_compressed(directions_path, **directions_data)
+    print(f"Saved directions to {directions_path}")
+
+    # Compute accuracy from metadata if available
+    accuracy_stats = None
+    if metadata:
+        correct_count = sum(1 for m in metadata if m.get("is_correct", False))
+        accuracy_stats = {
+            "accuracy": correct_count / len(metadata),
+            "correct_count": correct_count,
+            "total_count": len(metadata),
+        }
+
+    # Save results with metadata
+    output_data = {
+        "config": {
+            "base_model": BASE_MODEL_NAME,
+            "dataset": DATASET_NAME,
+            "adapter": MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
+            "train_split": TRAIN_SPLIT,
+            "probe_alpha": PROBE_ALPHA,
+            "use_pca": USE_PCA,
+            "pca_components": PCA_COMPONENTS,
+            "n_bootstrap": N_BOOTSTRAP,
+            "seed": SEED,
+        },
+        "entropy_stats": {
+            "mean": float(entropies.mean()),
+            "std": float(entropies.std()),
+            "min": float(entropies.min()),
+            "max": float(entropies.max()),
+            "variance": float(entropies.var()),
+            "pct_near_zero": float((entropies < 0.1).sum() / len(entropies) * 100),
+            "pct_near_max": float((entropies > 1.3).sum() / len(entropies) * 100),
+            "median": float(np.median(entropies)),
+            "iqr": float(np.percentile(entropies, 75) - np.percentile(entropies, 25)),
+        },
+        "results": {
+            str(k): v for k, v in results.items()
+        }
     }
-    with open(probe_path, "w") as f:
-        # Convert numpy arrays to lists for JSON serialization
-        results_json = {}
-        for layer_idx, res in results_to_save.items():
-            results_json[layer_idx] = {
-                k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                for k, v in res.items()
-            }
-        json.dump(results_json, f, indent=2)
-    print(f"Saved results to {probe_path}")
+
+    # Add accuracy if available
+    if accuracy_stats:
+        output_data["accuracy"] = accuracy_stats
+
+    with open(results_path, "w") as f:
+        json.dump(output_data, f, indent=2)
+    print(f"Saved results to {results_path}")
 
     # Print and plot results
     print_results(results)
     plot_results(results, plot_path)
+
+    # Print diagnostic summary for anomaly detection
+    print_diagnostic_summary(entropies, results)
+
+    # Plot entropy distribution if metadata available
+    if metadata:
+        plot_entropy_distribution(entropies, metadata, entropy_dist_path)
 
 
 if __name__ == "__main__":
