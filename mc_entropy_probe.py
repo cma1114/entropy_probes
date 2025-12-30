@@ -1,16 +1,28 @@
 """
-Run entropy prediction experiment on multiple-choice questions.
+Run uncertainty prediction experiment on multiple-choice questions.
 
 This script:
 1. Loads MC questions from dataset file
-2. Formats them and runs through the model to get probability distributions over answer tokens
-3. Computes entropy from those probabilities
+2. Formats them and runs through the model to get logits/probs over answer tokens
+3. Computes multiple uncertainty metrics (all saved, one probed per run):
+
+   Prob-based (nonlinear - may be harder for linear probes):
+   - entropy: Shannon entropy -sum(p * log(p))
+   - top_prob: P(argmax) - probability of most likely answer
+   - margin: P(top) - P(second) - prob gap between top two
+
+   Logit-based (linear - better aligned with linear probes):
+   - logit_gap: z(top) - z(second) - logit gap between top two
+   - top_logit: z(top) - mean(z) - centered top logit
+
 4. Extracts activations from all layers
-5. Trains linear probes to predict entropy from each layer
+5. Trains linear probes to predict the selected metric from each layer
+6. Saves directions: {prefix}_directions.npz
 
 Usage:
-    python mc_entropy_probe.py             # Full run
-    python mc_entropy_probe.py --plot-only # Load saved activations, retrain probes, plot
+    python mc_entropy_probe.py --metric logit_gap   # Probe logit_gap (default)
+    python mc_entropy_probe.py --metric entropy     # Probe entropy
+    python mc_entropy_probe.py --plot-only          # Retrain from saved activations
 """
 
 import argparse
@@ -31,13 +43,13 @@ from core import (
     LinearProbe,
     compute_entropy_from_probs,
 )
+from tasks import MC_SETUP_PROMPT, format_direct_prompt
 
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = BASE_MODEL_NAME  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###
 DATASET_NAME = "SimpleMC"
 NUM_QUESTIONS = 447 if DATASET_NAME.startswith("GP") else 500
-MAX_PROMPT_LENGTH = 2000  # Multiple choice prompts can be longer
 SEED = 42
 
 # Output directory
@@ -54,17 +66,78 @@ N_BOOTSTRAP = 100  # Number of bootstrap iterations for confidence intervals
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# MC setup prompt
-MC_SETUP_PROMPT = "I'm going to ask you a series of multiple-choice questions. For each one, select the answer you think is best. Respond only with the letter of your choice; do NOT output any other text."
+# MC_SETUP_PROMPT imported from tasks.py
+
+# Available uncertainty metrics:
+# Prob-based (nonlinear targets - may be harder for linear probes):
+#   entropy   - Shannon entropy -sum(p * log(p))
+#   top_prob  - P(argmax) - probability of most likely answer
+#   margin    - P(top) - P(second) - prob gap between top two
+# Logit-based (linear targets - better aligned with linear probes):
+#   logit_gap - z(top) - z(second) - logit gap between top two
+#   top_logit - z(top) - mean(z) - centered top logit
+AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+METRIC = "logit_gap"  # Which metric to probe (set via --metric flag)
 
 
-def get_output_prefix() -> str:
+def compute_uncertainty_metrics(probs: np.ndarray, logits: np.ndarray = None) -> Dict[str, float]:
+    """
+    Compute multiple uncertainty metrics from probability and logit distributions.
+
+    Args:
+        probs: Probability distribution over answer options (sums to 1)
+        logits: Raw logits for answer options (before softmax). If None, logit-based
+                metrics will be computed from log(probs) as an approximation.
+
+    Returns:
+        Dict with keys: entropy, top_prob, margin, logit_gap, top_logit
+    """
+    # === Prob-based metrics (nonlinear) ===
+
+    # Entropy: -sum(p * log(p))
+    entropy = compute_entropy_from_probs(probs)
+
+    # Top probability: P(argmax)
+    top_prob = float(np.max(probs))
+
+    # Margin: P(top) - P(second)
+    sorted_probs = np.sort(probs)[::-1]  # Descending
+    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else float(sorted_probs[0])
+
+    # === Logit-based metrics (linear - better for linear probes) ===
+
+    # If logits not provided, approximate from log-probs
+    # (This loses the constant offset but preserves gaps)
+    if logits is None:
+        logits = np.log(probs + 1e-10)
+
+    # Sort logits descending
+    sorted_logits = np.sort(logits)[::-1]
+
+    # Logit gap: z(top) - z(second)
+    # This is the cleanest linear target - invariant to temperature/scale shifts
+    logit_gap = float(sorted_logits[0] - sorted_logits[1]) if len(sorted_logits) > 1 else float(sorted_logits[0])
+
+    # Top logit (centered): z(top) - mean(z)
+    # Subtracting mean makes it invariant to adding a constant to all logits
+    top_logit = float(sorted_logits[0] - np.mean(logits))
+
+    return {
+        "entropy": entropy,
+        "top_prob": top_prob,
+        "margin": margin,
+        "logit_gap": logit_gap,
+        "top_logit": top_logit,
+    }
+
+
+def get_output_prefix(metric: str) -> str:
     """Generate output filename prefix based on config."""
     model_short = get_model_short_name(BASE_MODEL_NAME)
     if MODEL_NAME != BASE_MODEL_NAME:
         adapter_short = get_model_short_name(MODEL_NAME)
-        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_mc")
-    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_mc")
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_mc_{metric}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_mc_{metric}")
 
 
 def load_questions(dataset_name: str, num_questions: int = None) -> List[Dict]:
@@ -79,54 +152,17 @@ def load_questions(dataset_name: str, num_questions: int = None) -> List[Dict]:
     return questions
 
 
-def _present_question(question_data: Dict) -> str:
-    """Format a question for display."""
-    formatted_question = ""
-    formatted_question += "-" * 30 + "\n"
-    formatted_question += "Question:\n"
-    formatted_question += question_data["question"] + "\n"
-
-    if "options" in question_data:
-        formatted_question += "-" * 10 + "\n"
-        for key, value in question_data["options"].items():
-            formatted_question += f"  {key}: {value}\n"
-
-    formatted_question += "-" * 30
-    return formatted_question
-
-
 def format_mc_prompt(question: Dict, tokenizer) -> Tuple[str, List[str], List[int]]:
     """
     Format a multiple-choice question and get option token IDs.
 
+    Uses centralized format_direct_prompt from tasks.py.
+
     Returns:
         Tuple of (full_prompt, option_keys, option_token_ids)
     """
-    # Get the formatted question text
-    q_text = _present_question(question)
-
-    # Get option keys from the question
-    options = list(question["options"].keys())
-
-    # Format the prompt for choice
-    options_str = (
-        " or ".join(options)
-        if len(options) == 2
-        else ", ".join(options[:-1]) + f", or {options[-1]}"
-    )
-
-    llm_prompt = q_text + f"\nYour choice ({options_str}): "
-
-    # Apply chat template
-    messages = [
-        {"role": "system", "content": MC_SETUP_PROMPT},
-        {"role": "user", "content": llm_prompt}
-    ]
-    full_prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    # Use centralized prompt formatting
+    full_prompt, options = format_direct_prompt(question, tokenizer, use_chat_template=True)
 
     # Get token IDs for answer options
     option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in options]
@@ -134,15 +170,15 @@ def format_mc_prompt(question: Dict, tokenizer) -> Tuple[str, List[str], List[in
     return full_prompt, options, option_token_ids
 
 
-def extract_mc_activations_and_entropy(
+def extract_mc_activations_and_metrics(
     questions: List[Dict],
     model,
     tokenizer,
     num_layers: int,
     batch_size: int = 8
-) -> Tuple[Dict[int, np.ndarray], np.ndarray, List[Dict]]:
+) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray], List[Dict]]:
     """
-    Extract activations and compute entropy in a single forward pass per question.
+    Extract activations and compute uncertainty metrics in a single forward pass per question.
 
     Args:
         questions: List of question dicts
@@ -153,14 +189,14 @@ def extract_mc_activations_and_entropy(
 
     Returns:
         activations: Dict mapping layer_idx -> array of shape (num_questions, hidden_dim)
-        entropies: Array of shape (num_questions,)
+        metrics: Dict mapping metric_name -> array of shape (num_questions,)
         metadata: List of dicts with question info, probabilities, etc.
     """
     print(f"Processing {len(questions)} questions with batch_size={batch_size}...")
 
     # Initialize storage
     all_layer_activations = {i: [] for i in range(num_layers)}
-    all_entropies = []
+    all_metrics = {metric: [] for metric in AVAILABLE_METRICS}
     metadata = []
 
     # Set up hooks for activation extraction
@@ -220,12 +256,10 @@ def extract_mc_activations_and_entropy(
             batch_items = formatted_data[batch_start:batch_end]
             batch_prompts = [item["prompt"] for item in batch_items]
 
-            # Tokenize batch with padding
+            # Tokenize batch with padding (no truncation to match other scripts)
             inputs = tokenizer(
                 batch_prompts,
                 return_tensors="pt",
-                truncation=True,
-                max_length=MAX_PROMPT_LENGTH,
                 padding=True  # Pad to longest in batch
             )
             input_ids = inputs["input_ids"].to(DEVICE)
@@ -258,7 +292,7 @@ def extract_mc_activations_and_entropy(
                 for batch_item_idx in range(len(batch_items)):
                     all_layer_activations[layer_idx].append(stacked_cpu[layer_idx, batch_item_idx])
 
-            # Compute entropy for each item in batch
+            # Compute metrics for each item in batch
             for batch_item_idx, item in enumerate(batch_items):
                 option_token_ids = item["option_token_ids"]
                 options = item["options"]
@@ -268,8 +302,11 @@ def extract_mc_activations_and_entropy(
                 last_idx = current_last_indices[batch_item_idx].item()
                 final_logits = outputs.logits[batch_item_idx, last_idx, :]
                 option_logits = final_logits[option_token_ids]
+                option_logits_np = option_logits.cpu().numpy()
                 probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
-                entropy = compute_entropy_from_probs(probs)
+
+                # Compute all uncertainty metrics (pass logits for logit-based metrics)
+                item_metrics = compute_uncertainty_metrics(probs, option_logits_np)
 
                 # Compute accuracy
                 predicted_idx = np.argmax(probs)
@@ -277,7 +314,10 @@ def extract_mc_activations_and_entropy(
                 correct_answer = question.get("correct_answer", "")
                 is_correct = predicted_answer == correct_answer
 
-                all_entropies.append(entropy)
+                # Store metrics
+                for metric_name, metric_value in item_metrics.items():
+                    all_metrics[metric_name].append(metric_value)
+
                 metadata.append({
                     "question_id": batch_start + batch_item_idx,
                     "question": question.get("question", ""),
@@ -286,7 +326,8 @@ def extract_mc_activations_and_entropy(
                     "is_correct": is_correct,
                     "options": options,
                     "probabilities": probs.tolist(),
-                    "entropy": entropy,
+                    "logits": option_logits_np.tolist(),  # Store logits too
+                    **item_metrics,  # Include all metrics
                 })
 
             # Clear memory
@@ -304,24 +345,29 @@ def extract_mc_activations_and_entropy(
         layer_idx: np.array(acts)
         for layer_idx, acts in all_layer_activations.items()
     }
-    entropies = np.array(all_entropies)
+    metrics = {
+        metric_name: np.array(values)
+        for metric_name, values in all_metrics.items()
+    }
 
     # Compute accuracy statistics
     correct_count = sum(1 for m in metadata if m["is_correct"])
     accuracy = correct_count / len(metadata)
 
     print(f"Extracted activations shape (per layer): {activations[0].shape}")
-    print(f"Entropy range: [{entropies.min():.3f}, {entropies.max():.3f}]")
-    print(f"Entropy mean: {entropies.mean():.3f}, std: {entropies.std():.3f}")
     print(f"Accuracy: {accuracy:.2%} ({correct_count}/{len(metadata)})")
+    print(f"\nUncertainty metrics:")
+    for metric_name, values in metrics.items():
+        print(f"  {metric_name}: range=[{values.min():.3f}, {values.max():.3f}], "
+              f"mean={values.mean():.3f}, std={values.std():.3f}")
 
-    return activations, entropies, metadata
+    return activations, metrics, metadata
 
 
 def _train_probe_for_layer(
     layer_idx: int,
     X: np.ndarray,
-    entropies: np.ndarray,
+    targets: np.ndarray,
     n_bootstrap: int,
     train_split: float,
     seed: int,
@@ -335,7 +381,7 @@ def _train_probe_for_layer(
     Direction is extracted from a final probe trained on full training set.
     """
     rng = np.random.RandomState(seed + layer_idx)
-    n = len(entropies)
+    n = len(targets)
 
     test_r2s = []
     test_maes = []
@@ -351,8 +397,8 @@ def _train_probe_for_layer(
 
         X_train = X[train_idx]
         X_test = X[test_idx]
-        y_train = entropies[train_idx]
-        y_test = entropies[test_idx]
+        y_train = targets[train_idx]
+        y_test = targets[test_idx]
 
         # Train probe
         probe = LinearProbe(
@@ -379,7 +425,7 @@ def _train_probe_for_layer(
         use_pca=use_pca,
         pca_components=pca_components
     )
-    final_probe.fit(X[train_idx], entropies[train_idx])
+    final_probe.fit(X[train_idx], targets[train_idx])
     direction = final_probe.get_direction()  # Always in original space
 
     return layer_idx, {
@@ -392,68 +438,82 @@ def _train_probe_for_layer(
 
 def run_all_probes(
     activations: Dict[int, np.ndarray],
-    entropies: np.ndarray,
+    metrics: Dict[str, np.ndarray],
     n_jobs: int = -1,
     use_pca: bool = USE_PCA,
     pca_components: int = PCA_COMPONENTS,
     alpha: float = PROBE_ALPHA
-) -> Tuple[Dict[int, Dict], Dict[int, np.ndarray]]:
-    """Train probes for all layers with bootstrap confidence intervals.
+) -> Tuple[Dict[str, Dict[int, Dict]], Dict[str, Dict[int, np.ndarray]]]:
+    """Train probes for all layers and all metrics with bootstrap confidence intervals.
 
     Returns:
-        results: Dict mapping layer index to result dict with R², MAE stats
-        directions: Dict mapping layer index to normalized direction vectors (in original space)
+        all_results: Dict mapping metric_name -> {layer_idx -> result dict with R², MAE stats}
+        all_directions: Dict mapping metric_name -> {layer_idx -> normalized direction vector}
     """
     pca_str = f"PCA={pca_components}" if use_pca else "no PCA"
-    print(f"\nTraining probes for {len(activations)} layers "
-          f"({N_BOOTSTRAP} bootstrap iterations, {pca_str}, parallel across layers)...")
-
     layer_indices = sorted(activations.keys())
 
-    # Run in parallel across layers
-    results_list = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_train_probe_for_layer)(
-            layer_idx,
-            activations[layer_idx],
-            entropies,
-            N_BOOTSTRAP,
-            TRAIN_SPLIT,
-            SEED,
-            use_pca,
-            pca_components,
-            alpha
+    all_results = {}
+    all_directions = {}
+
+    for metric_name, targets in metrics.items():
+        print(f"\nTraining probes for metric '{metric_name}' across {len(activations)} layers "
+              f"({N_BOOTSTRAP} bootstrap iterations, {pca_str})...")
+
+        # Run in parallel across layers
+        results_list = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(_train_probe_for_layer)(
+                layer_idx,
+                activations[layer_idx],
+                targets,
+                N_BOOTSTRAP,
+                TRAIN_SPLIT,
+                SEED,
+                use_pca,
+                pca_components,
+                alpha
+            )
+            for layer_idx in layer_indices
         )
-        for layer_idx in layer_indices
-    )
 
-    # Convert list of (layer_idx, result, direction) tuples to dicts
-    results = {layer_idx: result for layer_idx, result, _ in results_list}
-    directions = {layer_idx: direction for layer_idx, _, direction in results_list}
+        # Convert list of (layer_idx, result, direction) tuples to dicts
+        all_results[metric_name] = {layer_idx: result for layer_idx, result, _ in results_list}
+        all_directions[metric_name] = {layer_idx: direction for layer_idx, _, direction in results_list}
 
-    return results, directions
+    return all_results, all_directions
 
 
-def print_results(results: Dict[int, Dict]):
-    """Print summary of results."""
+def print_results(all_results: Dict[str, Dict[int, Dict]]):
+    """Print summary of results for all metrics."""
+    for metric_name, results in all_results.items():
+        print("\n" + "="*80)
+        print(f"RESULTS SUMMARY: {metric_name.upper()}")
+        print("="*80)
+        print(f"{'Layer':<8} {'Test R²':<20} {'Test MAE':<20}")
+        print("-"*80)
+
+        for layer_idx in sorted(results.keys()):
+            res = results[layer_idx]
+            r2_str = f"{res['test_r2_mean']:.4f} ± {res['test_r2_std']:.4f}"
+            mae_str = f"{res['test_mae_mean']:.4f} ± {res['test_mae_std']:.4f}"
+            print(f"{layer_idx:<8} {r2_str:<20} {mae_str:<20}")
+
+        print("="*80)
+
+        # Find best layer
+        best_layer = max(results.keys(), key=lambda l: results[l]["test_r2_mean"])
+        best_r2 = results[best_layer]["test_r2_mean"]
+        best_std = results[best_layer]["test_r2_std"]
+        print(f"Best layer: {best_layer} (Test R² = {best_r2:.4f} ± {best_std:.4f})")
+
+    # Print comparison across metrics
     print("\n" + "="*80)
-    print("RESULTS SUMMARY")
+    print("METRIC COMPARISON (Best R² per metric)")
     print("="*80)
-    print(f"{'Layer':<8} {'Test R²':<20} {'Test MAE':<20}")
-    print("-"*80)
-
-    for layer_idx in sorted(results.keys()):
-        res = results[layer_idx]
-        r2_str = f"{res['test_r2_mean']:.4f} ± {res['test_r2_std']:.4f}"
-        mae_str = f"{res['test_mae_mean']:.4f} ± {res['test_mae_std']:.4f}"
-        print(f"{layer_idx:<8} {r2_str:<20} {mae_str:<20}")
-
-    print("="*80)
-
-    # Find best layer
-    best_layer = max(results.keys(), key=lambda l: results[l]["test_r2_mean"])
-    best_r2 = results[best_layer]["test_r2_mean"]
-    best_std = results[best_layer]["test_r2_std"]
-    print(f"\nBest layer: {best_layer} (Test R² = {best_r2:.4f} ± {best_std:.4f})")
+    for metric_name, results in all_results.items():
+        best_layer = max(results.keys(), key=lambda l: results[l]["test_r2_mean"])
+        best_r2 = results[best_layer]["test_r2_mean"]
+        print(f"  {metric_name:<12}: layer {best_layer:<3} R² = {best_r2:.4f}")
 
 
 def plot_entropy_distribution(
@@ -529,113 +589,105 @@ def plot_entropy_distribution(
     print(f"Entropy distribution plot saved to {output_path}")
 
 
-def plot_results(results: Dict[int, Dict], output_path: Path):
-    """Plot R² across layers with confidence intervals."""
-    layers = sorted(results.keys())
-    test_r2_mean = [results[l]["test_r2_mean"] for l in layers]
-    test_r2_std = [results[l]["test_r2_std"] for l in layers]
-    test_mae_mean = [results[l]["test_mae_mean"] for l in layers]
-    test_mae_std = [results[l]["test_mae_std"] for l in layers]
+def plot_results(all_results: Dict[str, Dict[int, Dict]], output_path: Path):
+    """Plot R² across layers for all metrics with confidence intervals."""
+    metric_names = list(all_results.keys())
+    n_metrics = len(metric_names)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    # Colors for different metrics
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
 
-    # R² plot with error bands
-    ax1.plot(layers, test_r2_mean, 'o-', label='Test R²', color='tab:blue')
-    ax1.fill_between(
-        layers,
-        np.array(test_r2_mean) - np.array(test_r2_std),
-        np.array(test_r2_mean) + np.array(test_r2_std),
-        alpha=0.3, color='tab:blue'
-    )
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Get layers from first metric (all should have same layers)
+    layers = sorted(all_results[metric_names[0]].keys())
+
+    # R² plot - all metrics on same axes
+    ax1 = axes[0]
+    for i, metric_name in enumerate(metric_names):
+        results = all_results[metric_name]
+        test_r2_mean = [results[l]["test_r2_mean"] for l in layers]
+        test_r2_std = [results[l]["test_r2_std"] for l in layers]
+
+        color = colors[i % len(colors)]
+        ax1.plot(layers, test_r2_mean, 'o-', label=metric_name, color=color, markersize=4)
+        ax1.fill_between(
+            layers,
+            np.array(test_r2_mean) - np.array(test_r2_std),
+            np.array(test_r2_mean) + np.array(test_r2_std),
+            alpha=0.2, color=color
+        )
+
     ax1.set_xlabel('Layer Index')
     ax1.set_ylabel('R² Score')
-    ax1.set_title('MC Entropy Predictability by Layer')
+    ax1.set_title('Uncertainty Metric Predictability by Layer')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # MAE plot with error bands
-    ax2.plot(layers, test_mae_mean, 'o-', label='Test MAE', color='tab:orange')
-    ax2.fill_between(
-        layers,
-        np.array(test_mae_mean) - np.array(test_mae_std),
-        np.array(test_mae_mean) + np.array(test_mae_std),
-        alpha=0.3, color='tab:orange'
-    )
-    ax2.set_xlabel('Layer Index')
-    ax2.set_ylabel('Mean Absolute Error')
-    ax2.set_title('Prediction Error by Layer')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    # Best R² comparison bar chart
+    ax2 = axes[1]
+    best_r2s = []
+    best_layers = []
+    for metric_name in metric_names:
+        results = all_results[metric_name]
+        best_layer = max(results.keys(), key=lambda l: results[l]["test_r2_mean"])
+        best_r2s.append(results[best_layer]["test_r2_mean"])
+        best_layers.append(best_layer)
+
+    bars = ax2.bar(metric_names, best_r2s, color=[colors[i % len(colors)] for i in range(n_metrics)])
+    ax2.set_xlabel('Metric')
+    ax2.set_ylabel('Best R² Score')
+    ax2.set_title('Best R² by Metric')
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    # Add layer labels on bars
+    for bar, layer in zip(bars, best_layers):
+        height = bar.get_height()
+        ax2.annotate(f'L{layer}',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha='center', va='bottom', fontsize=9)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to {output_path}")
 
 
-def print_diagnostic_summary(entropies: np.ndarray, results: Dict[int, Dict]):
+def print_diagnostic_summary(metrics: Dict[str, np.ndarray], all_results: Dict[str, Dict[int, Dict]]):
     """Print diagnostic summary to help identify anomalous patterns."""
     print("\n" + "="*80)
     print("DIAGNOSTIC SUMMARY")
     print("="*80)
 
-    # Entropy distribution diagnostics
-    pct_near_zero = (entropies < 0.1).sum() / len(entropies) * 100
-    pct_low = (entropies < 0.3).sum() / len(entropies) * 100
-    variance = entropies.var()
-    iqr = np.percentile(entropies, 75) - np.percentile(entropies, 25)
+    # Print distribution stats for each metric
+    for metric_name, values in metrics.items():
+        variance = values.var()
+        iqr = np.percentile(values, 75) - np.percentile(values, 25)
+        print(f"\n{metric_name.upper()} Distribution:")
+        print(f"  Mean: {values.mean():.3f}, Std: {values.std():.3f}, Variance: {variance:.4f}")
+        print(f"  Median: {np.median(values):.3f}, IQR: {iqr:.3f}")
+        print(f"  Range: [{values.min():.3f}, {values.max():.3f}]")
 
-    print(f"\nEntropy Distribution:")
-    print(f"  Mean: {entropies.mean():.3f}, Std: {entropies.std():.3f}, Variance: {variance:.4f}")
-    print(f"  Median: {np.median(entropies):.3f}, IQR: {iqr:.3f}")
-    print(f"  Range: [{entropies.min():.3f}, {entropies.max():.3f}]")
-    print(f"  % near zero (<0.1): {pct_near_zero:.1f}%")
-    print(f"  % low (<0.3): {pct_low:.1f}%")
+    # Early vs late layer comparison for each metric
+    print(f"\nLayer R² Comparison (early vs late):")
+    for metric_name, results in all_results.items():
+        layers = sorted(results.keys())
+        n_layers = len(layers)
+        early_layers = layers[:n_layers // 4]
+        late_layers = layers[3 * n_layers // 4:]
 
-    # Early vs late layer comparison
-    layers = sorted(results.keys())
-    n_layers = len(layers)
-    early_layers = layers[:n_layers // 4]  # First quarter
-    late_layers = layers[3 * n_layers // 4:]  # Last quarter
+        early_r2 = np.mean([results[l]["test_r2_mean"] for l in early_layers])
+        late_r2 = np.mean([results[l]["test_r2_mean"] for l in late_layers])
+        r2_increase = late_r2 - early_r2
 
-    early_r2 = np.mean([results[l]["test_r2_mean"] for l in early_layers])
-    late_r2 = np.mean([results[l]["test_r2_mean"] for l in late_layers])
-    r2_increase = late_r2 - early_r2
-
-    print(f"\nLayer R² Comparison:")
-    print(f"  Early layers (0-{early_layers[-1]}): mean R² = {early_r2:.4f}")
-    print(f"  Late layers ({late_layers[0]}-{late_layers[-1]}): mean R² = {late_r2:.4f}")
-    print(f"  R² increase (late - early): {r2_increase:.4f}")
-
-    # Flag anomalies
-    print(f"\nAnomaly Flags:")
-    flags = []
-
-    if pct_near_zero > 40:
-        flags.append(f"  ⚠ HIGH % NEAR-ZERO ENTROPY ({pct_near_zero:.1f}%) - probe may be trivially predictive")
-
-    if variance < 0.05:
-        flags.append(f"  ⚠ LOW ENTROPY VARIANCE ({variance:.4f}) - limited signal to predict")
-
-    if early_r2 > 0.5 and r2_increase < 0.1:
-        flags.append(f"  ⚠ UNIFORMLY HIGH R² - early layers already predictive (early={early_r2:.3f})")
-
-    if late_r2 < 0.3:
-        flags.append(f"  ⚠ UNIFORMLY LOW R² - even late layers poorly predictive (late={late_r2:.3f})")
-
-    if abs(r2_increase) < 0.1 and early_r2 > 0.3:
-        flags.append(f"  ⚠ FLAT R² CURVE - no clear emergence pattern")
-
-    if not flags:
-        flags.append("  ✓ No anomalies detected - typical emergence pattern")
-
-    for flag in flags:
-        print(flag)
+        print(f"  {metric_name:<12}: early={early_r2:.3f}, late={late_r2:.3f}, Δ={r2_increase:+.3f}")
 
     print("="*80)
 
 
-def load_activations(activations_path: Path) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
-    """Load activations from saved file."""
+def load_activations(activations_path: Path) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray]]:
+    """Load activations and metrics from saved file."""
     print(f"Loading activations from {activations_path}...")
     data = np.load(activations_path)
 
@@ -643,14 +695,29 @@ def load_activations(activations_path: Path) -> Tuple[Dict[int, np.ndarray], np.
         int(k.split("_")[1]): data[k]
         for k in data.files if k.startswith("layer_")
     }
-    entropies = data["entropies"]
 
-    print(f"Loaded {len(activations)} layers, {len(entropies)} samples")
-    return activations, entropies
+    # Load all available metrics
+    metrics = {}
+    for metric_name in AVAILABLE_METRICS:
+        if metric_name in data.files:
+            metrics[metric_name] = data[metric_name]
+        elif metric_name == "entropy" and "entropies" in data.files:
+            # Backward compatibility: old files have "entropies" key
+            metrics["entropy"] = data["entropies"]
+
+    if not metrics:
+        raise ValueError(f"No metrics found in {activations_path}. Re-run without --plot-only.")
+
+    print(f"Loaded {len(activations)} layers, {len(list(metrics.values())[0])} samples, {len(metrics)} metrics")
+    return activations, metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train entropy probes on MC questions")
+    global METRIC
+
+    parser = argparse.ArgumentParser(description="Train uncertainty probes on MC questions")
+    parser.add_argument("--metric", type=str, default=METRIC, choices=AVAILABLE_METRICS,
+                        help=f"Metric to probe (default: {METRIC})")
     parser.add_argument("--plot-only", action="store_true",
                         help="Skip extraction, load saved activations and retrain probes")
     parser.add_argument("--batch-size", type=int, default=8,
@@ -661,19 +728,20 @@ def main():
                         help="Load model in 8-bit quantization")
     args = parser.parse_args()
 
+    METRIC = args.metric
     print(f"Device: {DEVICE}")
+    print(f"Metric: {METRIC}")
 
-    # Generate output prefix
-    output_prefix = get_output_prefix()
+    # Generate output prefix (includes metric name)
+    output_prefix = get_output_prefix(METRIC)
     print(f"Output prefix: {output_prefix}")
 
     # Define output paths
     activations_path = Path(f"{output_prefix}_activations.npz")
-    dataset_path = Path(f"{output_prefix}_entropy_dataset.json")
-    results_path = Path(f"{output_prefix}_entropy_probe.json")
-    directions_path = Path(f"{output_prefix}_entropy_directions.npz")
-    plot_path = Path(f"{output_prefix}_entropy_probe.png")
-    entropy_dist_path = Path(f"{output_prefix}_entropy_distribution.png")
+    dataset_path = Path(f"{output_prefix}_dataset.json")
+    results_path = Path(f"{output_prefix}_results.json")
+    directions_path = Path(f"{output_prefix}_directions.npz")
+    plot_path = Path(f"{output_prefix}_results.png")
 
     metadata = None  # Will be loaded or computed
 
@@ -684,9 +752,14 @@ def main():
                 f"Activations file not found: {activations_path}. "
                 "Run without --plot-only first."
             )
-        activations, entropies = load_activations(activations_path)
+        activations, all_metrics = load_activations(activations_path)
 
-        # Load metadata for entropy distribution plot
+        # Get just the metric we care about
+        if METRIC not in all_metrics:
+            raise ValueError(f"Metric '{METRIC}' not found in saved file. Available: {list(all_metrics.keys())}")
+        target = all_metrics[METRIC]
+
+        # Load metadata
         if dataset_path.exists():
             with open(dataset_path) as f:
                 dataset_data = json.load(f)
@@ -707,17 +780,18 @@ def main():
         random.seed(SEED)
         random.shuffle(questions)
 
-        # Extract activations and compute entropies in single pass
-        activations, entropies, metadata = extract_mc_activations_and_entropy(
+        # Extract activations and compute all uncertainty metrics in single pass
+        activations, all_metrics, metadata = extract_mc_activations_and_metrics(
             questions, model, tokenizer, num_layers, batch_size=args.batch_size
         )
+        target = all_metrics[METRIC]
 
-        # Save activations
-        print("\nSaving activations...")
+        # Save activations and all metrics (so we can reuse for different metrics)
+        print("\nSaving activations and metrics...")
         np.savez_compressed(
             activations_path,
             **{f"layer_{i}": acts for i, acts in activations.items()},
-            entropies=entropies
+            **all_metrics  # Save all metrics for reuse
         )
         print(f"Saved to {activations_path}")
 
@@ -737,10 +811,8 @@ def main():
                 "accuracy": accuracy,
                 "correct_count": correct_count,
                 "total_count": len(metadata),
-                "entropy_mean": float(entropies.mean()),
-                "entropy_std": float(entropies.std()),
-                "entropy_min": float(entropies.min()),
-                "entropy_max": float(entropies.max()),
+                **{f"{name}_mean": float(values.mean()) for name, values in all_metrics.items()},
+                **{f"{name}_std": float(values.std()) for name, values in all_metrics.items()},
             },
             "data": metadata
         }
@@ -748,14 +820,22 @@ def main():
             json.dump(output_data, f, indent=2)
         print(f"Saved dataset to {dataset_path}")
 
-    # Train probes (bootstrap for confidence intervals) and extract directions
-    results, directions = run_all_probes(activations, entropies)
+    # Train probes for the selected metric
+    single_metric = {METRIC: target}
+    results, directions = run_all_probes(activations, single_metric)
 
-    # Save directions (include metadata for robust parsing by analysis scripts)
-    directions_data = {f"layer_{i}_entropy": d for i, d in directions.items()}
-    # Store dataset name as metadata so analysis scripts don't need to parse filenames
+    # Extract results for this metric
+    layer_results = results[METRIC]
+    layer_directions = directions[METRIC]
+
+    # Save directions
+    directions_data = {
+        f"layer_{layer_idx}": direction
+        for layer_idx, direction in layer_directions.items()
+    }
     directions_data["_metadata_dataset"] = np.array(DATASET_NAME)
     directions_data["_metadata_model"] = np.array(BASE_MODEL_NAME)
+    directions_data["_metadata_metric"] = np.array(METRIC)
     np.savez_compressed(directions_path, **directions_data)
     print(f"Saved directions to {directions_path}")
 
@@ -769,12 +849,13 @@ def main():
             "total_count": len(metadata),
         }
 
-    # Save results with metadata
+    # Save results
     output_data = {
         "config": {
             "base_model": BASE_MODEL_NAME,
             "dataset": DATASET_NAME,
             "adapter": MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
+            "metric": METRIC,
             "train_split": TRAIN_SPLIT,
             "probe_alpha": PROBE_ALPHA,
             "use_pca": USE_PCA,
@@ -782,23 +863,18 @@ def main():
             "n_bootstrap": N_BOOTSTRAP,
             "seed": SEED,
         },
-        "entropy_stats": {
-            "mean": float(entropies.mean()),
-            "std": float(entropies.std()),
-            "min": float(entropies.min()),
-            "max": float(entropies.max()),
-            "variance": float(entropies.var()),
-            "pct_near_zero": float((entropies < 0.1).sum() / len(entropies) * 100),
-            "pct_near_max": float((entropies > 1.3).sum() / len(entropies) * 100),
-            "median": float(np.median(entropies)),
-            "iqr": float(np.percentile(entropies, 75) - np.percentile(entropies, 25)),
+        "metric_stats": {
+            "mean": float(target.mean()),
+            "std": float(target.std()),
+            "min": float(target.min()),
+            "max": float(target.max()),
+            "variance": float(target.var()),
+            "median": float(np.median(target)),
+            "iqr": float(np.percentile(target, 75) - np.percentile(target, 25)),
         },
-        "results": {
-            str(k): v for k, v in results.items()
-        }
+        "results": {str(k): v for k, v in layer_results.items()}
     }
 
-    # Add accuracy if available
     if accuracy_stats:
         output_data["accuracy"] = accuracy_stats
 
@@ -806,16 +882,12 @@ def main():
         json.dump(output_data, f, indent=2)
     print(f"Saved results to {results_path}")
 
-    # Print and plot results
-    print_results(results)
-    plot_results(results, plot_path)
+    # Print and plot results (wrap in dict for existing functions)
+    print_results({METRIC: layer_results})
+    plot_results({METRIC: layer_results}, plot_path)
 
-    # Print diagnostic summary for anomaly detection
-    print_diagnostic_summary(entropies, results)
-
-    # Plot entropy distribution if metadata available
-    if metadata:
-        plot_entropy_distribution(entropies, metadata, entropy_dist_path)
+    # Print diagnostic summary
+    print_diagnostic_summary({METRIC: target}, {METRIC: layer_results})
 
 
 if __name__ == "__main__":

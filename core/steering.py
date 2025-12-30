@@ -347,3 +347,247 @@ def measure_steering_effect(
         "l2_change_mean": float(l2_change.mean()),
         "fraction_in_direction_mean": float(frac_in_direction.mean()),
     }
+
+
+# =============================================================================
+# ACTIVATION PATCHING
+# =============================================================================
+
+
+class PatchingHook:
+    """
+    Hook that replaces activations with pre-computed target activations.
+
+    Unlike steering (which adds a direction), patching swaps in the full
+    activation pattern from a different example. This tests whether the
+    complete activation (not just a 1D projection) causally determines behavior.
+
+    Usage:
+        # Load target activations from cache
+        target_act = cached_activations[target_idx]  # (hidden_dim,)
+
+        hook = PatchingHook(target_act, position="last")
+        handle = model.model.layers[layer_idx].register_forward_hook(hook)
+        # ... run source question through model ...
+        handle.remove()
+        # The model now saw target's activations at layer_idx
+    """
+
+    def __init__(
+        self,
+        target_activations: torch.Tensor,
+        position: str = "last",
+        last_token_indices: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            target_activations: Activations to inject.
+                - For single example: (hidden_dim,)
+                - For batch: (batch_size, hidden_dim)
+            position: Which token position to patch:
+                - "last": Last non-padding token (requires last_token_indices for padded batches)
+                - "all": All tokens (broadcasts target to all positions)
+                - int: Specific position index
+            last_token_indices: For padded batches with position="last", the index of
+                the last real token per batch item. Shape: (batch_size,)
+        """
+        # Handle numpy arrays
+        if isinstance(target_activations, np.ndarray):
+            target_activations = torch.tensor(target_activations, dtype=torch.float32)
+        else:
+            target_activations = target_activations.float().cpu()
+
+        self.target_activations = target_activations
+        self.position = position
+        self.last_token_indices = last_token_indices
+        self._device_set = False
+
+    def __call__(self, module, input, output):
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
+
+        # Move target to same device/dtype
+        if not self._device_set:
+            self.target_activations = self.target_activations.to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype
+            )
+            if self.last_token_indices is not None:
+                self.last_token_indices = self.last_token_indices.to(hidden_states.device)
+            self._device_set = True
+
+        batch_size = hidden_states.shape[0]
+
+        # Ensure target has batch dimension
+        if self.target_activations.dim() == 1:
+            # Single activation, broadcast to batch
+            target = self.target_activations.unsqueeze(0).expand(batch_size, -1)
+        else:
+            target = self.target_activations
+
+        if self.position == "last":
+            if self.last_token_indices is not None:
+                # Variable last positions (padded batch)
+                for i in range(batch_size):
+                    last_idx = self.last_token_indices[i].item()
+                    hidden_states[i, last_idx, :] = target[i]
+            else:
+                # Assume last position is -1 (no padding)
+                hidden_states[:, -1, :] = target
+        elif self.position == "all":
+            # Replace all positions with target (broadcasts)
+            hidden_states[:, :, :] = target.unsqueeze(1)
+        elif isinstance(self.position, int):
+            hidden_states[:, self.position, :] = target
+
+        if isinstance(output, tuple):
+            return (hidden_states,) + output[1:]
+        return hidden_states
+
+
+class BatchPatchingHook:
+    """
+    Hook for efficient batched patching with per-example targets.
+
+    When testing many source→target pairs, this hook allows running multiple
+    pairs in a single forward pass by specifying different target activations
+    for each batch element.
+
+    Usage:
+        # Prepare batch: sources are questions, targets are cached activations
+        source_prompts = [q1, q2, q3, ...]
+        target_activations = torch.stack([cached[t1], cached[t2], cached[t3], ...])
+
+        hook = BatchPatchingHook(target_activations)  # (batch, hidden)
+        handle = model.model.layers[layer_idx].register_forward_hook(hook)
+        outputs = model(tokenized_sources)
+        handle.remove()
+    """
+
+    def __init__(
+        self,
+        target_activations: torch.Tensor,
+        position: str = "last",
+        last_token_indices: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            target_activations: (batch_size, hidden_dim) - one target per batch element
+            position: "last", "all", or int
+            last_token_indices: (batch_size,) last token index for each example
+        """
+        if isinstance(target_activations, np.ndarray):
+            target_activations = torch.tensor(target_activations, dtype=torch.float32)
+        else:
+            target_activations = target_activations.float().cpu()
+
+        if target_activations.dim() != 2:
+            raise ValueError(f"Expected 2D target_activations (batch, hidden), got shape {target_activations.shape}")
+
+        self.target_activations = target_activations
+        self.position = position
+        self.last_token_indices = last_token_indices
+        self._device_set = False
+
+    def __call__(self, module, input, output):
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
+
+        if not self._device_set:
+            self.target_activations = self.target_activations.to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype
+            )
+            if self.last_token_indices is not None:
+                self.last_token_indices = self.last_token_indices.to(hidden_states.device)
+            self._device_set = True
+
+        batch_size = hidden_states.shape[0]
+
+        if batch_size != self.target_activations.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch: hidden_states has {batch_size}, "
+                f"target_activations has {self.target_activations.shape[0]}"
+            )
+
+        if self.position == "last":
+            if self.last_token_indices is not None:
+                for i in range(batch_size):
+                    last_idx = self.last_token_indices[i].item()
+                    hidden_states[i, last_idx, :] = self.target_activations[i]
+            else:
+                hidden_states[:, -1, :] = self.target_activations
+        elif self.position == "all":
+            hidden_states[:, :, :] = self.target_activations.unsqueeze(1)
+        elif isinstance(self.position, int):
+            hidden_states[:, self.position, :] = self.target_activations
+
+        if isinstance(output, tuple):
+            return (hidden_states,) + output[1:]
+        return hidden_states
+
+
+@contextmanager
+def patching_context(
+    model,
+    layer_idx: int,
+    target_activations: torch.Tensor,
+    position: str = "last",
+    last_token_indices: Optional[torch.Tensor] = None
+):
+    """
+    Context manager for activation patching at a single layer.
+
+    Usage:
+        with patching_context(model, layer_idx=15, target_activations=cached_act):
+            output = model(source_input_ids)
+            # output reflects source question with target's layer-15 activations
+    """
+    if hasattr(model, 'get_base_model'):
+        layers = model.get_base_model().model.layers
+    else:
+        layers = model.model.layers
+
+    hook = PatchingHook(target_activations, position, last_token_indices)
+    handle = layers[layer_idx].register_forward_hook(hook)
+
+    try:
+        yield hook
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def batch_patching_context(
+    model,
+    layer_idx: int,
+    target_activations: torch.Tensor,
+    position: str = "last",
+    last_token_indices: Optional[torch.Tensor] = None
+):
+    """
+    Context manager for batched activation patching.
+
+    Each batch element gets its own target activation injected.
+
+    Usage:
+        targets = torch.stack([cached[t1], cached[t2], ...])  # (batch, hidden)
+        with batch_patching_context(model, layer_idx=15, target_activations=targets):
+            output = model(source_batch_input_ids)
+    """
+    if hasattr(model, 'get_base_model'):
+        layers = model.get_base_model().model.layers
+    else:
+        layers = model.model.layers
+
+    hook = BatchPatchingHook(target_activations, position, last_token_indices)
+    handle = layers[layer_idx].register_forward_hook(hook)
+
+    try:
+        yield hook
+    finally:
+        handle.remove()

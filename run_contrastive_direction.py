@@ -38,6 +38,26 @@ from core import (
     generate_orthogonal_directions,
 )
 from core.steering import SteeringHook, AblationHook
+from core.probes import (
+    compute_cluster_centroids,
+    compute_cluster_directions,
+    compute_caa_direction,
+    compare_directions,
+)
+from tasks import (
+    # Confidence task
+    STATED_CONFIDENCE_OPTIONS,
+    STATED_CONFIDENCE_MIDPOINTS,
+    format_stated_confidence_prompt,
+    # Delegate task
+    ANSWER_OR_DELEGATE_SETUP,
+    ANSWER_OR_DELEGATE_SYSPROMPT,
+    ANSWER_OR_DELEGATE_OPTIONS,
+    format_answer_or_delegate_prompt,
+    get_delegate_mapping,
+    # Unified conversion
+    response_to_confidence as tasks_response_to_confidence,
+)
 
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
@@ -84,36 +104,23 @@ NUM_CONTROL_DIRECTIONS = 2
 MIN_PROJECTION_CORR = 0.5 # Minimum projection correlation for layer selection
 STEERING_BATCH_SIZE = 16  # Batch size for steering/ablation (increase for more GPU mem)
 
+# Direction comparison mode
+COMPARE_DIRECTIONS = True  # Set to True to compare different direction types
+N_CLUSTERS = 3  # Number of clusters for cluster-based directions (low/mid/high)
+CLUSTER_METHOD = "quantile"  # "quantile" (group by metric percentiles) or "kmeans"
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 random.seed(SEED)
 
-# Meta confidence scale (for confidence task)
-META_OPTION_DICT = {
-    "S": "<5%", "T": "5-10%", "U": "10-20%", "V": "20-40%",
-    "W": "40-60%", "X": "60-80%", "Y": "80-90%", "Z": ">90%"
-}
-META_RANGE_MIDPOINTS = {
-    "S": 0.025, "T": 0.075, "U": 0.15, "V": 0.3,
-    "W": 0.5, "X": 0.7, "Y": 0.85, "Z": 0.95
-}
-META_OPTIONS = list(META_OPTION_DICT.keys())
+# Backward compatibility aliases (now imported from tasks.py)
+META_OPTION_DICT = STATED_CONFIDENCE_OPTIONS
+META_RANGE_MIDPOINTS = STATED_CONFIDENCE_MIDPOINTS
+META_OPTIONS = list(STATED_CONFIDENCE_OPTIONS.keys())
 
-META_SETUP_PROMPT = "I'm going to show you a question, and I want you to tell me your level of confidence that you know the correct answer to this question. Respond only with the letter corresponding to the percentage range you choose; do NOT output any other text."
-META_QUESTION_PROMPT = "How confident are you that you know the correct answer to this question?"
-
-# Delegate task prompts and options
-DELEGATE_SETUP_PROMPT = """You are playing a game where you can either:
-1. Answer a multiple choice question yourself, OR
-2. Delegate to a teammate who answers 50% of questions correctly
-
-If you think you're MORE likely than 50% to get it right, you should answer yourself.
-If you think you're LESS likely than 50% to get it right, you should delegate.
-
-I'm going to show you a question. Based on the question, decide whether to ANSWER yourself or DELEGATE to your teammate.
-"""
-DELEGATE_SYSPROMPT = "Respond ONLY with '1' or '2'. Do NOT output any other text. Do not offer any explanation or justification.\n"
-DELEGATE_OPTIONS = ["1", "2"]
+DELEGATE_SETUP_PROMPT = ANSWER_OR_DELEGATE_SETUP
+DELEGATE_SYSPROMPT = ANSWER_OR_DELEGATE_SYSPROMPT
+DELEGATE_OPTIONS = ANSWER_OR_DELEGATE_OPTIONS
 
 
 def get_introspection_prefix() -> str:
@@ -228,68 +235,17 @@ def load_introspection_data(run_name: str = None) -> dict:
 
 
 # ============================================================================
-# STEERING HELPERS
+# STEERING HELPERS (wrappers around tasks.py functions)
 # ============================================================================
 
-def is_base_model(model_name: str) -> bool:
-    """Check if model is a base model (not instruction-tuned)."""
-    model_lower = model_name.lower()
-    instruct_indicators = ['instruct', 'chat', '-it', 'rlhf', 'sft', 'dpo']
-    return not any(ind in model_lower for ind in instruct_indicators)
-
-
-def has_chat_template(tokenizer) -> bool:
-    """Check if tokenizer has a chat template."""
-    try:
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}],
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        return True
-    except Exception:
-        return False
-
-
-def get_delegate_mapping(trial_index: int) -> Dict[str, str]:
-    """Return how digits map for this trial (alternates for position bias control)."""
-    if (trial_index % 2) == 1:
-        return {"1": "Answer", "2": "Delegate"}
-    else:
-        return {"1": "Delegate", "2": "Answer"}
-
-
-def _present_nested_question(question_data: Dict, outer_question: str, outer_options: Dict) -> str:
-    """Format a nested/meta question for display."""
-    formatted = "-" * 30 + "\n"
-    formatted += outer_question + "\n"
-    formatted += "-" * 10 + "\n"
-    formatted += question_data["question"] + "\n"
-    if "options" in question_data:
-        for key, value in question_data["options"].items():
-            formatted += f"  {key}: {value}\n"
-    formatted += "-" * 10 + "\n"
-    if outer_options:
-        for key, value in outer_options.items():
-            formatted += f"  {key}: {value}\n"
-    formatted += "-" * 30
-    return formatted
+# Import utility functions from core
+from core.model_utils import is_base_model, has_chat_template
 
 
 def format_meta_prompt(question: Dict, tokenizer, use_chat_template: bool = True) -> str:
-    """Format a meta/confidence question."""
-    q_text = _present_nested_question(question, META_QUESTION_PROMPT, META_OPTION_DICT)
-    options_str = ", ".join(META_OPTIONS[:-1]) + f", or {META_OPTIONS[-1]}"
-    llm_prompt = q_text + f"\nYour choice ({options_str}): "
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": META_SETUP_PROMPT},
-            {"role": "user", "content": llm_prompt}
-        ]
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        return f"{META_SETUP_PROMPT}\n\n{llm_prompt}"
+    """Format a meta/confidence question using centralized tasks.py logic."""
+    full_prompt, _ = format_stated_confidence_prompt(question, tokenizer, use_chat_template)
+    return full_prompt
 
 
 def format_delegate_prompt(
@@ -298,35 +254,11 @@ def format_delegate_prompt(
     use_chat_template: bool = True,
     trial_index: int = 0
 ) -> Tuple[str, List[str], Dict[str, str]]:
-    """Format a delegate question with alternating mapping."""
-    mapping = get_delegate_mapping(trial_index)
-
-    formatted_question = "-" * 30 + "\n"
-    formatted_question += "Question:\n"
-    formatted_question += question["question"] + "\n"
-
-    if "options" in question:
-        formatted_question += "-" * 10 + "\n"
-        for key, value in question["options"].items():
-            formatted_question += f"  {key}: {value}\n"
-
-    formatted_question += "-" * 30 + "\n"
-    formatted_question += "Choices:\n"
-    formatted_question += f"  1: {mapping['1']}\n"
-    formatted_question += f"  2: {mapping['2']}\n"
-    formatted_question += "Respond ONLY with '1' or '2'.\n"
-    formatted_question += "Your choice ('1' or '2'):"
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": DELEGATE_SYSPROMPT + DELEGATE_SETUP_PROMPT},
-            {"role": "user", "content": formatted_question}
-        ]
-        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        full_prompt = f"{DELEGATE_SYSPROMPT}\n{DELEGATE_SETUP_PROMPT}\n\n{formatted_question}"
-
-    return full_prompt, DELEGATE_OPTIONS, mapping
+    """Format a delegate question using centralized tasks.py logic."""
+    return format_answer_or_delegate_prompt(
+        question, tokenizer, trial_index=trial_index,
+        alternate_mapping=True, use_chat_template=use_chat_template
+    )
 
 
 def response_to_confidence(
@@ -334,20 +266,13 @@ def response_to_confidence(
     probs: np.ndarray = None,
     mapping: Dict[str, str] = None
 ) -> float:
-    """Convert a meta response to a confidence value."""
-    if META_TASK == "delegate":
-        if probs is not None and len(probs) >= 2 and mapping is not None:
-            if mapping.get("1") == "Answer":
-                return float(probs[0])
-            else:
-                return float(probs[1])
-        elif probs is not None and len(probs) >= 1:
-            return float(probs[0])
-        if mapping is not None:
-            return 1.0 if mapping.get(response) == "Answer" else 0.0
-        return 1.0 if response == "1" else 0.0
-    else:
-        return META_RANGE_MIDPOINTS.get(response, 0.5)
+    """
+    Convert a meta response to a confidence value.
+
+    Wrapper around tasks.response_to_confidence that passes the correct task_type.
+    """
+    task_type = "delegate" if META_TASK == "delegate" else "confidence"
+    return tasks_response_to_confidence(response, probs, mapping, task_type)
 
 
 def get_confidence_response(
@@ -1199,6 +1124,572 @@ def plot_results(
     print(f"\nPlot saved to {output_path}")
 
 
+# ============================================================================
+# DIRECTION COMPARISON
+# ============================================================================
+
+def compute_all_direction_types(
+    meta_activations: Dict[int, np.ndarray],
+    metric_values: np.ndarray,
+    direct_entropies: np.ndarray,
+    stated_confidences: np.ndarray,
+    n_clusters: int = 3,
+    cluster_method: str = "quantile"
+) -> Dict[int, Dict[str, np.ndarray]]:
+    """
+    Compute multiple direction types for each layer.
+
+    Direction types:
+    - contrastive: High conf/low entropy - Low conf/high entropy (calibrated examples)
+    - caa: Simple mean(high_metric) - mean(low_metric)
+    - cluster_low_to_high: Direction from low to high cluster centroid
+    - cluster_low_to_mid: Direction from low to mid cluster centroid
+    - cluster_mid_to_high: Direction from mid to high cluster centroid
+
+    Args:
+        meta_activations: Dict mapping layer_idx to activations (n_samples, hidden_dim)
+        metric_values: The metric to use for grouping (e.g., stated_confidences)
+        direct_entropies: Entropy values (used for contrastive direction)
+        stated_confidences: Confidence values (used for contrastive direction)
+        n_clusters: Number of clusters for cluster-based directions
+        cluster_method: "quantile" or "kmeans"
+
+    Returns:
+        Dict mapping layer_idx to Dict of direction_name -> direction_vector
+    """
+    print("\n" + "=" * 60)
+    print("COMPUTING ALL DIRECTION TYPES")
+    print("=" * 60)
+
+    all_directions = {}
+
+    for layer_idx in tqdm(sorted(meta_activations.keys()), desc="Computing directions"):
+        acts = meta_activations[layer_idx]
+        layer_directions = {}
+
+        # 1. Contrastive direction (calibrated high conf vs low conf)
+        try:
+            contrastive_info = compute_contrastive_direction_with_details(
+                acts, direct_entropies, stated_confidences
+            )
+            layer_directions["contrastive"] = contrastive_info["direction"]
+        except ValueError as e:
+            print(f"  Layer {layer_idx}: Could not compute contrastive direction: {e}")
+
+        # 2. CAA direction (simple mean difference)
+        try:
+            caa_direction, caa_info = compute_caa_direction(
+                acts, metric_values, high_quantile=0.25, low_quantile=0.25
+            )
+            layer_directions["caa"] = caa_direction
+        except ValueError as e:
+            print(f"  Layer {layer_idx}: Could not compute CAA direction: {e}")
+
+        # 3. Cluster-based directions
+        try:
+            cluster_info = compute_cluster_centroids(
+                acts, metric_values, n_clusters=n_clusters, method=cluster_method
+            )
+            cluster_dirs = compute_cluster_directions(
+                cluster_info["centroids"], normalize=True
+            )
+            # Add relevant cluster directions
+            for dir_name, direction in cluster_dirs.items():
+                layer_directions[f"cluster_{dir_name}"] = direction
+        except Exception as e:
+            print(f"  Layer {layer_idx}: Could not compute cluster directions: {e}")
+
+        all_directions[layer_idx] = layer_directions
+
+    # Print summary
+    if all_directions:
+        first_layer = list(all_directions.keys())[0]
+        dir_types = list(all_directions[first_layer].keys())
+        print(f"\nComputed direction types: {dir_types}")
+        print(f"Number of layers: {len(all_directions)}")
+
+    return all_directions
+
+
+def evaluate_direction_quality(
+    meta_activations: Dict[int, np.ndarray],
+    all_directions: Dict[int, Dict[str, np.ndarray]],
+    metric_values: np.ndarray,
+    metric_name: str = "confidence"
+) -> Dict[int, Dict[str, Dict]]:
+    """
+    Evaluate quality of each direction type by measuring correlation with metric.
+
+    For each layer and direction type:
+    - Project activations onto direction
+    - Compute correlation of projection with metric values
+    - Compute R² (variance explained)
+
+    Returns:
+        Dict mapping layer_idx to Dict of direction_name -> quality_metrics
+    """
+    print("\n" + "=" * 60)
+    print("EVALUATING DIRECTION QUALITY")
+    print("=" * 60)
+
+    # Z-score normalize metric
+    metric_z = stats.zscore(metric_values)
+
+    quality_results = {}
+
+    for layer_idx in sorted(all_directions.keys()):
+        acts = meta_activations[layer_idx]
+        layer_results = {}
+
+        for dir_name, direction in all_directions[layer_idx].items():
+            # Project onto direction
+            proj = acts @ direction
+
+            # Compute correlation with metric
+            corr, pval = stats.pearsonr(proj, metric_z)
+            r_squared = corr ** 2
+
+            layer_results[dir_name] = {
+                "correlation": float(corr),
+                "r_squared": float(r_squared),
+                "p_value": float(pval),
+            }
+
+        quality_results[layer_idx] = layer_results
+
+    # Print summary table
+    if quality_results:
+        first_layer = list(quality_results.keys())[0]
+        dir_types = list(quality_results[first_layer].keys())
+
+        print(f"\n{'Layer':<8}", end="")
+        for dt in dir_types:
+            short_name = dt[:12]
+            print(f"{short_name:<15}", end="")
+        print()
+        print("-" * (8 + 15 * len(dir_types)))
+
+        for layer_idx in sorted(quality_results.keys()):
+            print(f"{layer_idx:<8}", end="")
+            for dt in dir_types:
+                if dt in quality_results[layer_idx]:
+                    corr = quality_results[layer_idx][dt]["correlation"]
+                    print(f"{corr:+.4f}       ", end="")
+                else:
+                    print(f"{'N/A':<15}", end="")
+            print()
+
+    return quality_results
+
+
+def compare_direction_similarities(
+    all_directions: Dict[int, Dict[str, np.ndarray]],
+    layers: Optional[List[int]] = None
+) -> Dict[int, Dict[str, float]]:
+    """
+    Compare similarity between different direction types at each layer.
+
+    Returns:
+        Dict mapping layer_idx to Dict of "dirA_vs_dirB" -> cosine_similarity
+    """
+    print("\n" + "=" * 60)
+    print("DIRECTION SIMILARITY ANALYSIS")
+    print("=" * 60)
+
+    if layers is None:
+        layers = sorted(all_directions.keys())
+
+    similarity_results = {}
+
+    for layer_idx in layers:
+        if layer_idx not in all_directions:
+            continue
+
+        layer_dirs = all_directions[layer_idx]
+        if len(layer_dirs) < 2:
+            continue
+
+        # Use the compare_directions utility from core.probes
+        similarities = compare_directions(layer_dirs)
+        similarity_results[layer_idx] = similarities
+
+    # Print summary for key comparisons
+    if similarity_results:
+        first_layer = list(similarity_results.keys())[0]
+        comparison_keys = list(similarity_results[first_layer].keys())
+
+        # Focus on key comparisons
+        key_comparisons = [k for k in comparison_keys if "contrastive" in k or "caa" in k]
+        if key_comparisons:
+            print(f"\nKey direction comparisons (cosine similarity):")
+            print(f"{'Layer':<8}", end="")
+            for comp in key_comparisons[:5]:  # Limit to 5 for readability
+                print(f"{comp[:18]:<20}", end="")
+            print()
+            print("-" * (8 + 20 * min(5, len(key_comparisons))))
+
+            for layer_idx in sorted(similarity_results.keys()):
+                print(f"{layer_idx:<8}", end="")
+                for comp in key_comparisons[:5]:
+                    if comp in similarity_results[layer_idx]:
+                        sim = similarity_results[layer_idx][comp]
+                        print(f"{sim:.4f}              ", end="")
+                    else:
+                        print(f"{'N/A':<20}", end="")
+                print()
+
+    return similarity_results
+
+
+def run_direction_comparison_experiment(
+    model,
+    tokenizer,
+    questions: List[Dict],
+    direct_entropies: np.ndarray,
+    layers: List[int],
+    all_directions: Dict[int, Dict[str, np.ndarray]],
+    multipliers: List[float],
+    use_chat_template: bool,
+    batch_size: int = 8
+) -> Dict:
+    """
+    Run steering experiment comparing different direction types.
+
+    For each layer and direction type, run steering and measure effect.
+    This allows comparing the causal efficacy of different direction computation methods.
+
+    Returns:
+        Dict with per-layer, per-direction-type steering results
+    """
+    print("\n" + "=" * 70)
+    print("DIRECTION COMPARISON STEERING EXPERIMENT")
+    print("=" * 70)
+    print(f"  Layers: {layers}")
+    print(f"  Multipliers: {multipliers}")
+    print(f"  Questions: {len(questions)}")
+    print(f"  Batch size: {batch_size}")
+
+    # Get direction types from first layer
+    if not all_directions:
+        print("No directions to compare!")
+        return {}
+
+    first_layer = list(all_directions.keys())[0]
+    direction_types = list(all_directions[first_layer].keys())
+    print(f"  Direction types: {direction_types}")
+
+    entropy_mean = direct_entropies.mean()
+    entropy_std = direct_entropies.std()
+
+    def compute_results_from_batch(batch_results):
+        """Convert batch results to per-question result dicts."""
+        out = []
+        for q_idx, (response, confidence, probs, mapping) in enumerate(batch_results):
+            entropy = direct_entropies[q_idx]
+            entropy_z = (entropy - entropy_mean) / entropy_std
+            confidence_z = (confidence - 0.5) / 0.25
+            alignment = -entropy_z * confidence_z
+
+            out.append({
+                "question_idx": q_idx,
+                "response": response,
+                "confidence": confidence,
+                "entropy": float(entropy),
+                "alignment": float(alignment),
+            })
+        return out
+
+    results = {
+        "layers": layers,
+        "multipliers": multipliers,
+        "direction_types": direction_types,
+        "num_questions": len(questions),
+        "layer_results": {},
+    }
+
+    # Compute baseline once
+    print("\nComputing baseline (no steering)...")
+    baseline_batch = get_batch_confidence_responses(
+        model, tokenizer, questions, None, None, 0.0, use_chat_template, batch_size
+    )
+    shared_baseline = compute_results_from_batch(baseline_batch)
+
+    for layer_idx in tqdm(layers, desc="Layers"):
+        if layer_idx not in all_directions:
+            continue
+
+        layer_dirs = all_directions[layer_idx]
+        layer_results = {
+            "baseline": shared_baseline,
+            "direction_results": {},
+        }
+
+        for dir_type, direction in layer_dirs.items():
+            dir_results = {m: [] for m in multipliers}
+
+            for mult in tqdm(multipliers, desc=f"L{layer_idx}/{dir_type[:10]}", leave=False):
+                if mult == 0.0:
+                    dir_results[mult] = layer_results["baseline"]
+                    continue
+
+                batch_results = get_batch_confidence_responses(
+                    model, tokenizer, questions, layer_idx, direction, mult,
+                    use_chat_template, batch_size
+                )
+                dir_results[mult] = compute_results_from_batch(batch_results)
+
+            layer_results["direction_results"][dir_type] = dir_results
+
+        results["layer_results"][layer_idx] = layer_results
+        torch.cuda.empty_cache()
+
+    return results
+
+
+def analyze_direction_comparison_results(results: Dict) -> Dict:
+    """
+    Analyze direction comparison experiment results.
+
+    For each layer and direction type, compute:
+    - Mean confidence change at each multiplier
+    - Effect size (confidence change per unit multiplier)
+    - Comparison to other direction types
+    """
+    analysis = {
+        "layer_analysis": {},
+        "direction_type_summary": {},
+    }
+
+    all_direction_types = results.get("direction_types", [])
+    multipliers = results.get("multipliers", [])
+
+    # Initialize summary accumulators
+    for dt in all_direction_types:
+        analysis["direction_type_summary"][dt] = {
+            "mean_effect": [],
+            "layers": [],
+        }
+
+    for layer_idx, layer_results in results.get("layer_results", {}).items():
+        baseline_confidences = [r["confidence"] for r in layer_results["baseline"]]
+        baseline_mean = np.mean(baseline_confidences)
+
+        layer_analysis = {
+            "baseline_mean_confidence": float(baseline_mean),
+            "direction_effects": {},
+        }
+
+        for dir_type, dir_results in layer_results.get("direction_results", {}).items():
+            effects = {}
+            effect_per_mult = []
+
+            for mult in multipliers:
+                if mult == 0.0:
+                    effects[mult] = {
+                        "mean_confidence": float(baseline_mean),
+                        "confidence_change": 0.0,
+                    }
+                    continue
+
+                mult_confidences = [r["confidence"] for r in dir_results[mult]]
+                mult_mean = np.mean(mult_confidences)
+                change = mult_mean - baseline_mean
+
+                effects[mult] = {
+                    "mean_confidence": float(mult_mean),
+                    "confidence_change": float(change),
+                }
+
+                # Track effect per unit multiplier (for effect size)
+                effect_per_mult.append(change / abs(mult))
+
+            # Compute overall effect size (mean absolute effect per unit multiplier)
+            if effect_per_mult:
+                mean_effect = np.mean(np.abs(effect_per_mult))
+            else:
+                mean_effect = 0.0
+
+            layer_analysis["direction_effects"][dir_type] = {
+                "multiplier_effects": effects,
+                "mean_effect_per_unit": float(mean_effect),
+            }
+
+            # Accumulate for summary
+            if dir_type in analysis["direction_type_summary"]:
+                analysis["direction_type_summary"][dir_type]["mean_effect"].append(mean_effect)
+                analysis["direction_type_summary"][dir_type]["layers"].append(layer_idx)
+
+        analysis["layer_analysis"][layer_idx] = layer_analysis
+
+    # Compute overall summary for each direction type
+    for dt in all_direction_types:
+        if dt in analysis["direction_type_summary"]:
+            effects = analysis["direction_type_summary"][dt]["mean_effect"]
+            if effects:
+                analysis["direction_type_summary"][dt]["overall_mean_effect"] = float(np.mean(effects))
+                analysis["direction_type_summary"][dt]["overall_std_effect"] = float(np.std(effects))
+            else:
+                analysis["direction_type_summary"][dt]["overall_mean_effect"] = 0.0
+                analysis["direction_type_summary"][dt]["overall_std_effect"] = 0.0
+
+    return analysis
+
+
+def print_direction_comparison_summary(analysis: Dict):
+    """Print summary of direction comparison analysis."""
+    print("\n" + "=" * 70)
+    print("DIRECTION COMPARISON SUMMARY")
+    print("=" * 70)
+
+    # Overall direction type ranking
+    print("\nOverall Direction Type Effectiveness (mean effect per unit multiplier):")
+    print(f"{'Direction Type':<25} {'Mean Effect':<15} {'Std':<15}")
+    print("-" * 55)
+
+    summary = analysis.get("direction_type_summary", {})
+    sorted_types = sorted(
+        summary.keys(),
+        key=lambda dt: summary[dt].get("overall_mean_effect", 0),
+        reverse=True
+    )
+
+    for dt in sorted_types:
+        mean_eff = summary[dt].get("overall_mean_effect", 0)
+        std_eff = summary[dt].get("overall_std_effect", 0)
+        print(f"{dt:<25} {mean_eff:<15.4f} {std_eff:<15.4f}")
+
+    # Per-layer breakdown
+    print("\nPer-Layer Effect Comparison:")
+    layer_analysis = analysis.get("layer_analysis", {})
+
+    for layer_idx in sorted(layer_analysis.keys()):
+        layer = layer_analysis[layer_idx]
+        print(f"\n  Layer {layer_idx}:")
+        print(f"    {'Direction':<20} {'Effect/mult':<15}")
+        print(f"    {'-'*35}")
+
+        effects = layer.get("direction_effects", {})
+        sorted_dirs = sorted(
+            effects.keys(),
+            key=lambda d: effects[d].get("mean_effect_per_unit", 0),
+            reverse=True
+        )
+
+        for dt in sorted_dirs:
+            eff = effects[dt].get("mean_effect_per_unit", 0)
+            print(f"    {dt:<20} {eff:.4f}")
+
+
+def plot_direction_comparison(
+    quality_results: Dict[int, Dict[str, Dict]],
+    similarity_results: Dict[int, Dict[str, float]],
+    steering_analysis: Optional[Dict] = None,
+    output_path: str = "direction_comparison.png"
+):
+    """Plot direction comparison results."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Get data
+    layers = sorted(quality_results.keys())
+    if not layers:
+        print("No quality results to plot")
+        return
+
+    first_layer = layers[0]
+    direction_types = list(quality_results[first_layer].keys())
+
+    # 1. Correlation by layer for each direction type
+    ax = axes[0, 0]
+    for dt in direction_types:
+        correlations = []
+        valid_layers = []
+        for layer_idx in layers:
+            if dt in quality_results[layer_idx]:
+                correlations.append(quality_results[layer_idx][dt]["correlation"])
+                valid_layers.append(layer_idx)
+        if correlations:
+            ax.plot(valid_layers, correlations, 'o-', label=dt[:15], alpha=0.7)
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Correlation with Metric')
+    ax.set_title('Direction Quality by Layer\n(Correlation of Projection with Metric)')
+    ax.legend(loc='best', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 2. R² by layer
+    ax = axes[0, 1]
+    for dt in direction_types:
+        r2_values = []
+        valid_layers = []
+        for layer_idx in layers:
+            if dt in quality_results[layer_idx]:
+                r2_values.append(quality_results[layer_idx][dt]["r_squared"])
+                valid_layers.append(layer_idx)
+        if r2_values:
+            ax.plot(valid_layers, r2_values, 'o-', label=dt[:15], alpha=0.7)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('R² (Variance Explained)')
+    ax.set_title('Direction Quality by Layer\n(R² of Projection)')
+    ax.legend(loc='best', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 3. Direction similarity (contrastive vs others)
+    ax = axes[1, 0]
+    if similarity_results:
+        # Find comparisons involving contrastive
+        sample_layer = list(similarity_results.keys())[0]
+        contrastive_comps = [k for k in similarity_results[sample_layer].keys()
+                           if "contrastive" in k and k != "contrastive_vs_contrastive"]
+
+        for comp in contrastive_comps[:5]:  # Limit for readability
+            similarities = []
+            valid_layers = []
+            for layer_idx in layers:
+                if layer_idx in similarity_results and comp in similarity_results[layer_idx]:
+                    similarities.append(similarity_results[layer_idx][comp])
+                    valid_layers.append(layer_idx)
+            if similarities:
+                ax.plot(valid_layers, similarities, 'o-', label=comp[:20], alpha=0.7)
+
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Cosine Similarity')
+        ax.set_title('Direction Similarity\n(Contrastive vs Other Methods)')
+        ax.legend(loc='best', fontsize=8)
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No similarity data', ha='center', va='center')
+        ax.set_title('Direction Similarity')
+
+    # 4. Steering effect comparison (if available)
+    ax = axes[1, 1]
+    if steering_analysis and "layer_analysis" in steering_analysis:
+        layer_analysis = steering_analysis["layer_analysis"]
+        for dt in direction_types:
+            effects = []
+            valid_layers = []
+            for layer_idx in layers:
+                if (layer_idx in layer_analysis and
+                    dt in layer_analysis[layer_idx].get("direction_effects", {})):
+                    eff = layer_analysis[layer_idx]["direction_effects"][dt].get("mean_effect_per_unit", 0)
+                    effects.append(eff)
+                    valid_layers.append(layer_idx)
+            if effects:
+                ax.plot(valid_layers, effects, 'o-', label=dt[:15], alpha=0.7)
+
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Effect per Unit Multiplier')
+        ax.set_title('Steering Effect by Direction Type')
+        ax.legend(loc='best', fontsize=8)
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No steering data\n(Run with RUN_STEERING=True)', ha='center', va='center')
+        ax.set_title('Steering Effect Comparison')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\nDirection comparison plot saved to {output_path}")
+
+
 def main():
     print(f"Device: {DEVICE}")
     print(f"Contrastive selection: top {TOP_QUANTILE*100:.0f}% vs bottom {BOTTOM_QUANTILE*100:.0f}%")
@@ -1303,6 +1794,66 @@ def main():
     print(f"Directions saved to {output_prefix}_directions.npz")
 
     # ========================================================================
+    # DIRECTION COMPARISON (if enabled)
+    # ========================================================================
+    all_directions = None
+    quality_results = None
+    similarity_results = None
+    direction_comparison_analysis = None
+
+    if COMPARE_DIRECTIONS:
+        print("\n" + "=" * 70)
+        print("DIRECTION COMPARISON MODE")
+        print("=" * 70)
+
+        # Compute all direction types for each layer
+        all_directions = compute_all_direction_types(
+            meta_activations,
+            metric_values=stated_confidences,
+            direct_entropies=direct_entropies,
+            stated_confidences=stated_confidences,
+            n_clusters=N_CLUSTERS,
+            cluster_method=CLUSTER_METHOD
+        )
+
+        # Evaluate quality of each direction type
+        quality_results = evaluate_direction_quality(
+            meta_activations,
+            all_directions,
+            metric_values=stated_confidences,
+            metric_name="confidence"
+        )
+
+        # Compare similarity between direction types
+        similarity_results = compare_direction_similarities(all_directions)
+
+        # Save all directions
+        all_directions_for_save = {}
+        for layer_idx, layer_dirs in all_directions.items():
+            for dir_name, direction in layer_dirs.items():
+                all_directions_for_save[f"layer_{layer_idx}_{dir_name}"] = direction
+        np.savez_compressed(f"{output_prefix}_all_directions.npz", **all_directions_for_save)
+        print(f"\nAll directions saved to {output_prefix}_all_directions.npz")
+
+        # Save quality results
+        quality_results_serializable = {
+            str(k): v for k, v in quality_results.items()
+        }
+        quality_path = f"{output_prefix}_direction_quality.json"
+        with open(quality_path, "w") as f:
+            json.dump(quality_results_serializable, f, indent=2)
+        print(f"Direction quality saved to {quality_path}")
+
+        # Save similarity results
+        similarity_results_serializable = {
+            str(k): v for k, v in similarity_results.items()
+        }
+        similarity_path = f"{output_prefix}_direction_similarity.json"
+        with open(similarity_path, "w") as f:
+            json.dump(similarity_results_serializable, f, indent=2)
+        print(f"Direction similarity saved to {similarity_path}")
+
+    # ========================================================================
     # STEERING/ABLATION EXPERIMENTS
     # ========================================================================
     if RUN_STEERING:
@@ -1400,6 +1951,51 @@ def main():
                 json.dump(ablation_analysis, f, indent=2,
                           default=lambda x: float(x) if isinstance(x, (np.floating, np.float16, np.float32, np.float64)) else x)
             print(f"Ablation analysis saved to {ablation_analysis_path}")
+
+            # ================================================================
+            # DIRECTION COMPARISON STEERING (if enabled)
+            # ================================================================
+            if COMPARE_DIRECTIONS and all_directions is not None:
+                print("\n" + "=" * 70)
+                print("DIRECTION COMPARISON STEERING EXPERIMENT")
+                print("=" * 70)
+
+                # Run steering experiment comparing all direction types
+                direction_comparison_results = run_direction_comparison_experiment(
+                    model, tokenizer, questions, steering_entropies,
+                    steering_layers, all_directions, STEERING_MULTIPLIERS,
+                    use_chat_template, batch_size=STEERING_BATCH_SIZE
+                )
+
+                # Analyze results
+                direction_comparison_analysis = analyze_direction_comparison_results(
+                    direction_comparison_results
+                )
+                print_direction_comparison_summary(direction_comparison_analysis)
+
+                # Save direction comparison results
+                direction_comp_path = f"{output_prefix}_direction_comparison_results.json"
+                with open(direction_comp_path, "w") as f:
+                    json.dump(direction_comparison_results, f, indent=2,
+                              default=lambda x: float(x) if isinstance(x, (np.floating, np.float16, np.float32, np.float64)) else x)
+                print(f"\nDirection comparison results saved to {direction_comp_path}")
+
+                direction_comp_analysis_path = f"{output_prefix}_direction_comparison_analysis.json"
+                with open(direction_comp_analysis_path, "w") as f:
+                    json.dump(direction_comparison_analysis, f, indent=2,
+                              default=lambda x: float(x) if isinstance(x, (np.floating, np.float16, np.float32, np.float64)) else x)
+                print(f"Direction comparison analysis saved to {direction_comp_analysis_path}")
+
+    # ========================================================================
+    # FINAL PLOTS (if direction comparison was enabled)
+    # ========================================================================
+    if COMPARE_DIRECTIONS and quality_results is not None:
+        plot_direction_comparison(
+            quality_results,
+            similarity_results or {},
+            steering_analysis=direction_comparison_analysis,
+            output_path=f"{output_prefix}_direction_comparison.png"
+        )
 
     print("\n" + "=" * 70)
     print("CONTRASTIVE DIRECTION ANALYSIS COMPLETE")

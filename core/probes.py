@@ -582,3 +582,247 @@ def run_introspection_mapping_analysis(
         }
 
     return results, directions
+
+
+# ============================================================================
+# CLUSTER-BASED DIRECTION COMPUTATION
+# ============================================================================
+
+
+def compute_cluster_centroids(
+    activations: np.ndarray,
+    metric_values: np.ndarray,
+    n_clusters: int = 3,
+    method: str = "quantile"
+) -> Dict:
+    """
+    Compute cluster centroids for activations grouped by metric value.
+
+    This supports cluster-based interventions where uncertainty may be encoded
+    categorically rather than continuously (e.g., low/mid/high as discrete states).
+
+    Args:
+        activations: (n_samples, hidden_dim) activation matrix
+        metric_values: (n_samples,) the uncertainty metric to cluster by
+        n_clusters: Number of clusters (e.g., 3 for low/mid/high)
+        method: Clustering method:
+            - "quantile": Group by metric value percentiles (always uses metric)
+            - "kmeans": Cluster in activation space (may not align with metric)
+
+    Returns:
+        Dict with:
+            - centroids: (n_clusters, hidden_dim) cluster centers
+            - labels: (n_samples,) cluster assignment per sample
+            - boundaries: metric value boundaries for quantile method
+            - cluster_sizes: (n_clusters,) number of samples per cluster
+            - cluster_metric_means: (n_clusters,) mean metric value per cluster
+    """
+    n_samples = len(metric_values)
+
+    if method == "quantile":
+        # Group by metric percentiles
+        percentiles = np.linspace(0, 100, n_clusters + 1)
+        boundaries = np.percentile(metric_values, percentiles)
+
+        labels = np.zeros(n_samples, dtype=int)
+        for i in range(n_clusters):
+            if i == n_clusters - 1:
+                # Last cluster includes the max
+                mask = (metric_values >= boundaries[i]) & (metric_values <= boundaries[i + 1])
+            else:
+                mask = (metric_values >= boundaries[i]) & (metric_values < boundaries[i + 1])
+            labels[mask] = i
+
+        # Compute centroids
+        centroids = np.zeros((n_clusters, activations.shape[1]))
+        for i in range(n_clusters):
+            cluster_mask = labels == i
+            if cluster_mask.sum() > 0:
+                centroids[i] = activations[cluster_mask].mean(axis=0)
+
+    elif method == "kmeans":
+        from sklearn.cluster import KMeans
+
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(activations)
+        centroids = kmeans.cluster_centers_
+
+        # Sort clusters by mean metric value so cluster 0 = lowest metric
+        cluster_metric_means = [metric_values[labels == i].mean() for i in range(n_clusters)]
+        sorted_order = np.argsort(cluster_metric_means)
+
+        # Remap labels and centroids to sorted order
+        label_map = {old: new for new, old in enumerate(sorted_order)}
+        labels = np.array([label_map[l] for l in labels])
+        centroids = centroids[sorted_order]
+
+        # Boundaries not meaningful for kmeans, but compute approximate ones
+        boundaries = np.array([metric_values[labels == i].min() for i in range(n_clusters)] +
+                              [metric_values.max()])
+
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'quantile' or 'kmeans'.")
+
+    # Compute cluster statistics
+    cluster_sizes = np.array([np.sum(labels == i) for i in range(n_clusters)])
+    cluster_metric_means = np.array([metric_values[labels == i].mean() for i in range(n_clusters)])
+
+    return {
+        "centroids": centroids,
+        "labels": labels,
+        "boundaries": boundaries,
+        "cluster_sizes": cluster_sizes,
+        "cluster_metric_means": cluster_metric_means,
+        "n_clusters": n_clusters,
+        "method": method,
+    }
+
+
+def compute_cluster_directions(
+    centroids: np.ndarray,
+    normalize: bool = True
+) -> Dict[str, np.ndarray]:
+    """
+    Compute pairwise directions between cluster centroids.
+
+    These directions can be used for steering: moving along "low_to_high"
+    should shift the model's behavior from low-metric to high-metric.
+
+    Args:
+        centroids: (n_clusters, hidden_dim) cluster centers, ordered by metric value
+                  (cluster 0 = lowest metric, cluster -1 = highest)
+        normalize: Whether to normalize directions to unit length
+
+    Returns:
+        Dict mapping direction name to direction vector:
+            - "low_to_high": From lowest to highest cluster
+            - "low_to_mid": From lowest to middle cluster (if 3+ clusters)
+            - "mid_to_high": From middle to highest cluster (if 3+ clusters)
+            Plus additional pairwise directions for larger n_clusters
+    """
+    n_clusters = len(centroids)
+    directions = {}
+
+    # Primary direction: lowest to highest
+    direction = centroids[-1] - centroids[0]
+    if normalize:
+        direction = direction / (np.linalg.norm(direction) + 1e-10)
+    directions["low_to_high"] = direction
+
+    # Additional directions for 3+ clusters
+    if n_clusters >= 3:
+        mid_idx = n_clusters // 2
+
+        # Low to mid
+        direction = centroids[mid_idx] - centroids[0]
+        if normalize:
+            direction = direction / (np.linalg.norm(direction) + 1e-10)
+        directions["low_to_mid"] = direction
+
+        # Mid to high
+        direction = centroids[-1] - centroids[mid_idx]
+        if normalize:
+            direction = direction / (np.linalg.norm(direction) + 1e-10)
+        directions["mid_to_high"] = direction
+
+    # For completeness, add all pairwise directions (useful for analysis)
+    for i in range(n_clusters):
+        for j in range(i + 1, n_clusters):
+            direction = centroids[j] - centroids[i]
+            if normalize:
+                direction = direction / (np.linalg.norm(direction) + 1e-10)
+            directions[f"cluster_{i}_to_{j}"] = direction
+
+    return directions
+
+
+def compute_caa_direction(
+    activations: np.ndarray,
+    metric_values: np.ndarray,
+    high_quantile: float = 0.25,
+    low_quantile: float = 0.25
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Compute Contrastive Activation Addition (CAA) direction.
+
+    Direction = mean(high_metric_activations) - mean(low_metric_activations)
+
+    Unlike probe directions (which are optimized for prediction), CAA captures
+    the empirical difference between high and low metric examples.
+
+    Args:
+        activations: (n_samples, hidden_dim) activation matrix
+        metric_values: (n_samples,) metric values to contrast
+        high_quantile: Top fraction of samples to use for high group
+        low_quantile: Bottom fraction of samples to use for low group
+
+    Returns:
+        Tuple of:
+            - direction: Normalized CAA direction vector
+            - info: Dict with group statistics
+    """
+    n = len(metric_values)
+    sorted_idx = np.argsort(metric_values)
+
+    # Low group (bottom quantile)
+    n_low = int(n * low_quantile)
+    low_idx = sorted_idx[:n_low]
+
+    # High group (top quantile)
+    n_high = int(n * high_quantile)
+    high_idx = sorted_idx[-n_high:]
+
+    # Compute means
+    mean_low = activations[low_idx].mean(axis=0)
+    mean_high = activations[high_idx].mean(axis=0)
+
+    # CAA direction
+    direction = mean_high - mean_low
+    direction_norm = np.linalg.norm(direction)
+    direction = direction / (direction_norm + 1e-10)
+
+    info = {
+        "n_low": n_low,
+        "n_high": n_high,
+        "metric_mean_low": float(metric_values[low_idx].mean()),
+        "metric_mean_high": float(metric_values[high_idx].mean()),
+        "metric_std_low": float(metric_values[low_idx].std()),
+        "metric_std_high": float(metric_values[high_idx].std()),
+        "direction_magnitude": float(direction_norm),
+        "high_quantile": high_quantile,
+        "low_quantile": low_quantile,
+    }
+
+    return direction, info
+
+
+def compare_directions(
+    directions: Dict[str, np.ndarray]
+) -> Dict[str, float]:
+    """
+    Compute pairwise cosine similarities between direction vectors.
+
+    Useful for comparing probe directions, CAA directions, and cluster directions
+    to see if they identify similar representational axes.
+
+    Args:
+        directions: Dict mapping direction name to direction vector
+
+    Returns:
+        Dict mapping "name1_vs_name2" to cosine similarity
+    """
+    names = list(directions.keys())
+    similarities = {}
+
+    for i, name1 in enumerate(names):
+        for j, name2 in enumerate(names):
+            if i < j:
+                d1 = directions[name1]
+                d2 = directions[name2]
+                # Normalize just in case
+                d1 = d1 / (np.linalg.norm(d1) + 1e-10)
+                d2 = d2 / (np.linalg.norm(d2) + 1e-10)
+                sim = float(np.dot(d1, d2))
+                similarities[f"{name1}_vs_{name2}"] = sim
+
+    return similarities

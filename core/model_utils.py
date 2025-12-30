@@ -120,7 +120,7 @@ def load_model_and_tokenizer(
         Tuple of (model, tokenizer, num_layers)
     """
     if torch_dtype is None:
-        torch_dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+        torch_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
 
     print(f"Loading model: {base_model_name}")
 

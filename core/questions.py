@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import numpy as np
 
+# Import centralized prompt formatting from tasks.py
+from tasks import format_direct_prompt as _format_direct_prompt_impl
+
 
 def load_questions(
     dataset_name: str,
@@ -152,6 +155,8 @@ def format_direct_prompt(
     """
     Format a direct MC question prompt.
 
+    This is a thin wrapper around tasks.format_direct_prompt for backward compatibility.
+
     Args:
         question: Question dict with 'question' and 'options'
         tokenizer: Tokenizer for chat template
@@ -161,45 +166,7 @@ def format_direct_prompt(
     Returns:
         Tuple of (full_prompt, option_keys)
     """
-    if setup_prompt is None:
-        setup_prompt = "I'm going to ask you a series of multiple-choice questions. For each one, select the answer you think is best. Respond only with the letter of your choice; do NOT output any other text."
-
-    # Format question
-    formatted = ""
-    formatted += "-" * 30 + "\n"
-    formatted += "Question:\n"
-    formatted += question["question"] + "\n"
-
-    options = list(question["options"].keys())
-    if options:
-        formatted += "-" * 10 + "\n"
-        for key, value in question["options"].items():
-            formatted += f"  {key}: {value}\n"
-
-    formatted += "-" * 30
-
-    options_str = (
-        " or ".join(options)
-        if len(options) == 2
-        else ", ".join(options[:-1]) + f", or {options[-1]}"
-    )
-    llm_prompt = formatted + f"\nYour choice ({options_str}): "
-
-    if use_chat_template:
-        try:
-            messages = [
-                {"role": "system", "content": setup_prompt},
-                {"role": "user", "content": llm_prompt}
-            ]
-            full_prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except:
-            full_prompt = f"{setup_prompt}\n\n{llm_prompt}"
-    else:
-        full_prompt = f"{setup_prompt}\n\n{llm_prompt}"
-
-    return full_prompt, options
+    return _format_direct_prompt_impl(question, tokenizer, use_chat_template, setup_prompt)
 
 
 def split_questions(

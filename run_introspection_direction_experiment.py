@@ -42,6 +42,15 @@ import seaborn as sns
 load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
+from tasks import (
+    # Confidence task
+    STATED_CONFIDENCE_OPTIONS,
+    STATED_CONFIDENCE_MIDPOINTS,
+    STATED_CONFIDENCE_SETUP,
+    STATED_CONFIDENCE_QUESTION,
+    format_stated_confidence_prompt,
+)
+
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
@@ -90,42 +99,15 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 random.seed(SEED)
 
-# Meta confidence scale (from other scripts)
-META_OPTION_DICT = {
-    "S": "<5%", "T": "5-10%", "U": "10-20%", "V": "20-40%",
-    "W": "40-60%", "X": "60-80%", "Y": "80-90%", "Z": ">90%"
-}
-META_RANGE_MIDPOINTS = {
-    "S": 0.025, "T": 0.075, "U": 0.15, "V": 0.3,
-    "W": 0.5, "X": 0.7, "Y": 0.85, "Z": 0.95
-}
-META_OPTIONS = list(META_OPTION_DICT.keys())
+# Backward compatibility aliases (now imported from tasks.py)
+META_OPTION_DICT = STATED_CONFIDENCE_OPTIONS
+META_RANGE_MIDPOINTS = STATED_CONFIDENCE_MIDPOINTS
+META_OPTIONS = list(STATED_CONFIDENCE_OPTIONS.keys())
+META_SETUP_PROMPT = STATED_CONFIDENCE_SETUP
+META_QUESTION_PROMPT = STATED_CONFIDENCE_QUESTION
 
-# Meta prompt setup
-META_SETUP_PROMPT = "I'm going to show you a question, and I want you to tell me your level of confidence that you know the correct answer to this question. Respond only with the letter corresponding to the percentage range you choose; do NOT output any other text."
-META_QUESTION_PROMPT = "How confident are you that you know the correct answer to this question?"
-
-
-def is_base_model(model_name: str) -> bool:
-    """Check if model is a base model (not instruction-tuned)."""
-    model_lower = model_name.lower()
-    # Base models typically don't have these suffixes
-    instruct_indicators = ['instruct', 'chat', '-it', 'rlhf', 'sft', 'dpo']
-    return not any(ind in model_lower for ind in instruct_indicators)
-
-
-def has_chat_template(tokenizer) -> bool:
-    """Check if tokenizer has a chat template."""
-    try:
-        # Try to apply chat template with a simple message
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}],
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        return True
-    except Exception:
-        return False
+# Import utility functions from core
+from core.model_utils import is_base_model, has_chat_template
 
 
 # ============================================================================
@@ -329,36 +311,8 @@ def _present_nested_question(question_data: Dict, outer_question: str, outer_opt
 
 
 def format_meta_prompt(question: Dict, tokenizer, use_chat_template: bool = True) -> str:
-    """
-    Format a meta/confidence question.
-
-    Args:
-        question: The question dict with 'question' and 'options'
-        tokenizer: The tokenizer
-        use_chat_template: If True, use chat template. If False, use plain text format for base models.
-
-    Returns:
-        The formatted prompt string
-    """
-    q_text = _present_nested_question(question, META_QUESTION_PROMPT, META_OPTION_DICT)
-    options_str = ", ".join(META_OPTIONS[:-1]) + f", or {META_OPTIONS[-1]}"
-    llm_prompt = q_text + f"\nYour choice ({options_str}): "
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": META_SETUP_PROMPT},
-            {"role": "user", "content": llm_prompt}
-        ]
-
-        full_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    else:
-        # Plain text format for base models
-        full_prompt = f"{META_SETUP_PROMPT}\n\n{llm_prompt}"
-
+    """Format a meta/confidence question using centralized tasks.py logic."""
+    full_prompt, _ = format_stated_confidence_prompt(question, tokenizer, use_chat_template)
     return full_prompt
 
 

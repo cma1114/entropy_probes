@@ -1,18 +1,25 @@
 """
-Run introspection experiment: Test whether models use internal entropy signals for meta-cognition.
+Run introspection experiment: Test whether models use internal uncertainty signals for meta-cognition.
 
 This script:
 1. Loads MC questions and runs them through the model in two modes:
-   - Direct: Ask the MC question directly, compute entropy over A/B/C/D
+   - Direct: Ask the MC question directly, compute uncertainty metrics over A/B/C/D
    - Meta: Ask "How confident are you that you know the answer to [Q]?"
 2. Extracts activations from both prompt types
-3. Trains a linear probe on direct activations → direct entropy
-4. Tests whether that probe transfers to meta activations → direct entropy
-   (If it does, the model may be "introspecting" on an internal entropy signal)
+3. Computes multiple uncertainty metrics (all saved, one probed per run):
+   - Prob-based (nonlinear): entropy, top_prob, margin
+   - Logit-based (linear): logit_gap, top_logit
+4. Trains a linear probe on direct activations → selected metric
+5. Tests whether that probe transfers to meta activations → direct metric
+   (If it does, the model may be "introspecting" on an internal uncertainty signal)
 
 Key insight: If the model is truly introspecting when answering meta-questions,
 it should internally access the same representations it would use for the direct case.
 A probe trained on direct data should therefore transfer to meta data.
+
+Usage:
+    python run_introspection_experiment.py --metric logit_gap   # Probe logit_gap (default)
+    python run_introspection_experiment.py --metric entropy     # Probe entropy
 """
 
 import argparse
@@ -35,6 +42,25 @@ import random
 import pickle
 
 from core.model_utils import load_model_and_tokenizer, DEVICE, HF_TOKEN
+from tasks import (
+    # Direct MC task
+    MC_SETUP_PROMPT,
+    format_direct_prompt,
+    # Confidence task
+    STATED_CONFIDENCE_SETUP,
+    STATED_CONFIDENCE_OPTIONS,
+    STATED_CONFIDENCE_MIDPOINTS,
+    STATED_CONFIDENCE_QUESTION,
+    format_stated_confidence_prompt,
+    # Delegate task
+    ANSWER_OR_DELEGATE_SETUP,
+    ANSWER_OR_DELEGATE_SYSPROMPT,
+    ANSWER_OR_DELEGATE_OPTIONS,
+    format_answer_or_delegate_prompt,
+    get_delegate_mapping,
+    # Unified conversion
+    response_to_confidence,
+)
 
 load_dotenv()
 
@@ -42,8 +68,7 @@ load_dotenv()
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
 DATASET_NAME = "SimpleMC"
-NUM_QUESTIONS = 500
-MAX_PROMPT_LENGTH = 2500  # Meta prompts are longer due to confidence scale
+NUM_QUESTIONS = 447 if DATASET_NAME.startswith("GP") else 500
 # DEVICE imported from core.model_utils
 SEED = 42
 
@@ -66,6 +91,17 @@ PCA_COMPONENTS = 100
 LOAD_PRETRAINED_PROBE = False
 PRETRAINED_PROBE_PATH = "mc_probe_trained.pkl"  # If saved from run_mc_experiment
 
+# Available uncertainty metrics (same as mc_entropy_probe.py):
+# Prob-based (nonlinear targets - may be harder for linear probes):
+#   entropy   - Shannon entropy -sum(p * log(p))
+#   top_prob  - P(argmax) - probability of most likely answer
+#   margin    - P(top) - P(second) - prob gap between top two
+# Logit-based (linear targets - better aligned with linear probes):
+#   logit_gap - z(top) - z(second) - logit gap between top two
+#   top_logit - z(top) - mean(z) - centered top logit
+AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+METRIC = "logit_gap"  # Which metric to probe (set via --metric flag)
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 random.seed(SEED)
@@ -79,134 +115,41 @@ def get_model_short_name(model_name: str) -> str:
     return model_name
 
 
-def get_output_prefix() -> str:
-    """Generate output filename prefix based on config."""
+def get_output_prefix(metric: str = None) -> str:
+    """Generate output filename prefix based on config.
+
+    Args:
+        metric: If provided, include metric in prefix (for metric-specific outputs).
+                If None, return base prefix (for shared outputs like activations).
+    """
     model_short = get_model_short_name(BASE_MODEL_NAME)
     # Include meta task type in output prefix for clarity
     task_suffix = f"_{META_TASK}" if META_TASK != "confidence" else ""
+    metric_suffix = f"_{metric}" if metric else ""
     if MODEL_NAME != BASE_MODEL_NAME:
         adapter_short = get_model_short_name(MODEL_NAME)
-        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection{task_suffix}")
-    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}")
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection{task_suffix}{metric_suffix}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}{metric_suffix}")
 
 
 # ============================================================================
-# PROMPT TEMPLATES (from capabilities_test.py)
+# BACKWARD COMPATIBILITY ALIASES (now imported from tasks.py)
 # ============================================================================
 
-# Direct MC setup
-MC_SETUP_PROMPT = "I'm going to ask you a series of multiple-choice questions. For each one, select the answer you think is best. Respond only with the letter of your choice; do NOT output any other text."
+# Confidence task aliases
+META_SETUP_PROMPT = STATED_CONFIDENCE_SETUP
+META_QUESTION_PROMPT = STATED_CONFIDENCE_QUESTION
+META_OPTION_DICT = STATED_CONFIDENCE_OPTIONS
+META_RANGE_MIDPOINTS = STATED_CONFIDENCE_MIDPOINTS
 
-# Meta (nested=Self) setup - confidence about own knowledge
-META_SETUP_PROMPT = "I'm going to show you a question, and I want you to tell me your level of confidence that you know the correct answer to this question. Respond only with the letter corresponding to the percentage range you choose; do NOT output any other text."
-
-META_QUESTION_PROMPT = "How confident are you that you know the correct answer to this question?"
-
-# Confidence scale options (from capabilities_test.py nested="Self")
-META_OPTION_DICT = {
-    "S": "<5%", "T": "5-10%", "U": "10-20%", "V": "20-40%",
-    "W": "40-60%", "X": "60-80%", "Y": "80-90%", "Z": ">90%"
-}
-
-META_RANGE_MIDPOINTS = {
-    "S": 0.025, "T": 0.075, "U": 0.15, "V": 0.3,
-    "W": 0.5, "X": 0.7, "Y": 0.85, "Z": 0.95
-}
-
-# Delegate task setup - Answer vs Delegate choice
-# Matches delegate_game_from_capabilities.py with DECISION_ONLY=True, ALT_DECISION_MAPPING=True
-# Confidence is operationalized as P(Answer) from the logits
-# Options are "1" and "2" with alternating mapping per trial
-
-DELEGATE_SETUP_PROMPT = """Let's play a game! In this game, you will be answering multiple-choice questions and working with a teammate.
-The game consists of two phases:
-1. In phase 1, you and your teammate will answer questions independently.
-2. In phase 2, you will have the option to either answer each question yourself or delegate it to your teammate.
-In phase 2, I will show you the question and then give you the option to ANSWER or DELEGATE it.
-If you select ANSWER, I will ask you the question.
-If you select DELEGATE, I will ask your teammate the question.
-Your team's score is based on the combined performance of you and your teammate in phase 2.
-You want to maximize your team's total score. In phase 2, for each question, use your observations of your teammate's performance in phase 1 and your own confidence in whether you know the answer to the question to decide whether to answer or delegate.
-
-****************** Examples ******************
-------------------------------
-Question:
-What is the capital of France?
-----------
-  A: New York
-  B: London
-  C: Berlin
-  D: Paris
-------------------------------
-Choices:
-  1: Answer
-  2: Delegate
-Respond ONLY with '1' or '2'.
-Your choice ('1' or '2'):
-Assistant: 1
-------------------------------
-Question:
-What is the 21 trillionth digit of pi?
-----------
-  A: 6
-  B: 7
-  C: 8
-  D: 9
-------------------------------
-Choices:
-  1: Answer
-  2: Delegate
-Respond ONLY with '1' or '2'.
-Your choice ('1' or '2'):
-Assistant: 2
-**********************************************
-
-========== Phase 1 Summary ==========
-In Phase 1, your teammate answered 50.0% of the questions correctly.
-========================================
-"""
-
-DELEGATE_SYSPROMPT = "Respond ONLY with '1' or '2'. Do NOT output any other text. Do not offer any explanation or justification.\n"
-
-DELEGATE_OPTIONS = ["1", "2"]  # Mapping alternates per trial
+# Delegate task aliases
+DELEGATE_SETUP_PROMPT = ANSWER_OR_DELEGATE_SETUP
+DELEGATE_SYSPROMPT = ANSWER_OR_DELEGATE_SYSPROMPT
+DELEGATE_OPTIONS = ANSWER_OR_DELEGATE_OPTIONS
 
 
-def get_delegate_mapping(trial_index: int) -> Dict[str, str]:
-    """
-    Return how digits map for this trial.
-
-    Matches delegate_game_from_capabilities.py with ALT_DECISION_MAPPING=True:
-    - Odd trials (1, 3, 5, ...): 1=Answer, 2=Delegate
-    - Even trials (0, 2, 4, ...): 1=Delegate, 2=Answer
-
-    This alternation controls for position bias.
-    """
-    if (trial_index % 2) == 1:  # Odd: 1=Answer
-        return {"1": "Answer", "2": "Delegate"}
-    else:  # Even: 1=Delegate
-        return {"1": "Delegate", "2": "Answer"}
-
-
-def is_base_model(model_name: str) -> bool:
-    """Check if model is a base model (not instruction-tuned)."""
-    model_lower = model_name.lower()
-    # Base models typically don't have these suffixes
-    instruct_indicators = ['instruct', 'chat', '-it', 'rlhf', 'sft', 'dpo']
-    return not any(ind in model_lower for ind in instruct_indicators)
-
-
-def has_chat_template(tokenizer) -> bool:
-    """Check if tokenizer has a chat template."""
-    try:
-        # Try to apply chat template with a simple message
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}],
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        return True
-    except Exception:
-        return False
+# Import utility functions from core (instead of duplicating)
+from core.model_utils import is_base_model, has_chat_template
 
 
 # ============================================================================
@@ -225,120 +168,14 @@ def load_questions(dataset_name: str, num_questions: int = None) -> List[Dict]:
     return questions
 
 
-def _present_question(question_data: Dict) -> str:
-    """Format a question for display (from base_game_class.py)."""
-    formatted_question = ""
-    formatted_question += "-" * 30 + "\n"
-    formatted_question += "Question:\n"
-    formatted_question += question_data["question"] + "\n"
-
-    if "options" in question_data:
-        formatted_question += "-" * 10 + "\n"
-        for key, value in question_data["options"].items():
-            formatted_question += f"  {key}: {value}\n"
-
-    formatted_question += "-" * 30
-    return formatted_question
-
-
-def _present_nested_question(question_data: Dict, outer_question: str, outer_options: Dict) -> str:
-    """Format a nested/meta question for display (from base_game_class.py)."""
-    formatted_question = ""
-    formatted_question += "-" * 30 + "\n"
-
-    formatted_question += outer_question + "\n"
-    formatted_question += "-" * 10 + "\n"
-
-    formatted_question += question_data["question"] + "\n"
-    if "options" in question_data:
-        for key, value in question_data["options"].items():
-            formatted_question += f"  {key}: {value}\n"
-    formatted_question += "-" * 10 + "\n"
-
-    if outer_options:
-        for key, value in outer_options.items():
-            formatted_question += f"  {key}: {value}\n"
-
-    formatted_question += "-" * 30
-    return formatted_question
-
-
-def format_direct_prompt(question: Dict, tokenizer, use_chat_template: bool = True) -> Tuple[str, List[str]]:
-    """
-    Format a direct MC question.
-
-    Args:
-        question: The question dict with 'question' and 'options'
-        tokenizer: The tokenizer
-        use_chat_template: If True, use chat template. If False, use plain text format for base models.
-
-    Returns:
-        Tuple of (full_prompt, option_keys)
-    """
-    q_text = _present_question(question)
-    options = list(question["options"].keys())
-
-    options_str = (
-        " or ".join(options)
-        if len(options) == 2
-        else ", ".join(options[:-1]) + f", or {options[-1]}"
-    )
-
-    llm_prompt = q_text + f"\nYour choice ({options_str}): "
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": MC_SETUP_PROMPT},
-            {"role": "user", "content": llm_prompt}
-        ]
-
-        full_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    else:
-        # Plain text format for base models
-        full_prompt = f"{MC_SETUP_PROMPT}\n\n{llm_prompt}"
-
-    return full_prompt, options
+# Use formatting functions from tasks.py (imported at top)
+# format_direct_prompt - imported directly
+# Local wrappers for meta tasks to maintain backward compatibility
 
 
 def format_meta_prompt(question: Dict, tokenizer, use_chat_template: bool = True) -> Tuple[str, List[str]]:
-    """
-    Format a meta/confidence question.
-
-    Args:
-        question: The question dict with 'question' and 'options'
-        tokenizer: The tokenizer
-        use_chat_template: If True, use chat template. If False, use plain text format for base models.
-
-    Returns:
-        Tuple of (full_prompt, meta_option_keys)
-    """
-    q_text = _present_nested_question(question, META_QUESTION_PROMPT, META_OPTION_DICT)
-    meta_options = list(META_OPTION_DICT.keys())
-
-    options_str = ", ".join(meta_options[:-1]) + f", or {meta_options[-1]}"
-
-    llm_prompt = q_text + f"\nYour choice ({options_str}): "
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": META_SETUP_PROMPT},
-            {"role": "user", "content": llm_prompt}
-        ]
-
-        full_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    else:
-        # Plain text format for base models
-        full_prompt = f"{META_SETUP_PROMPT}\n\n{llm_prompt}"
-
-    return full_prompt, meta_options
+    """Format a meta/confidence question using centralized tasks.py logic."""
+    return format_stated_confidence_prompt(question, tokenizer, use_chat_template)
 
 
 def format_delegate_prompt(
@@ -347,58 +184,11 @@ def format_delegate_prompt(
     use_chat_template: bool = True,
     trial_index: int = 0
 ) -> Tuple[str, List[str], Dict[str, str]]:
-    """
-    Format a delegate (Answer vs Delegate) question.
-
-    Args:
-        question: The question dict with 'question' and 'options'
-        tokenizer: The tokenizer
-        use_chat_template: If True, use chat template. If False, use plain text format.
-        trial_index: The trial number (0-indexed) for alternating mapping
-
-    Returns:
-        Tuple of (full_prompt, delegate_option_keys, mapping)
-        where mapping is {"1": "Answer"/"Delegate", "2": "Delegate"/"Answer"}
-    """
-    # Get the mapping for this trial (alternates to control position bias)
-    mapping = get_delegate_mapping(trial_index)
-
-    # Format the question with MC options
-    formatted_question = ""
-    formatted_question += "-" * 30 + "\n"
-    formatted_question += "Question:\n"
-    formatted_question += question["question"] + "\n"
-
-    if "options" in question:
-        formatted_question += "-" * 10 + "\n"
-        for key, value in question["options"].items():
-            formatted_question += f"  {key}: {value}\n"
-
-    formatted_question += "-" * 30 + "\n"
-
-    # Add delegate choice with the current mapping
-    formatted_question += "Choices:\n"
-    formatted_question += f"  1: {mapping['1']}\n"
-    formatted_question += f"  2: {mapping['2']}\n"
-    formatted_question += "Respond ONLY with '1' or '2'.\n"
-    formatted_question += "Your choice ('1' or '2'):"
-
-    if use_chat_template and has_chat_template(tokenizer):
-        messages = [
-            {"role": "system", "content": DELEGATE_SYSPROMPT + DELEGATE_SETUP_PROMPT},
-            {"role": "user", "content": formatted_question}
-        ]
-
-        full_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    else:
-        # Plain text format for base models
-        full_prompt = f"{DELEGATE_SYSPROMPT}\n{DELEGATE_SETUP_PROMPT}\n\n{formatted_question}"
-
-    return full_prompt, DELEGATE_OPTIONS, mapping
+    """Format a delegate question using centralized tasks.py logic."""
+    return format_answer_or_delegate_prompt(
+        question, tokenizer, trial_index=trial_index,
+        alternate_mapping=True, use_chat_template=use_chat_template
+    )
 
 
 def get_meta_prompt_formatter():
@@ -417,7 +207,7 @@ def get_meta_options():
         return list(META_OPTION_DICT.keys())
 
 
-def response_to_confidence(
+def local_response_to_confidence(
     response: str,
     probs: np.ndarray = None,
     mapping: Dict[str, str] = None
@@ -425,34 +215,10 @@ def response_to_confidence(
     """
     Convert a meta response to a confidence value.
 
-    For confidence task: Uses META_RANGE_MIDPOINTS lookup
-    For delegate task: Uses P(Answer) from the probability distribution,
-                       accounting for alternating mapping
-
-    Args:
-        response: The model's response ("1", "2", or S-Z for confidence)
-        probs: Probability array [P("1"), P("2")] for delegate, or [P(S)...P(Z)] for confidence
-        mapping: For delegate task, the mapping {"1": "Answer"/"Delegate", "2": ...}
+    Wrapper around tasks.response_to_confidence that passes the correct task_type.
     """
-    if META_TASK == "delegate":
-        # For delegate task, confidence = P(Answer)
-        # Need to account for alternating mapping
-        if probs is not None and len(probs) >= 2 and mapping is not None:
-            # Find which option corresponds to "Answer"
-            if mapping.get("1") == "Answer":
-                return float(probs[0])  # P("1") = P(Answer)
-            else:
-                return float(probs[1])  # P("2") = P(Answer)
-        elif probs is not None and len(probs) >= 1:
-            # Fallback: assume position 0 is Answer (old behavior)
-            return float(probs[0])
-        # Fallback if only response is known (no probs)
-        if mapping is not None:
-            return 1.0 if mapping.get(response) == "Answer" else 0.0
-        return 1.0 if response == "1" else 0.0
-    else:
-        # For confidence task, use the midpoint lookup
-        return META_RANGE_MIDPOINTS.get(response, 0.5)
+    task_type = "delegate" if META_TASK == "delegate" else "confidence"
+    return response_to_confidence(response, probs, mapping, task_type)
 
 
 # ============================================================================
@@ -465,6 +231,57 @@ def compute_entropy_from_probs(probs: np.ndarray) -> float:
     probs = probs[probs > 0]
     entropy = -(probs * np.log(probs)).sum()
     return float(entropy)
+
+
+def compute_uncertainty_metrics(probs: np.ndarray, logits: np.ndarray = None) -> Dict[str, float]:
+    """
+    Compute multiple uncertainty metrics from probability and logit distributions.
+
+    Args:
+        probs: Probability distribution over answer options (sums to 1)
+        logits: Raw logits for answer options (before softmax). If None, logit-based
+                metrics will be computed from log(probs) as an approximation.
+
+    Returns:
+        Dict with keys: entropy, top_prob, margin, logit_gap, top_logit
+    """
+    # === Prob-based metrics (nonlinear) ===
+
+    # Entropy: -sum(p * log(p))
+    entropy = compute_entropy_from_probs(probs)
+
+    # Top probability: P(argmax)
+    top_prob = float(np.max(probs))
+
+    # Margin: P(top) - P(second)
+    sorted_probs = np.sort(probs)[::-1]  # Descending
+    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else float(sorted_probs[0])
+
+    # === Logit-based metrics (linear - better for linear probes) ===
+
+    # If logits not provided, approximate from log-probs
+    # (This loses the constant offset but preserves gaps)
+    if logits is None:
+        logits = np.log(probs + 1e-10)
+
+    # Sort logits descending
+    sorted_logits = np.sort(logits)[::-1]
+
+    # Logit gap: z(top) - z(second)
+    # This is the cleanest linear target - invariant to temperature/scale shifts
+    logit_gap = float(sorted_logits[0] - sorted_logits[1]) if len(sorted_logits) > 1 else float(sorted_logits[0])
+
+    # Top logit (centered): z(top) - mean(z)
+    # Subtracting mean makes it invariant to adding a constant to all logits
+    top_logit = float(sorted_logits[0] - np.mean(logits))
+
+    return {
+        "entropy": entropy,
+        "top_prob": top_prob,
+        "margin": margin,
+        "logit_gap": logit_gap,
+        "top_logit": top_logit,
+    }
 
 
 # ============================================================================
@@ -518,9 +335,9 @@ class BatchedExtractor:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         option_token_ids: List[int]
-    ) -> Tuple[List[Dict[int, np.ndarray]], List[np.ndarray], List[float]]:
+    ) -> Tuple[List[Dict[int, np.ndarray]], List[np.ndarray], List[np.ndarray], List[Dict[str, float]]]:
         """
-        Extract activations AND compute option probabilities in one forward pass.
+        Extract activations AND compute option probabilities/metrics in one forward pass.
 
         Args:
             input_ids: (batch_size, seq_len)
@@ -530,7 +347,8 @@ class BatchedExtractor:
         Returns:
             layer_activations: List of {layer_idx: activation} dicts, one per batch item
             option_probs: List of probability arrays, one per batch item
-            entropies: List of entropy values, one per batch item
+            option_logits: List of logit arrays, one per batch item
+            all_metrics: List of metric dicts, one per batch item
         """
         self.activations = {}
         batch_size = input_ids.shape[0]
@@ -553,18 +371,21 @@ class BatchedExtractor:
             }
             all_layer_activations.append(item_activations)
 
-        # Extract logits and compute probabilities for each batch item
+        # Extract logits and compute probabilities/metrics for each batch item
         all_probs = []
-        all_entropies = []
+        all_logits = []
+        all_metrics = []
         for batch_idx in range(batch_size):
             final_logits = outputs.logits[batch_idx, -1, :]
             option_logits = final_logits[option_token_ids]
+            option_logits_np = option_logits.cpu().numpy()
             probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
-            entropy = compute_entropy_from_probs(probs)
+            metrics = compute_uncertainty_metrics(probs, option_logits_np)
             all_probs.append(probs)
-            all_entropies.append(entropy)
+            all_logits.append(option_logits_np)
+            all_metrics.append(metrics)
 
-        return all_layer_activations, all_probs, all_entropies
+        return all_layer_activations, all_probs, all_logits, all_metrics
 
 
 # ============================================================================
@@ -584,7 +405,7 @@ def collect_paired_data(
     batch_size: int = BATCH_SIZE
 ) -> Dict:
     """
-    Collect activations and entropies for both direct and meta prompts.
+    Collect activations and uncertainty metrics for both direct and meta prompts.
 
     Uses batched processing with combined activation+logit extraction
     for ~4x speedup over the naive approach.
@@ -592,8 +413,9 @@ def collect_paired_data(
     Returns dict with:
         - direct_activations: {layer_idx: np.array of shape (n_questions, hidden_dim)}
         - meta_activations: {layer_idx: np.array of shape (n_questions, hidden_dim)}
-        - direct_entropies: np.array of shape (n_questions,)
+        - direct_metrics: {metric_name: np.array of shape (n_questions,)}
         - direct_probs: list of prob arrays
+        - direct_logits: list of logit arrays
         - meta_entropies: np.array (entropy over confidence options)
         - meta_probs: list of prob arrays over S-Z (or [P("1"), P("2")] for delegate)
         - meta_responses: list of predicted confidence letters (or "1"/"2" for delegate)
@@ -608,8 +430,9 @@ def collect_paired_data(
     # Storage
     direct_layer_acts = {i: [] for i in range(num_layers)}
     meta_layer_acts = {i: [] for i in range(num_layers)}
-    direct_entropies = []
+    direct_metrics_lists = {metric: [] for metric in AVAILABLE_METRICS}
     direct_probs_list = []
+    direct_logits_list = []
     meta_entropies = []
     meta_probs_list = []
     meta_responses = []
@@ -656,21 +479,21 @@ def collect_paired_data(
                     direct_prompts,
                     return_tensors="pt",
                     padding=True,
-                    truncation=True,
-                    max_length=MAX_PROMPT_LENGTH
                 ).to(DEVICE)
 
-                batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                     inputs["input_ids"],
                     inputs["attention_mask"],
                     direct_option_token_ids
                 )
 
-                for i, (acts, probs, entropy) in enumerate(zip(batch_acts, batch_probs, batch_entropies)):
+                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
                     for layer_idx, act in acts.items():
                         direct_layer_acts[layer_idx].append(act)
                     direct_probs_list.append(probs.tolist())
-                    direct_entropies.append(entropy)
+                    direct_logits_list.append(logits.tolist())
+                    for metric_name, metric_val in metrics.items():
+                        direct_metrics_lists[metric_name].append(metric_val)
 
                 del inputs
             else:
@@ -680,11 +503,9 @@ def collect_paired_data(
                     inputs = tokenizer(
                         prompt,
                         return_tensors="pt",
-                        truncation=True,
-                        max_length=MAX_PROMPT_LENGTH
                     ).to(DEVICE)
 
-                    batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                    batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                         inputs["input_ids"],
                         inputs["attention_mask"],
                         option_token_ids
@@ -693,7 +514,9 @@ def collect_paired_data(
                     for layer_idx, act in batch_acts[0].items():
                         direct_layer_acts[layer_idx].append(act)
                     direct_probs_list.append(batch_probs[0].tolist())
-                    direct_entropies.append(batch_entropies[0])
+                    direct_logits_list.append(batch_logits[0].tolist())
+                    for metric_name, metric_val in batch_metrics[0].items():
+                        direct_metrics_lists[metric_name].append(metric_val)
 
                     del inputs
 
@@ -707,11 +530,9 @@ def collect_paired_data(
                     inputs = tokenizer(
                         prompt,
                         return_tensors="pt",
-                        truncation=True,
-                        max_length=MAX_PROMPT_LENGTH
                     ).to(DEVICE)
 
-                    batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                    batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                         inputs["input_ids"],
                         inputs["attention_mask"],
                         meta_option_token_ids
@@ -720,7 +541,7 @@ def collect_paired_data(
                     for layer_idx, act in batch_acts[0].items():
                         meta_layer_acts[layer_idx].append(act)
                     meta_probs_list.append(batch_probs[0].tolist())
-                    meta_entropies.append(batch_entropies[0])
+                    meta_entropies.append(batch_metrics[0]["entropy"])
                     meta_response = meta_options[np.argmax(batch_probs[0])]
                     meta_responses.append(meta_response)
                     meta_mappings.append(mapping)
@@ -737,21 +558,19 @@ def collect_paired_data(
                     meta_prompts,
                     return_tensors="pt",
                     padding=True,
-                    truncation=True,
-                    max_length=MAX_PROMPT_LENGTH
                 ).to(DEVICE)
 
-                batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                     inputs["input_ids"],
                     inputs["attention_mask"],
                     meta_option_token_ids
                 )
 
-                for i, (acts, probs, entropy) in enumerate(zip(batch_acts, batch_probs, batch_entropies)):
+                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
                     for layer_idx, act in acts.items():
                         meta_layer_acts[layer_idx].append(act)
                     meta_probs_list.append(probs.tolist())
-                    meta_entropies.append(entropy)
+                    meta_entropies.append(metrics["entropy"])
                     meta_response = meta_options[np.argmax(probs)]
                     meta_responses.append(meta_response)
                     meta_mappings.append(None)  # No mapping for confidence task
@@ -772,15 +591,23 @@ def collect_paired_data(
     meta_activations = {
         layer_idx: np.array(acts) for layer_idx, acts in meta_layer_acts.items()
     }
+    direct_metrics = {
+        metric: np.array(values) for metric, values in direct_metrics_lists.items()
+    }
 
     print(f"Direct activations shape (per layer): {direct_activations[0].shape}")
     print(f"Meta activations shape (per layer): {meta_activations[0].shape}")
+    print(f"\nDirect uncertainty metrics:")
+    for metric_name, values in direct_metrics.items():
+        print(f"  {metric_name}: range=[{values.min():.3f}, {values.max():.3f}], "
+              f"mean={values.mean():.3f}, std={values.std():.3f}")
 
     return {
         "direct_activations": direct_activations,
         "meta_activations": meta_activations,
-        "direct_entropies": np.array(direct_entropies),
+        "direct_metrics": direct_metrics,
         "direct_probs": direct_probs_list,
+        "direct_logits": direct_logits_list,
         "meta_entropies": np.array(meta_entropies),
         "meta_probs": meta_probs_list,
         "meta_responses": meta_responses,
@@ -838,11 +665,9 @@ def collect_meta_only(
                     inputs = tokenizer(
                         prompt,
                         return_tensors="pt",
-                        truncation=True,
-                        max_length=MAX_PROMPT_LENGTH
                     ).to(DEVICE)
 
-                    batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                    batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                         inputs["input_ids"],
                         inputs["attention_mask"],
                         meta_option_token_ids
@@ -851,7 +676,7 @@ def collect_meta_only(
                     for layer_idx, act in batch_acts[0].items():
                         meta_layer_acts[layer_idx].append(act)
                     meta_probs_list.append(batch_probs[0].tolist())
-                    meta_entropies.append(batch_entropies[0])
+                    meta_entropies.append(batch_metrics[0]["entropy"])
                     meta_response = meta_options[np.argmax(batch_probs[0])]
                     meta_responses.append(meta_response)
                     meta_mappings.append(mapping)
@@ -868,21 +693,19 @@ def collect_meta_only(
                     meta_prompts,
                     return_tensors="pt",
                     padding=True,
-                    truncation=True,
-                    max_length=MAX_PROMPT_LENGTH
                 ).to(DEVICE)
 
-                batch_acts, batch_probs, batch_entropies = extractor.extract_batch(
+                batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                     inputs["input_ids"],
                     inputs["attention_mask"],
                     meta_option_token_ids
                 )
 
-                for i, (acts, probs, entropy) in enumerate(zip(batch_acts, batch_probs, batch_entropies)):
+                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
                     for layer_idx, act in acts.items():
                         meta_layer_acts[layer_idx].append(act)
                     meta_probs_list.append(probs.tolist())
-                    meta_entropies.append(entropy)
+                    meta_entropies.append(metrics["entropy"])
                     meta_response = meta_options[np.argmax(probs)]
                     meta_responses.append(meta_response)
                     meta_mappings.append(None)
@@ -901,14 +724,32 @@ def collect_meta_only(
 
     print(f"Meta activations shape (per layer): {meta_activations[0].shape}")
 
-    # Build direct_probs from metadata
+    # Build direct data from mc_data
+    # mc_data may have "direct_metrics" dict (new format) or just "direct_entropies" (old format)
     direct_probs_list = [m.get("probabilities", []) for m in mc_data["metadata"]]
+    direct_logits_list = [m.get("logits", []) for m in mc_data["metadata"]]
+
+    # Handle both old (entropies only) and new (all metrics) mc_data formats
+    if "direct_metrics" in mc_data:
+        direct_metrics = mc_data["direct_metrics"]
+    else:
+        # Old format: only has entropies, need to compute metrics from metadata
+        direct_metrics = {metric: [] for metric in AVAILABLE_METRICS}
+        for m in mc_data["metadata"]:
+            probs = np.array(m.get("probabilities", []))
+            logits = np.array(m.get("logits", [])) if m.get("logits") else None
+            if len(probs) > 0:
+                item_metrics = compute_uncertainty_metrics(probs, logits)
+                for metric_name, metric_val in item_metrics.items():
+                    direct_metrics[metric_name].append(metric_val)
+        direct_metrics = {k: np.array(v) for k, v in direct_metrics.items()}
 
     return {
         "direct_activations": mc_data["direct_activations"],
         "meta_activations": meta_activations,
-        "direct_entropies": mc_data["direct_entropies"],
+        "direct_metrics": direct_metrics,
         "direct_probs": direct_probs_list,
+        "direct_logits": direct_logits_list,
         "meta_entropies": np.array(meta_entropies),
         "meta_probs": meta_probs_list,
         "meta_responses": meta_responses,
@@ -1233,7 +1074,7 @@ def analyze_behavioral_introspection(
     """
     # Convert meta responses to confidence values
     stated_confidence = np.array([
-        response_to_confidence(r, np.array(p) if p else None, m)
+        local_response_to_confidence(r, np.array(p) if p else None, m)
         for r, p, m in zip(
             meta_responses,
             meta_probs or [None] * len(meta_responses),
@@ -1542,7 +1383,11 @@ def try_load_mc_data() -> Optional[Dict]:
 # ============================================================================
 
 def main():
+    global METRIC
+
     parser = argparse.ArgumentParser(description="Run introspection experiment")
+    parser.add_argument("--metric", type=str, default=METRIC, choices=AVAILABLE_METRICS,
+                        help=f"Uncertainty metric to probe (default: {METRIC})")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Batch size for forward passes (default {BATCH_SIZE})")
     parser.add_argument("--load-in-4bit", action="store_true",
@@ -1551,7 +1396,9 @@ def main():
                         help="Load model in 8-bit quantization")
     args = parser.parse_args()
 
+    METRIC = args.metric
     print(f"Device: {DEVICE}")
+    print(f"Metric: {METRIC}")
     print(f"Meta-judgment task: {META_TASK}")
 
     # Print delegate parameters if using delegate task
@@ -1597,28 +1444,36 @@ def main():
     else:
         data = collect_paired_data(questions, model, tokenizer, num_layers, use_chat_template, batch_size=args.batch_size)
 
-    # Generate output prefix
-    output_prefix = get_output_prefix()
-    print(f"Output prefix: {output_prefix}")
+    # Generate output prefixes
+    # Base prefix for shared files (activations, paired data)
+    base_prefix = get_output_prefix()
+    # Metric-specific prefix for probe results and directions
+    metric_prefix = get_output_prefix(METRIC)
+    print(f"Base output prefix: {base_prefix}")
+    print(f"Metric output prefix: {metric_prefix}")
 
-    # Save activations
+    # Get the selected metric's values
+    direct_target = data["direct_metrics"][METRIC]
+
+    # Save activations with ALL metrics (so we can retrain with different metrics later)
     print("\nSaving activations...")
     np.savez_compressed(
-        f"{output_prefix}_direct_activations.npz",
+        f"{base_prefix}_direct_activations.npz",
         **{f"layer_{i}": acts for i, acts in data["direct_activations"].items()},
-        entropies=data["direct_entropies"]
+        **data["direct_metrics"]  # Save all metrics
     )
     np.savez_compressed(
-        f"{output_prefix}_meta_activations.npz",
+        f"{base_prefix}_meta_activations.npz",
         **{f"layer_{i}": acts for i, acts in data["meta_activations"].items()},
-        entropies=data["meta_entropies"]
+        entropy=data["meta_entropies"]  # Meta always uses entropy
     )
-    print(f"Saved activations to {output_prefix}_*_activations.npz")
+    print(f"Saved activations to {base_prefix}_*_activations.npz")
 
     # Save paired data (for reproducibility and further analysis)
     paired_data = {
-        "direct_entropies": data["direct_entropies"].tolist(),
+        "direct_metrics": {k: v.tolist() for k, v in data["direct_metrics"].items()},
         "direct_probs": data["direct_probs"],
+        "direct_logits": data.get("direct_logits", []),
         "meta_entropies": data["meta_entropies"].tolist(),
         "meta_probs": data["meta_probs"],
         "meta_responses": data["meta_responses"],
@@ -1639,6 +1494,7 @@ def main():
             "num_questions": NUM_QUESTIONS,
             "seed": SEED,
             "meta_task": META_TASK,
+            "metric": METRIC,
             # Delegate task parameters (matches delegate_game_from_capabilities.py)
             "delegate_params": {
                 "decision_only": True,
@@ -1650,34 +1506,38 @@ def main():
             } if META_TASK == "delegate" else None,
         }
     }
-    with open(f"{output_prefix}_paired_data.json", "w") as f:
+    with open(f"{base_prefix}_paired_data.json", "w") as f:
         json.dump(paired_data, f, indent=2)
-    print(f"Saved paired data to {output_prefix}_paired_data.json")
+    print(f"Saved paired data to {base_prefix}_paired_data.json")
 
-    # Run introspection analysis
-    results, test_idx, entropy_directions = run_introspection_analysis(
+    # Run introspection analysis with selected metric
+    print(f"\nRunning introspection analysis with metric: {METRIC}")
+    results, test_idx, directions = run_introspection_analysis(
         data["direct_activations"],
         data["meta_activations"],
-        data["direct_entropies"],
+        direct_target,  # Use selected metric
         extract_directions=True
     )
 
-    # Save entropy directions for steering/ablation experiments
-    if entropy_directions is not None:
+    # Save directions for steering/ablation experiments (metric-specific filename)
+    if directions is not None:
         directions_data = {
-            f"layer_{layer_idx}_entropy": direction
-            for layer_idx, direction in entropy_directions.items()
+            f"layer_{layer_idx}": direction
+            for layer_idx, direction in directions.items()
         }
+        directions_data["_metadata_metric"] = np.array(METRIC)
+        directions_data["_metadata_dataset"] = np.array(DATASET_NAME)
+        directions_data["_metadata_model"] = np.array(BASE_MODEL_NAME)
         np.savez_compressed(
-            f"{output_prefix}_entropy_directions.npz",
+            f"{metric_prefix}_directions.npz",
             **directions_data
         )
-        print(f"Saved entropy directions to {output_prefix}_entropy_directions.npz")
+        print(f"Saved {METRIC} directions to {metric_prefix}_directions.npz")
 
-    # Behavioral analysis
+    # Behavioral analysis (always uses entropy for correlation with confidence)
     behavioral = analyze_behavioral_introspection(
         data["meta_responses"],
-        data["direct_entropies"],
+        data["direct_metrics"]["entropy"],  # Always use entropy for behavioral correlation
         test_idx,
         data["meta_probs"],
         data.get("meta_mappings"),
@@ -1685,8 +1545,20 @@ def main():
         data["questions"]
     )
 
-    # Save results
+    # Save results (metric-specific filename)
     results_to_save = {
+        "config": {
+            "metric": METRIC,
+            "meta_task": META_TASK,
+            "model": BASE_MODEL_NAME,
+            "dataset": DATASET_NAME,
+        },
+        "metric_stats": {
+            "mean": float(direct_target.mean()),
+            "std": float(direct_target.std()),
+            "min": float(direct_target.min()),
+            "max": float(direct_target.max()),
+        },
         "probe_results": {
             str(layer_idx): {
                 k: (v.tolist() if isinstance(v, np.ndarray) else v)
@@ -1708,19 +1580,19 @@ def main():
                     if isinstance(v, np.ndarray):
                         inner[k] = v.tolist()
 
-    with open(f"{output_prefix}_probe_results.json", "w") as f:
+    with open(f"{metric_prefix}_results.json", "w") as f:
         json.dump(results_to_save, f, indent=2)
-    print(f"Saved results to {output_prefix}_probe_results.json")
+    print(f"Saved results to {metric_prefix}_results.json")
 
     # Print and plot results
     print_results(results, behavioral)
     plot_results(
         results, behavioral,
-        data["direct_entropies"], test_idx,
-        output_path=f"{output_prefix}_results.png"
+        direct_target, test_idx,
+        output_path=f"{metric_prefix}_results.png"
     )
 
-    print("\n✓ Introspection experiment complete!")
+    print(f"\n✓ Introspection experiment complete! (metric: {METRIC})")
 
 
 if __name__ == "__main__":

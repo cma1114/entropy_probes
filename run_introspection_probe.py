@@ -7,15 +7,24 @@ This script:
 3. Runs permutation tests for statistical significance
 4. Saves the introspection direction for steering experiments
 
-Introspection score = -entropy_z * confidence_z
-- Positive when aligned (high entropy + low confidence, or low entropy + high confidence)
+Introspection score = -metric_z * confidence_z
+- Positive when aligned (high uncertainty + low confidence, or low uncertainty + high confidence)
 - Negative when misaligned
 
+The metric can be any uncertainty measure:
+- Prob-based (nonlinear): entropy, top_prob, margin
+- Logit-based (linear): logit_gap, top_logit
+
 Output files:
-- introspection_probe_results.json: Probe metrics and significance tests
-- introspection_probe_directions.npz: Direction vectors for steering
+- {prefix}_probe_results.json: Probe metrics and significance tests
+- {prefix}_probe_directions.npz: Direction vectors for steering
+
+Usage:
+    python run_introspection_probe.py --metric logit_gap   # Probe logit_gap (default)
+    python run_introspection_probe.py --metric entropy     # Probe entropy
 """
 
+import argparse
 import torch
 import numpy as np
 import json
@@ -33,6 +42,12 @@ import os
 from dotenv import load_dotenv
 import random
 
+# Import centralized task handling from tasks.py
+from tasks import (
+    response_to_confidence as _response_to_confidence_impl,
+    STATED_CONFIDENCE_MIDPOINTS,
+)
+
 load_dotenv()
 
 # =============================================================================
@@ -47,6 +62,17 @@ DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 # Output directory
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
+
+# Available uncertainty metrics (same as run_introspection_experiment.py):
+# Prob-based (nonlinear targets - may be harder for linear probes):
+#   entropy   - Shannon entropy -sum(p * log(p))
+#   top_prob  - P(argmax) - probability of most likely answer
+#   margin    - P(top) - P(second) - prob gap between top two
+# Logit-based (linear targets - better aligned with linear probes):
+#   logit_gap - z(top) - z(second) - logit gap between top two
+#   top_logit - z(top) - mean(z) - centered top logit
+AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+METRIC = "logit_gap"  # Which metric to use for introspection score (set via --metric flag)
 
 
 def get_model_short_name(model_name: str) -> str:
@@ -88,11 +114,8 @@ random.seed(SEED)
 #   "delegate"   - Answer vs Delegate choice; confidence = P(Answer)
 META_TASK = "confidence"
 
-# Meta confidence scale (for confidence task)
-META_RANGE_MIDPOINTS = {
-    "S": 0.025, "T": 0.075, "U": 0.15, "V": 0.3,
-    "W": 0.5, "X": 0.7, "Y": 0.85, "Z": 0.95
-}
+# Backward compatibility alias (now imported from tasks.py)
+META_RANGE_MIDPOINTS = STATED_CONFIDENCE_MIDPOINTS
 
 
 def response_to_confidence(
@@ -103,34 +126,15 @@ def response_to_confidence(
     """
     Convert a meta response to a confidence value.
 
-    For confidence task: Uses META_RANGE_MIDPOINTS lookup
-    For delegate task: Uses P(Answer) from the probability distribution,
-                       accounting for alternating mapping
+    This is a thin wrapper around tasks.response_to_confidence that uses
+    the global META_TASK to determine task type.
 
     Args:
         response: The model's response ("1", "2", or S-Z for confidence)
         probs: Probability array [P("1"), P("2")] for delegate, or [P(S)...P(Z)] for confidence
         mapping: For delegate task, the mapping {"1": "Answer"/"Delegate", "2": ...}
     """
-    if META_TASK == "delegate":
-        # For delegate task, confidence = P(Answer)
-        # Need to account for alternating mapping
-        if probs is not None and len(probs) >= 2 and mapping is not None:
-            # Find which option corresponds to "Answer"
-            if mapping.get("1") == "Answer":
-                return float(probs[0])  # P("1") = P(Answer)
-            else:
-                return float(probs[1])  # P("2") = P(Answer)
-        elif probs is not None and len(probs) >= 1:
-            # Fallback: assume position 0 is Answer (old behavior)
-            return float(probs[0])
-        # Fallback if only response is known (no probs)
-        if mapping is not None:
-            return 1.0 if mapping.get(response) == "Answer" else 0.0
-        return 1.0 if response == "1" else 0.0
-    else:
-        # For confidence task, use the midpoint lookup
-        return META_RANGE_MIDPOINTS.get(response, 0.5)
+    return _response_to_confidence_impl(response, probs, mapping, task_type=META_TASK)
 
 
 # ============================================================================
@@ -138,26 +142,32 @@ def response_to_confidence(
 # ============================================================================
 
 def compute_introspection_scores(
-    direct_entropies: np.ndarray,
+    direct_metric_values: np.ndarray,
     meta_responses: List[str],
     meta_probs: List[List[float]] = None,
-    meta_mappings: List[Dict] = None
+    meta_mappings: List[Dict] = None,
+    metric_name: str = "entropy"
 ) -> Tuple[np.ndarray, Dict, np.ndarray, np.ndarray]:
     """
     Compute introspection alignment scores.
 
-    For true introspection: high entropy should correlate with LOW confidence.
+    For true introspection: high uncertainty should correlate with LOW confidence.
     So correlation should be NEGATIVE.
 
-    Introspection score = -entropy_z * confidence_z
-    - Positive when aligned (high entropy + low conf, or low entropy + high conf)
+    Introspection score = -metric_z * confidence_z
+    - Positive when aligned (high uncertainty + low conf, or low uncertainty + high conf)
     - Negative when misaligned
 
+    Note: For metrics where HIGH value = HIGH confidence (top_prob, margin, logit_gap, top_logit),
+    we flip the sign so that the correlation interpretation remains consistent:
+    negative correlation = introspective behavior.
+
     Args:
-        direct_entropies: Array of entropy values from direct MC questions
+        direct_metric_values: Array of uncertainty metric values from direct MC questions
         meta_responses: List of model responses (S-Z for confidence, "1"/"2" for delegate)
         meta_probs: List of probability arrays for each response (optional, used for delegate task)
         meta_mappings: List of mappings for delegate task (optional)
+        metric_name: Name of the metric being used (for stats reporting)
     """
     # Convert meta responses to confidence values using response_to_confidence
     # which handles both confidence and delegate tasks
@@ -174,29 +184,44 @@ def compute_introspection_scores(
         )
     ])
 
+    # For metrics where HIGH value = HIGH confidence, flip the sign
+    # so that introspective behavior always shows as NEGATIVE correlation
+    # - entropy: HIGH = uncertain (no flip needed)
+    # - top_prob, margin, logit_gap, top_logit: HIGH = confident (flip needed)
+    uncertainty_values = direct_metric_values.copy()
+    if metric_name != "entropy":
+        # These metrics are confidence-like (high = confident), so negate for uncertainty
+        uncertainty_values = -uncertainty_values
+
     # Raw correlation (should be negative for introspection)
-    correlation = np.corrcoef(direct_entropies, stated_confidences)[0, 1]
+    correlation = np.corrcoef(uncertainty_values, stated_confidences)[0, 1]
 
     # Z-score both
-    entropy_z = stats.zscore(direct_entropies)
+    metric_z = stats.zscore(uncertainty_values)
     confidence_z = stats.zscore(stated_confidences)
 
     # Introspection score = negative product
-    # High score = aligned (entropy and confidence move in opposite directions)
-    introspection_scores = -1 * entropy_z * confidence_z
+    # High score = aligned (high uncertainty and low confidence, or vice versa)
+    introspection_scores = -1 * metric_z * confidence_z
 
     stats_dict = {
         "meta_task": META_TASK,
-        "correlation_entropy_confidence": float(correlation),
+        "metric": metric_name,
+        "correlation_metric_confidence": float(correlation),
         "correlation_interpretation": "negative=introspective, positive=anti-introspective",
-        "mean_entropy": float(direct_entropies.mean()),
-        "std_entropy": float(direct_entropies.std()),
+        "mean_metric": float(direct_metric_values.mean()),
+        "std_metric": float(direct_metric_values.std()),
         "mean_confidence": float(stated_confidences.mean()),
         "std_confidence": float(stated_confidences.std()),
         "mean_introspection_score": float(introspection_scores.mean()),
         "std_introspection_score": float(introspection_scores.std()),
         "fraction_aligned": float((introspection_scores > 0).mean()),
     }
+
+    # Backward compatibility: also include entropy-named keys
+    stats_dict["correlation_entropy_confidence"] = stats_dict["correlation_metric_confidence"]
+    stats_dict["mean_entropy"] = stats_dict["mean_metric"]
+    stats_dict["std_entropy"] = stats_dict["std_metric"]
 
     # Add delegate-specific statistics
     if META_TASK == "delegate" and meta_mappings is not None:
@@ -214,7 +239,7 @@ def compute_introspection_scores(
             stats_dict["num_delegated"] = sum(delegated)
             stats_dict["num_self_answered"] = len(delegated) - sum(delegated)
 
-    return introspection_scores, stats_dict, entropy_z, confidence_z
+    return introspection_scores, stats_dict, metric_z, confidence_z
 
 
 # ============================================================================
@@ -598,10 +623,19 @@ def print_results(results: Dict, score_stats: Dict):
 # ============================================================================
 
 def main():
+    global METRIC
+
+    parser = argparse.ArgumentParser(description="Train introspection probe on meta activations")
+    parser.add_argument("--metric", type=str, default=METRIC, choices=AVAILABLE_METRICS,
+                        help=f"Uncertainty metric to use for introspection score (default: {METRIC})")
+    args = parser.parse_args()
+
+    METRIC = args.metric
     print(f"Device: {DEVICE}")
+    print(f"Metric: {METRIC}")
     print(f"Meta-judgment task: {META_TASK}")
 
-    # Generate output prefix
+    # Generate output prefix (base prefix without metric for input files)
     output_prefix = get_output_prefix()
     print(f"Output prefix: {output_prefix}")
 
@@ -614,27 +648,48 @@ def main():
     with open(paired_data_path, "r") as f:
         paired_data = json.load(f)
 
-    direct_entropies = np.array(paired_data["direct_entropies"])
+    # Load the selected metric's values
+    # New format has direct_metrics (dict of metric_name -> list of values)
+    # Old format has direct_entropies (list of values)
+    if "direct_metrics" in paired_data and METRIC in paired_data["direct_metrics"]:
+        direct_metric_values = np.array(paired_data["direct_metrics"][METRIC])
+        print(f"Using metric '{METRIC}' from paired data")
+    elif "direct_entropies" in paired_data:
+        # Backward compatibility: fall back to direct_entropies (only works for entropy)
+        if METRIC != "entropy":
+            raise ValueError(
+                f"Metric '{METRIC}' not found in paired data. "
+                f"Old format only contains 'direct_entropies'. "
+                f"Re-run run_introspection_experiment.py to generate all metrics."
+            )
+        direct_metric_values = np.array(paired_data["direct_entropies"])
+        print(f"Using 'entropy' (backward compatible fallback)")
+    else:
+        raise ValueError("Paired data missing both 'direct_metrics' and 'direct_entropies'")
+
     meta_responses = paired_data["meta_responses"]
     # Load meta_probs and meta_mappings for delegate task support
     meta_probs = paired_data.get("meta_probs")
     meta_mappings = paired_data.get("meta_mappings")
 
-    print(f"Loaded {len(direct_entropies)} questions")
+    print(f"Loaded {len(direct_metric_values)} questions")
+    print(f"  {METRIC}: range=[{direct_metric_values.min():.3f}, {direct_metric_values.max():.3f}], "
+          f"mean={direct_metric_values.mean():.3f}, std={direct_metric_values.std():.3f}")
 
     # Compute introspection scores
     # For delegate task, confidence = P(Answer) from meta_probs
     # For confidence task, confidence = midpoint of chosen range
     print("\nComputing introspection scores...")
-    introspection_scores, score_stats, entropy_z, confidence_z = \
+    introspection_scores, score_stats, metric_z, confidence_z = \
         compute_introspection_scores(
-            direct_entropies,
+            direct_metric_values,
             meta_responses,
             meta_probs,
-            meta_mappings
+            meta_mappings,
+            metric_name=METRIC
         )
 
-    print(f"  Correlation (entropy, confidence): {score_stats['correlation_entropy_confidence']:.4f}")
+    print(f"  Correlation ({METRIC}, confidence): {score_stats['correlation_metric_confidence']:.4f}")
     print(f"  Fraction aligned: {score_stats['fraction_aligned']:.1%}")
 
     # Load meta activations
@@ -656,6 +711,12 @@ def main():
 
     # Save results
     results_to_save = {
+        "config": {
+            "metric": METRIC,
+            "meta_task": META_TASK,
+            "model": BASE_MODEL_NAME,
+            "dataset": DATASET_NAME,
+        },
         "score_stats": score_stats,
         "train_size": results["train_size"],
         "test_size": results["test_size"],
@@ -682,25 +743,31 @@ def main():
             return obj.tolist()
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    output_results = f"{output_prefix}_probe_results.json"
+    # Include metric in output filenames
+    output_results = f"{output_prefix}_{METRIC}_probe_results.json"
     with open(output_results, "w") as f:
         json.dump(results_to_save, f, indent=2, default=json_serializer)
     print(f"\nSaved {output_results}")
 
-    # Save directions
+    # Save directions (metric-specific filename)
     directions = {}
     for layer_idx, layer_results in results["layer_results"].items():
         directions[f"layer_{layer_idx}_introspection"] = np.array(layer_results["direction"])
 
-    output_directions = f"{output_prefix}_probe_directions.npz"
+    # Add metadata
+    directions["_metadata_metric"] = np.array(METRIC)
+    directions["_metadata_dataset"] = np.array(DATASET_NAME)
+    directions["_metadata_model"] = np.array(BASE_MODEL_NAME)
+
+    output_directions = f"{output_prefix}_{METRIC}_probe_directions.npz"
     np.savez_compressed(output_directions, **directions)
     print(f"Saved {output_directions}")
 
     # Print and plot results
     print_results(results, score_stats)
-    plot_results(results, score_stats, output_prefix)
+    plot_results(results, score_stats, f"{output_prefix}_{METRIC}")
 
-    print("\n✓ Introspection probe analysis complete!")
+    print(f"\n✓ Introspection probe analysis complete! (metric: {METRIC})")
 
 
 if __name__ == "__main__":
