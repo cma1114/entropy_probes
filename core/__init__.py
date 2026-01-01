@@ -7,6 +7,7 @@ Modules:
 - probes: Linear probe training, transfer testing, permutation tests
 - questions: Question loading, hashing, consistency verification
 - steering: Steering and ablation hooks for activation intervention
+- steering_experiments: Experiment runners and statistical analysis
 """
 
 from .model_utils import (
@@ -60,6 +61,33 @@ from .steering import (
     measure_steering_effect,
 )
 
+from .steering_experiments import (
+    SteeringExperimentConfig,
+    # KV cache utilities
+    extract_cache_tensors,
+    create_fresh_cache,
+    get_kv_cache,
+    # Batch hooks
+    BatchSteeringHook,
+    BatchAblationHook,
+    # Tokenization
+    pretokenize_prompts,
+    build_padded_gpu_batches,
+    # Direction prep
+    precompute_direction_tensors,
+    # Experiment runners
+    run_steering_experiment,
+    run_ablation_experiment,
+    # Analysis
+    compute_correlation,
+    get_expected_slope_sign,
+    analyze_steering_results,
+    analyze_ablation_results,
+    # Printing
+    print_steering_summary,
+    print_ablation_summary,
+)
+
 __all__ = [
     # model_utils
     "DEVICE",
@@ -102,4 +130,22 @@ __all__ = [
     "multi_layer_steering_context",
     "compute_projection_magnitude",
     "measure_steering_effect",
+    # steering_experiments
+    "SteeringExperimentConfig",
+    "extract_cache_tensors",
+    "create_fresh_cache",
+    "get_kv_cache",
+    "BatchSteeringHook",
+    "BatchAblationHook",
+    "pretokenize_prompts",
+    "build_padded_gpu_batches",
+    "precompute_direction_tensors",
+    "run_steering_experiment",
+    "run_ablation_experiment",
+    "compute_correlation",
+    "get_expected_slope_sign",
+    "analyze_steering_results",
+    "analyze_ablation_results",
+    "print_steering_summary",
+    "print_ablation_summary",
 ]

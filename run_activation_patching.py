@@ -628,18 +628,34 @@ def run_other_confidence_patching(
 def analyze_other_confidence_patching_effect(
     self_results: Dict,
     other_results: Dict,
-    layers: List[int]
+    layers: List[int],
+    significant_layers: List[int] = None
 ) -> Dict:
     """
     Compare patching effect on self-confidence vs other-confidence.
 
+    Statistical approach:
+    1. For each layer, compute mean |shift| for self and other
+    2. Bootstrap CI for the difference (self - other)
+    3. Permutation test: is self > other significantly?
+    4. Focus on significant layers from main analysis
+
+    Args:
+        self_results: Main patching results (self-confidence)
+        other_results: Other-confidence patching results
+        layers: All layers tested
+        significant_layers: Layers that showed significant patching effect (focus analysis)
+
     Returns dict with per-layer comparison and overall assessment.
     """
+    from scipy import stats
+
     if other_results is None:
         return None
 
     analysis = {
         "layers": layers,
+        "significant_layers": significant_layers or [],
         "layer_effects": {},
     }
 
@@ -659,20 +675,68 @@ def analyze_other_confidence_patching_effect(
 
         self_shifts = np.array(self_shifts)
         other_shifts = np.array(other_shifts)
+        n_pairs = len(self_shifts)
 
-        self_effect = float(np.mean(np.abs(self_shifts)))
-        other_effect = float(np.mean(np.abs(other_shifts)))
+        self_abs = np.abs(self_shifts)
+        other_abs = np.abs(other_shifts)
+
+        self_effect = float(np.mean(self_abs))
+        other_effect = float(np.mean(other_abs))
 
         if other_effect > 1e-6:
             ratio = self_effect / other_effect
         else:
             ratio = float('inf') if self_effect > 1e-6 else 1.0
 
+        # Paired difference: self - other (per sample)
+        diff = self_abs - other_abs
+        diff_mean = float(np.mean(diff))
+        diff_std = float(np.std(diff))
+
+        # Bootstrap 95% CI for the difference
+        n_bootstrap = 1000
+        bootstrap_diffs = []
+        for _ in range(n_bootstrap):
+            boot_idx = np.random.choice(n_pairs, size=n_pairs, replace=True)
+            boot_diff = np.mean(self_abs[boot_idx] - other_abs[boot_idx])
+            bootstrap_diffs.append(boot_diff)
+        ci_low = float(np.percentile(bootstrap_diffs, 2.5))
+        ci_high = float(np.percentile(bootstrap_diffs, 97.5))
+
+        # Paired t-test: is self effect > other effect?
+        t_stat, p_two_sided = stats.ttest_rel(self_abs, other_abs)
+        # One-sided: self > other
+        p_one_sided = p_two_sided / 2 if t_stat > 0 else 1 - p_two_sided / 2
+
+        # Permutation test as alternative
+        n_perms = 1000
+        observed_diff = np.mean(self_abs - other_abs)
+        perm_diffs = []
+        combined = np.stack([self_abs, other_abs], axis=1)
+        for _ in range(n_perms):
+            # Randomly swap self/other within each pair
+            swaps = np.random.randint(0, 2, size=n_pairs)
+            perm_self = np.where(swaps == 0, combined[:, 0], combined[:, 1])
+            perm_other = np.where(swaps == 0, combined[:, 1], combined[:, 0])
+            perm_diffs.append(np.mean(perm_self - perm_other))
+        p_perm = float(np.mean(np.array(perm_diffs) >= observed_diff))
+
         analysis["layer_effects"][layer_str] = {
             "self_effect_mean_abs": self_effect,
+            "self_effect_std": float(np.std(self_abs)),
             "other_effect_mean_abs": other_effect,
+            "other_effect_std": float(np.std(other_abs)),
             "self_vs_other_ratio": ratio,
-            "self_other_correlation": float(np.corrcoef(self_shifts, other_shifts)[0, 1]) if len(self_shifts) > 1 else np.nan,
+            "diff_mean": diff_mean,  # self - other
+            "diff_std": diff_std,
+            "diff_ci95": [ci_low, ci_high],
+            "t_statistic": float(t_stat),
+            "p_value_paired": float(p_two_sided),
+            "p_value_one_sided": float(p_one_sided),  # self > other
+            "p_value_permutation": p_perm,
+            "self_other_correlation": float(np.corrcoef(self_shifts, other_shifts)[0, 1]) if n_pairs > 1 else np.nan,
+            "n_pairs": n_pairs,
+            "is_significant_layer": layer_idx in (significant_layers or []),
         }
 
     # Overall summary
@@ -682,6 +746,17 @@ def analyze_other_confidence_patching_effect(
             analysis["mean_ratio"] = float(np.mean(ratios))
         else:
             analysis["mean_ratio"] = float('inf')
+
+        # Focus on significant layers
+        sig_effects = [e for l, e in analysis["layer_effects"].items()
+                       if e.get("is_significant_layer", False)]
+        if sig_effects:
+            analysis["significant_layer_summary"] = {
+                "mean_self_effect": float(np.mean([e["self_effect_mean_abs"] for e in sig_effects])),
+                "mean_other_effect": float(np.mean([e["other_effect_mean_abs"] for e in sig_effects])),
+                "mean_ratio": float(np.mean([e["self_vs_other_ratio"] for e in sig_effects if not np.isinf(e["self_vs_other_ratio"])])),
+                "any_significant_diff": any(e["p_value_one_sided"] < 0.05 for e in sig_effects),
+            }
 
     return analysis
 
@@ -1132,6 +1207,214 @@ Pattern Analysis:
     print(f"\nBidirectional plot saved to {output_path}")
 
 
+def plot_other_confidence_comparison(
+    other_confidence_analyses: Dict[str, Dict],
+    main_analyses: Dict[str, Dict],
+    output_path: str
+):
+    """
+    Plot comparison of self-confidence vs other-confidence patching effects.
+
+    Shows:
+    1. Bar chart comparing |self| vs |other| effect per layer with CIs
+    2. Focus panel on significant layers
+    3. Summary statistics with p-values
+    """
+    # Collect data from both directions
+    all_layers = set()
+    significant_layers = set()
+
+    for direction, analysis in other_confidence_analyses.items():
+        if analysis and analysis.get("layer_effects"):
+            for layer_str, effect in analysis["layer_effects"].items():
+                all_layers.add(int(layer_str))
+                if effect.get("is_significant_layer"):
+                    significant_layers.add(int(layer_str))
+
+    if not all_layers:
+        print("  No other-confidence data to plot")
+        return
+
+    layers = sorted(all_layers)
+    sig_layers = sorted(significant_layers)
+
+    # Determine layout based on what we have
+    if sig_layers:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Combine data from both directions for each layer
+    combined_data = {l: {"self": [], "other": [], "diff": [], "diff_ci": []} for l in layers}
+
+    for direction, analysis in other_confidence_analyses.items():
+        if analysis and analysis.get("layer_effects"):
+            for layer_str, effect in analysis["layer_effects"].items():
+                layer = int(layer_str)
+                combined_data[layer]["self"].append(effect["self_effect_mean_abs"])
+                combined_data[layer]["other"].append(effect["other_effect_mean_abs"])
+                combined_data[layer]["diff"].append(effect["diff_mean"])
+                combined_data[layer]["diff_ci"].append(effect["diff_ci95"])
+
+    # Plot 1: Self vs Other effect by layer
+    ax1 = axes[0]
+    x = np.arange(len(layers))
+    width = 0.35
+
+    self_means = [np.mean(combined_data[l]["self"]) for l in layers]
+    other_means = [np.mean(combined_data[l]["other"]) for l in layers]
+    self_stds = [np.std(combined_data[l]["self"]) if len(combined_data[l]["self"]) > 1 else 0 for l in layers]
+    other_stds = [np.std(combined_data[l]["other"]) if len(combined_data[l]["other"]) > 1 else 0 for l in layers]
+
+    # Color significant layers differently
+    self_colors = ['steelblue' if l in sig_layers else 'lightsteelblue' for l in layers]
+    other_colors = ['coral' if l in sig_layers else 'lightsalmon' for l in layers]
+
+    ax1.bar(x - width/2, self_means, width, yerr=self_stds, label='Self-confidence',
+            color=self_colors, alpha=0.8, capsize=2, edgecolor='darkblue', linewidth=0.5)
+    ax1.bar(x + width/2, other_means, width, yerr=other_stds, label='Other-confidence',
+            color=other_colors, alpha=0.8, capsize=2, edgecolor='darkred', linewidth=0.5)
+
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("Mean |Δ Confidence|")
+    ax1.set_title("Self vs Other Confidence: Patching Effect")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(layers)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # Mark significant layers
+    for i, l in enumerate(layers):
+        if l in sig_layers:
+            ax1.annotate('*', (i, max(self_means[i], other_means[i]) * 1.05),
+                        ha='center', fontsize=14, fontweight='bold')
+
+    # Plot 2 (or 3): Summary text
+    if sig_layers:
+        # Plot 2: Focus on significant layers
+        ax2 = axes[1]
+
+        sig_x = np.arange(len(sig_layers))
+        sig_self = [np.mean(combined_data[l]["self"]) for l in sig_layers]
+        sig_other = [np.mean(combined_data[l]["other"]) for l in sig_layers]
+        sig_diff = [np.mean(combined_data[l]["diff"]) for l in sig_layers]
+
+        # CI from the analyses
+        sig_ci_low = []
+        sig_ci_high = []
+        for l in sig_layers:
+            cis = combined_data[l]["diff_ci"]
+            if cis:
+                sig_ci_low.append(np.mean([ci[0] for ci in cis]))
+                sig_ci_high.append(np.mean([ci[1] for ci in cis]))
+            else:
+                sig_ci_low.append(0)
+                sig_ci_high.append(0)
+
+        # Plot difference (self - other) with CI
+        colors = ['green' if d > 0 else 'red' for d in sig_diff]
+        yerr_low = [d - ci_l for d, ci_l in zip(sig_diff, sig_ci_low)]
+        yerr_high = [ci_h - d for d, ci_h in zip(sig_diff, sig_ci_high)]
+
+        ax2.bar(sig_x, sig_diff, color=colors, alpha=0.7,
+                yerr=[yerr_low, yerr_high], capsize=4)
+        ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+        ax2.set_xlabel("Significant Layer")
+        ax2.set_ylabel("Difference: |Self| - |Other| (95% CI)")
+        ax2.set_title("Self > Other? (Significant Layers Only)")
+        ax2.set_xticks(sig_x)
+        ax2.set_xticklabels(sig_layers)
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        # Add ratio annotations
+        for i, l in enumerate(sig_layers):
+            ratio = sig_self[i] / sig_other[i] if sig_other[i] > 1e-6 else float('inf')
+            ax2.annotate(f'{ratio:.1f}x', (i, sig_diff[i]),
+                        ha='center', va='bottom' if sig_diff[i] > 0 else 'top',
+                        fontsize=9)
+
+        ax_summary = axes[2]
+    else:
+        ax_summary = axes[1]
+
+    # Summary panel
+    ax_summary.axis('off')
+
+    # Collect p-values from significant layers
+    p_values = []
+    for direction, analysis in other_confidence_analyses.items():
+        if analysis and analysis.get("layer_effects"):
+            for layer_str, effect in analysis["layer_effects"].items():
+                if int(layer_str) in sig_layers:
+                    p_values.append((int(layer_str), direction, effect["p_value_one_sided"]))
+
+    summary = """SELF vs OTHER CONFIDENCE COMPARISON
+
+Question: Does patching affect self-confidence
+specifically, or general confidence judgments?
+
+"""
+    if sig_layers:
+        # Get stats from significant layers
+        sig_self_mean = np.mean([np.mean(combined_data[l]["self"]) for l in sig_layers])
+        sig_other_mean = np.mean([np.mean(combined_data[l]["other"]) for l in sig_layers])
+        sig_ratio = sig_self_mean / sig_other_mean if sig_other_mean > 1e-6 else float('inf')
+
+        summary += f"""Significant Layers: {list(sig_layers)}
+
+Mean effects (significant layers):
+  Self:  {sig_self_mean:.3f}
+  Other: {sig_other_mean:.3f}
+  Ratio: {sig_ratio:.2f}x
+
+"""
+        if p_values:
+            summary += "P-values (self > other):\n"
+            for layer, direction, p in sorted(p_values):
+                dir_label = "h→l" if "high" in direction else "l→h"
+                sig_marker = "*" if p < 0.05 else ""
+                summary += f"  L{layer} {dir_label}: p={p:.3f}{sig_marker}\n"
+
+        summary += "\nInterpretation:\n"
+        if sig_ratio > 1.5 and any(p < 0.05 for _, _, p in p_values):
+            summary += """✓ Self > Other (significant)
+  Patching primarily affects
+  SELF-confidence (introspection)."""
+        elif sig_ratio > 1.2:
+            summary += """~ Self > Other (trend)
+  Self-confidence affected more,
+  but not significantly so."""
+        elif sig_ratio > 0.8:
+            summary += """— Similar effects
+  Patching affects both self and
+  other judgments similarly."""
+        else:
+            summary += """⚠ Other > Self
+  Unexpected: patching affects
+  other-confidence more."""
+    else:
+        summary += """No significant patching layers found
+in main analysis. Cannot focus on
+specific layers for comparison.
+
+All Layers Summary:
+"""
+        all_self = np.mean([np.mean(combined_data[l]["self"]) for l in layers])
+        all_other = np.mean([np.mean(combined_data[l]["other"]) for l in layers])
+        all_ratio = all_self / all_other if all_other > 1e-6 else float('inf')
+        summary += f"""  Mean |Self|:  {all_self:.3f}
+  Mean |Other|: {all_other:.3f}
+  Ratio: {all_ratio:.2f}x"""
+
+    ax_summary.text(0.05, 0.95, summary, transform=ax_summary.transAxes, fontsize=9,
+                    verticalalignment='top', fontfamily='monospace')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved other-confidence comparison plot to {output_path}")
+    plt.close()
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1314,6 +1597,26 @@ def main():
         print("Testing whether patching affects self-confidence specifically,")
         print("or also affects general confidence-like judgments (human difficulty estimation).")
 
+        # Find significant layers from main analysis (bidirectional: both directions positive + significant)
+        significant_layers = []
+        for layer in layers:
+            h2l_effect = all_analyses["high_to_low"]["layer_effects"].get(str(layer), {})
+            l2h_effect = all_analyses["low_to_high"]["layer_effects"].get(str(layer), {})
+
+            h2l_sig = h2l_effect.get("significant_p05", False) and h2l_effect.get("mean_normalized_shift", 0) > 0.1
+            l2h_sig = l2h_effect.get("significant_p05", False) and l2h_effect.get("mean_normalized_shift", 0) > 0.1
+
+            # Count as significant if EITHER direction shows strong effect, or BOTH show moderate effect
+            if (h2l_sig and l2h_sig) or \
+               (h2l_effect.get("mean_normalized_shift", 0) > 0.2 and h2l_effect.get("significant_p05", False)) or \
+               (l2h_effect.get("mean_normalized_shift", 0) > 0.2 and l2h_effect.get("significant_p05", False)):
+                significant_layers.append(layer)
+
+        if significant_layers:
+            print(f"\nFocusing on significant layers from main analysis: {significant_layers}")
+        else:
+            print("\nNo strongly significant layers found, will analyze all layers.")
+
         other_confidence_results = {}
         other_confidence_analyses = {}
 
@@ -1336,46 +1639,100 @@ def main():
             if other_results is not None:
                 other_confidence_results[direction] = other_results
 
-                # Analyze self vs other effect
+                # Analyze self vs other effect (with significant layers marked)
                 self_results = all_results[direction]
                 analysis = analyze_other_confidence_patching_effect(
-                    self_results, other_results, layers
+                    self_results, other_results, layers,
+                    significant_layers=significant_layers
                 )
                 other_confidence_analyses[direction] = analysis
 
-                # Print summary
+                # Print summary with statistics
                 print(f"\n{dir_label} self vs other comparison:")
+                print(f"{'Layer':<8} {'|Δself|':<10} {'|Δother|':<10} {'Diff':<10} {'95% CI':<18} {'p(self>other)':<14} {'Sig?':<5}")
+                print("-" * 80)
+
                 if analysis and analysis.get("layer_effects"):
                     for layer_str, effect in analysis["layer_effects"].items():
                         self_eff = effect["self_effect_mean_abs"]
                         other_eff = effect["other_effect_mean_abs"]
-                        ratio = effect["self_vs_other_ratio"]
-                        print(f"  Layer {layer_str}: |Δself|={self_eff:.3f}, |Δother|={other_eff:.3f}, ratio={ratio:.2f}x")
+                        diff = effect["diff_mean"]
+                        ci = effect["diff_ci95"]
+                        p_val = effect["p_value_one_sided"]
+                        is_sig = effect.get("is_significant_layer", False)
+
+                        sig_marker = "*" if is_sig else ""
+                        p_marker = "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+
+                        ci_str = f"[{ci[0]:.3f}, {ci[1]:.3f}]"
+                        print(f"{layer_str + sig_marker:<8} {self_eff:<10.3f} {other_eff:<10.3f} {diff:<+10.3f} {ci_str:<18} {p_val:<14.4f} {p_marker:<5}")
 
                     if "mean_ratio" in analysis:
-                        print(f"  Mean ratio: {analysis['mean_ratio']:.2f}x")
+                        print(f"\n  Mean ratio (all layers): {analysis['mean_ratio']:.2f}x")
+
+                    # Print significant layer summary if available
+                    if analysis.get("significant_layer_summary"):
+                        sig_summ = analysis["significant_layer_summary"]
+                        print(f"  Significant layers only: self={sig_summ['mean_self_effect']:.3f}, other={sig_summ['mean_other_effect']:.3f}, ratio={sig_summ['mean_ratio']:.2f}x")
 
         # Overall assessment
         if other_confidence_analyses:
             all_ratios = []
+            sig_ratios = []
+            sig_p_values = []
+
             for dir_analysis in other_confidence_analyses.values():
                 if dir_analysis and dir_analysis.get("layer_effects"):
-                    for e in dir_analysis["layer_effects"].values():
+                    for layer_str, e in dir_analysis["layer_effects"].items():
                         if not np.isinf(e["self_vs_other_ratio"]):
                             all_ratios.append(e["self_vs_other_ratio"])
+                            if e.get("is_significant_layer", False):
+                                sig_ratios.append(e["self_vs_other_ratio"])
+                                sig_p_values.append(e["p_value_one_sided"])
+
+            print(f"\n" + "=" * 60)
+            print("OVERALL OTHER-CONFIDENCE CONTROL SUMMARY")
+            print("=" * 60)
 
             if all_ratios:
                 overall_ratio = np.mean(all_ratios)
-                print(f"\n--- Overall Other-Confidence Control Summary ---")
-                print(f"Mean self/other ratio across all layers and directions: {overall_ratio:.2f}x")
-                if overall_ratio > 2.0:
-                    print("→ Patching primarily affects SELF-confidence (introspection-specific)")
-                elif overall_ratio > 1.2:
-                    print("→ Patching affects self-confidence more than other-confidence")
-                elif overall_ratio > 0.8:
-                    print("→ Patching affects self and other confidence similarly (general effect)")
+                print(f"\nAll layers ({len(all_ratios)} measurements):")
+                print(f"  Mean self/other ratio: {overall_ratio:.2f}x")
+
+            if sig_ratios:
+                sig_ratio = np.mean(sig_ratios)
+                n_sig_tests = len(sig_p_values)
+                n_sig_p05 = sum(1 for p in sig_p_values if p < 0.05)
+                print(f"\nSignificant layers only ({len(sig_ratios)} measurements from layers {significant_layers}):")
+                print(f"  Mean self/other ratio: {sig_ratio:.2f}x")
+                print(f"  Tests with p<0.05 (self > other): {n_sig_p05}/{n_sig_tests}")
+
+                # Overall interpretation based on significant layers
+                print("\nInterpretation:")
+                if sig_ratio > 1.5 and n_sig_p05 > 0:
+                    print("  ✓ SELF-SPECIFIC: Patching primarily affects self-confidence")
+                    print("    The causal effect is specific to introspection, not general confidence.")
+                elif sig_ratio > 1.2:
+                    print("  ~ TREND: Self-confidence affected more than other-confidence")
+                    print("    But the difference may not be statistically significant.")
+                elif sig_ratio > 0.8:
+                    print("  — GENERAL EFFECT: Patching affects both similarly")
+                    print("    The causal effect may not be introspection-specific.")
                 else:
-                    print("→ Patching affects other-confidence more than self (unexpected)")
+                    print("  ⚠ UNEXPECTED: Other-confidence affected more than self")
+
+            elif all_ratios:
+                # No significant layers, use all data
+                overall_ratio = np.mean(all_ratios)
+                print("\nInterpretation (based on all layers):")
+                if overall_ratio > 2.0:
+                    print("  → Patching primarily affects SELF-confidence (introspection-specific)")
+                elif overall_ratio > 1.2:
+                    print("  → Patching affects self-confidence more than other-confidence")
+                elif overall_ratio > 0.8:
+                    print("  → Patching affects self and other confidence similarly (general effect)")
+                else:
+                    print("  → Patching affects other-confidence more than self (unexpected)")
 
         # Save other-confidence results
         other_conf_path = f"{output_prefix}_{METRIC}_patching_other_confidence.json"
@@ -1383,8 +1740,16 @@ def main():
             json.dump({
                 "results": other_confidence_results,
                 "analyses": other_confidence_analyses,
+                "significant_layers": significant_layers,
             }, f, indent=2, default=json_serializer)
         print(f"\nSaved other-confidence results to {other_conf_path}")
+
+        # Plot other-confidence comparison
+        if other_confidence_analyses:
+            other_conf_plot_path = f"{output_prefix}_{METRIC}_patching_other_confidence.png"
+            plot_other_confidence_comparison(
+                other_confidence_analyses, all_analyses, other_conf_plot_path
+            )
 
 
 if __name__ == "__main__":

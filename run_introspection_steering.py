@@ -38,6 +38,7 @@ from tqdm import tqdm
 from typing import List, Dict, Tuple, Optional
 import matplotlib.pyplot as plt
 import random
+from scipy import stats
 
 from core.model_utils import (
     load_model_and_tokenizer,
@@ -68,7 +69,7 @@ from tasks import (
 # =============================================================================
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###BASE_MODEL_NAME  # 
-DATASET_NAME = "TriviaMC"
+DATASET_NAME = "SimpleMC"
 
 # Direction type: "introspection", "entropy", or "shared"
 # - "introspection": Uses directions from run_introspection_probe.py
@@ -121,11 +122,14 @@ STEERING_LAYERS = None  # None = auto-select from probe results
 STEERING_MULTIPLIERS = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
 NUM_STEERING_QUESTIONS = 100
 # Number of control directions per layer. Set to None for dynamic scaling.
-# Dynamic scaling: NUM_CONTROL_DIRECTIONS = max(MIN_CONTROLS_PER_LAYER, TARGET_POOLED_SAMPLES // num_layers)
-# This ensures ~100 total pooled samples for statistical testing regardless of layer count.
+# Dynamic scaling ensures enough power for FDR correction:
+#   - For FDR at α=0.05 with N layers, need min p-value < 0.05/N
+#   - min p-value ≈ 1/(pooled_samples), so need pooled_samples > 20*N
+#   - We use 25*N for safety margin, giving controls_per_layer = 25
 NUM_CONTROL_DIRECTIONS = None  # None = dynamic based on num_layers, or set explicit value
-TARGET_POOLED_SAMPLES = 100   # Target total samples when pooling controls across layers
-MIN_CONTROLS_PER_LAYER = 5    # Minimum controls even for many layers
+FDR_ALPHA = 0.05              # Target FDR significance level
+FDR_SAFETY_FACTOR = 25        # Multiplier: pooled_samples = FDR_SAFETY_FACTOR * num_layers
+MIN_CONTROLS_PER_LAYER = 10   # Minimum controls even for few layers
 
 BATCH_SIZE = 8  # Batch size for baseline/single-direction forward passes
 
@@ -228,16 +232,76 @@ def local_response_to_confidence(
 # STEERING AND ABLATION
 # ============================================================================
 
+# Import DynamicCache safely
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:
+    DynamicCache = None
+
+def extract_cache_tensors(past_key_values):
+    """
+    Extract raw tensors from past_key_values (tuple or DynamicCache).
+    Uses robust indexing (cache[i]) instead of attribute access.
+    Returns (key_tensors, value_tensors) where each is a list of tensors.
+    """
+    keys = []
+    values = []
+    
+    # Robustly determine number of layers
+    try:
+        num_layers = len(past_key_values)
+    except TypeError:
+        # Fallback for weird objects (e.g. some PEFT proxies)
+        if hasattr(past_key_values, "to_legacy_cache"):
+             return extract_cache_tensors(past_key_values.to_legacy_cache())
+        raise ValueError(f"Cannot determine length of cache: {type(past_key_values)}")
+        
+    for i in range(num_layers):
+        # Indexing returns (key_state, value_state) for layer i
+        # This is supported by both legacy Tuples and DynamicCache.__getitem__
+        k, v = past_key_values[i]
+        keys.append(k)
+        values.append(v)
+        
+    return keys, values
+
+
+def create_fresh_cache(key_tensors, value_tensors, expand_size=1):
+    """
+    Create a fresh DynamicCache (or tuple) from tensors.
+    Uses the public .update() API to populate, avoiding attribute errors.
+    """
+    if DynamicCache is not None:
+        cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(key_tensors, value_tensors)):
+            if expand_size > 1:
+                k = k.repeat_interleave(expand_size, dim=0)
+                v = v.repeat_interleave(expand_size, dim=0)
+            
+            # Use public update API to populate the fresh cache.
+            # When the cache is empty, update() appends these tensors as the layer state.
+            cache.update(k, v, i)
+            
+        return cache
+    else:
+        # Fallback to tuple for older transformers
+        layers = []
+        for k, v in zip(key_tensors, value_tensors):
+            if expand_size > 1:
+                k = k.repeat_interleave(expand_size, dim=0)
+                v = v.repeat_interleave(expand_size, dim=0)
+            layers.append((k, v))
+        return tuple(layers)
+        
 def get_kv_cache(model, batch_inputs):
     """
-    Run the prefix (all tokens except the last one) to generate KV cache.
-    Returns the inputs required for the final step (including the cache).
+    Run the prefix to generate KV cache tensors.
+    Returns dictionary with next-step inputs and 'past_key_values_data' (snapshot).
     """
     input_ids = batch_inputs["input_ids"]
     attention_mask = batch_inputs["attention_mask"]
     
     # 1. Run Prefix (Tokens 0 to T-1)
-    # We slice off the last token
     prefix_ids = input_ids[:, :-1]
     prefix_mask = attention_mask[:, :-1]
     
@@ -248,23 +312,25 @@ def get_kv_cache(model, batch_inputs):
             use_cache=True,
         )
     
-    # 2. Prepare inputs for the Final Token (T)
-    # We pass the *full* attention mask so the model knows the position relative to history
+    # 2. Extract Immutable Snapshot (List of Tensors)
+    # This prevents the "tuple has no attribute get_seq_length" AND mutation bugs
+    keys, values = extract_cache_tensors(outputs.past_key_values)
+    
+    # 3. Prepare next step inputs
     last_ids = input_ids[:, -1:]
     
-    next_step_inputs = {
+    result = {
         "input_ids": last_ids,
         "attention_mask": attention_mask, # Full mask (History + Current)
-        "past_key_values": outputs.past_key_values,
-        "use_cache": True
+        "past_key_values_data": (keys, values), # Store tensors, not the object
     }
     
-    # Handle position_ids for RoPE models (safety check)
+    # Preserve position_ids if available (Critical for RoPE)
     if "position_ids" in batch_inputs:
-        next_step_inputs["position_ids"] = batch_inputs["position_ids"][:, -1:]
+        result["position_ids"] = batch_inputs["position_ids"][:, -1:]
         
-    return next_step_inputs
-
+    return result
+    
 class SteeringHook:
     """Hook that adds a steering vector to activations.
 
@@ -440,9 +506,11 @@ class BatchAblationHook:
         """
         self.directions_bh = directions_bh
         self.handle = None
+        self._diag_printed = False
 
     def set_directions(self, directions_bh: torch.Tensor):
         self.directions_bh = directions_bh
+        self._diag_printed = False  # Reset diagnostic flag for new directions
 
     def __call__(self, module, input, output):
         if self.directions_bh is None:
@@ -462,6 +530,21 @@ class BatchAblationHook:
             dots = torch.einsum('bh,bh->b', last_token, dirs)
             # Projection: dots[:, None] * dirs -> (batch, hidden)
             proj = dots.unsqueeze(-1) * dirs
+
+            # Diagnostic: track projection magnitude (first call only per direction set)
+            if not self._diag_printed:
+                proj_norm = proj.norm(dim=-1).mean().item()
+                hs_norm = last_token.norm(dim=-1).mean().item()
+                dir_norm = dirs.norm(dim=-1).mean().item()
+                dot_mean = dots.abs().mean().item()
+                # Always print first diagnostic per layer to confirm hook is running
+                if not hasattr(self, '_first_diag_done'):
+                    print(f"  [BatchAblationHook] dir_norm={dir_norm:.4f}, hs_norm={hs_norm:.2f}, dot={dot_mean:.4f}, proj_norm={proj_norm:.4f}")
+                    self._first_diag_done = True
+                elif proj_norm < 1e-6 and hs_norm > 1e-3:
+                    print(f"  [BatchAblationHook] WARNING: Near-zero projection ({proj_norm:.2e}) vs hs_norm ({hs_norm:.2e})")
+                self._diag_printed = True
+
             hs[:, -1, :] = last_token - proj
         else:
             # Project out direction from all tokens (original behavior):
@@ -949,6 +1032,8 @@ def analyze_other_confidence_effect(
     - self_effect: mean change in self-confidence signal
     - other_effect: mean change in other-confidence signal
     - self_vs_other_ratio: how much more self is affected than other
+    - p_value_paired: paired t-test p-value for |self_delta| > |other_delta|
+    - p_value_permutation: permutation test p-value
     """
     if baseline_other is None or steered_other is None:
         return None
@@ -972,8 +1057,55 @@ def analyze_other_confidence_effect(
     # Compute ratio (avoid division by zero)
     if abs(other_effect) > 1e-6:
         ratio = abs(self_effect) / abs(other_effect)
+    elif abs(self_effect) > 1e-6:
+        ratio = float('inf')
     else:
-        ratio = float('inf') if abs(self_effect) > 1e-6 else 1.0
+        # Both effects are ~0 - no meaningful comparison
+        ratio = float('nan')
+
+    # Compute correlation safely (avoid warning when std=0)
+    if len(self_delta) > 1 and np.std(self_delta) > 1e-10 and np.std(other_delta) > 1e-10:
+        self_other_corr = float(np.corrcoef(self_delta, other_delta)[0, 1])
+    else:
+        self_other_corr = float('nan')
+
+    # Statistical test: is |self_delta| > |other_delta| per question?
+    # Paired t-test on absolute effects
+    abs_self = np.abs(self_delta)
+    abs_other = np.abs(other_delta)
+    diff = abs_self - abs_other  # positive if self effect larger
+
+    # Paired t-test (one-sided: self > other)
+    if len(diff) > 1 and np.std(diff) > 1e-10:
+        t_stat, p_two_sided = stats.ttest_rel(abs_self, abs_other)
+        # One-sided p-value: we want self > other
+        p_paired = p_two_sided / 2 if t_stat > 0 else 1 - p_two_sided / 2
+    else:
+        p_paired = float('nan')
+
+    # Permutation test: shuffle self/other labels
+    n_permutations = 1000
+    observed_diff = np.mean(abs_self) - np.mean(abs_other)
+    count_extreme = 0
+    combined = np.stack([abs_self, abs_other], axis=1)  # (n_questions, 2)
+    for _ in range(n_permutations):
+        # Randomly swap self/other for each question
+        swaps = np.random.randint(0, 2, size=len(combined))
+        perm_self = np.array([combined[i, swaps[i]] for i in range(len(combined))])
+        perm_other = np.array([combined[i, 1 - swaps[i]] for i in range(len(combined))])
+        perm_diff = np.mean(perm_self) - np.mean(perm_other)
+        if perm_diff >= observed_diff:
+            count_extreme += 1
+    p_permutation = (count_extreme + 1) / (n_permutations + 1)
+
+    # Bootstrap 95% CI for the difference
+    n_bootstrap = 1000
+    bootstrap_diffs = []
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(diff), size=len(diff), replace=True)
+        bootstrap_diffs.append(np.mean(diff[idx]))
+    ci_low = float(np.percentile(bootstrap_diffs, 2.5))
+    ci_high = float(np.percentile(bootstrap_diffs, 97.5))
 
     return {
         "self_effect_mean": self_effect,
@@ -981,7 +1113,11 @@ def analyze_other_confidence_effect(
         "other_effect_mean": other_effect,
         "other_effect_std": float(np.std(other_delta)),
         "self_vs_other_ratio": ratio,
-        "self_other_correlation": float(np.corrcoef(self_delta, other_delta)[0, 1]) if len(self_delta) > 1 else np.nan,
+        "self_other_correlation": self_other_corr,
+        "diff_abs_effect": float(np.mean(diff)),  # mean(|self| - |other|)
+        "diff_abs_effect_ci95": [ci_low, ci_high],
+        "p_value_paired": float(p_paired),
+        "p_value_permutation": float(p_permutation),
     }
 
 
@@ -1128,8 +1264,54 @@ def analyze_other_confidence_ablation_effect(
     # Compute ratio (avoid division by zero)
     if other_effect > 1e-6:
         ratio = self_effect / other_effect
+    elif self_effect > 1e-6:
+        ratio = float('inf')
     else:
-        ratio = float('inf') if self_effect > 1e-6 else 1.0
+        # Both effects are ~0 - no meaningful comparison
+        ratio = float('nan')
+
+    # Compute correlation safely (avoid warning when std=0)
+    if len(self_delta) > 1 and np.std(self_delta) > 1e-10 and np.std(other_delta) > 1e-10:
+        self_other_corr = float(np.corrcoef(self_delta, other_delta)[0, 1])
+    else:
+        self_other_corr = float('nan')
+
+    # Statistical test: is |self_delta| > |other_delta| per question?
+    abs_self = np.abs(self_delta)
+    abs_other = np.abs(other_delta)
+    diff = abs_self - abs_other  # positive if self effect larger
+
+    # Paired t-test (one-sided: self > other)
+    if len(diff) > 1 and np.std(diff) > 1e-10:
+        t_stat, p_two_sided = stats.ttest_rel(abs_self, abs_other)
+        # One-sided p-value: we want self > other
+        p_paired = p_two_sided / 2 if t_stat > 0 else 1 - p_two_sided / 2
+    else:
+        p_paired = float('nan')
+
+    # Permutation test: shuffle self/other labels
+    n_permutations = 1000
+    observed_diff = np.mean(abs_self) - np.mean(abs_other)
+    count_extreme = 0
+    combined = np.stack([abs_self, abs_other], axis=1)  # (n_questions, 2)
+    for _ in range(n_permutations):
+        # Randomly swap self/other for each question
+        swaps = np.random.randint(0, 2, size=len(combined))
+        perm_self = np.array([combined[i, swaps[i]] for i in range(len(combined))])
+        perm_other = np.array([combined[i, 1 - swaps[i]] for i in range(len(combined))])
+        perm_diff = np.mean(perm_self) - np.mean(perm_other)
+        if perm_diff >= observed_diff:
+            count_extreme += 1
+    p_permutation = (count_extreme + 1) / (n_permutations + 1)
+
+    # Bootstrap 95% CI for the difference
+    n_bootstrap = 1000
+    bootstrap_diffs = []
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(diff), size=len(diff), replace=True)
+        bootstrap_diffs.append(np.mean(diff[idx]))
+    ci_low = float(np.percentile(bootstrap_diffs, 2.5))
+    ci_high = float(np.percentile(bootstrap_diffs, 97.5))
 
     return {
         "self_effect_mean_abs": self_effect,
@@ -1137,56 +1319,38 @@ def analyze_other_confidence_ablation_effect(
         "other_effect_mean_abs": other_effect,
         "other_effect_std": float(np.std(other_delta)),
         "self_vs_other_ratio": ratio,
-        "self_other_correlation": float(np.corrcoef(self_delta, other_delta)[0, 1]) if len(self_delta) > 1 else np.nan,
+        "self_other_correlation": self_other_corr,
+        "diff_abs_effect": float(np.mean(diff)),  # mean(|self| - |other|)
+        "diff_abs_effect_ci95": [ci_low, ci_high],
+        "p_value_paired": float(p_paired),
+        "p_value_permutation": float(p_permutation),
     }
 
 
 # ============================================================================
 # MAIN EXPERIMENT
 # ============================================================================
-def run_steering_experiment(
+
+def _run_steering_full_forward(
     model,
     tokenizer,
     questions: List[Dict],
     direct_metric_values: np.ndarray,
     layers: List[int],
-    directions: Dict,
     multipliers: List[float],
     num_controls: int,
-    use_chat_template: bool,
-    cached_directions: Optional[Dict] = None
+    cached_directions: Dict,
+    option_token_ids: List[int],
+    options: List[str],
+    mappings: List,
+    cached_inputs: List[Dict],
 ) -> Dict:
-    print(f"\nRunning steering experiment (KV Cache - Memory Safe)...")
-    
-    if INTERVENTION_POSITION != "last":
-        print("Warning: INTERVENTION_POSITION != 'last'. KV Cache optimization disabled.")
-        return {}
+    """Fallback: Full forward pass implementation for INTERVENTION_POSITION='all'."""
+    print("Using full forward passes (INTERVENTION_POSITION='all')...")
 
     metric_mean = direct_metric_values.mean()
     metric_std = direct_metric_values.std()
 
-    prompts = []
-    mappings = []
-    for q_idx, question in enumerate(questions):
-        if META_TASK == "delegate":
-            prompt, _, mapping = format_delegate_prompt(question, tokenizer, use_chat_template, trial_index=q_idx)
-        else:
-            prompt = format_meta_prompt(question, tokenizer, use_chat_template)
-            mapping = None
-        prompts.append(prompt)
-        mappings.append(mapping)
-
-    cached_inputs = pretokenize_prompts(prompts, tokenizer, DEVICE)
-    
-    if META_TASK == "delegate":
-        option_token_ids = _CACHED_TOKEN_IDS["delegate_options"]
-        options = DELEGATE_OPTIONS
-    else:
-        option_token_ids = _CACHED_TOKEN_IDS["meta_options"]
-        options = META_OPTIONS
-
-    nonzero_multipliers = [m for m in multipliers if m != 0.0]
-    
     # Initialize results
     shared_baseline = [None] * len(questions)
     final_layer_results = {}
@@ -1201,25 +1365,13 @@ def run_steering_experiment(
             for k in final_layer_results[l]["controls"]:
                 final_layer_results[l]["controls"][k][0.0] = shared_baseline
 
-    if cached_directions is None:
-        cached_directions = precompute_direction_tensors(
-            directions, layers, num_controls, DEVICE, 
-            torch.float16 if DEVICE == "cuda" else torch.float32
-        )
-
-    # Standard batch size
     gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
-    print(f"Processing {len(gpu_batches)} batches (KV-Cached)...")
 
-    for batch_indices, batch_inputs in tqdm(gpu_batches, desc="Batches"):
-        B = len(batch_indices)
-        
-        # 1. Compute KV Cache
-        base_step_inputs = get_kv_cache(model, batch_inputs)
-        
-        # 2. Compute Baseline for this batch
+    # Compute baseline first
+    print("Computing baseline...")
+    for batch_indices, batch_inputs in gpu_batches:
         with torch.inference_mode():
-            out = model(**base_step_inputs)
+            out = model(**batch_inputs)
             logits = out.logits[:, -1, :][:, option_token_ids]
             probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
         for i, q_idx in enumerate(batch_indices):
@@ -1233,57 +1385,49 @@ def run_steering_experiment(
                 "metric": float(m_val), "alignment": float(align)
             }
 
-        # 3. Iterate Layers
-        for layer_idx in layers:
-            if hasattr(model, 'get_base_model'):
-                layer_module = model.get_base_model().model.layers[layer_idx]
-            else:
-                layer_module = model.model.layers[layer_idx]
+    nonzero_multipliers = [m for m in multipliers if m != 0.0]
 
-            intro_dir = cached_directions[layer_idx]["introspection"]
-            control_dirs = cached_directions[layer_idx]["controls"]
-            
-            hook = BatchSteeringHook()
+    # Process each layer
+    for layer_idx in tqdm(layers, desc="Layers"):
+        if hasattr(model, 'get_base_model'):
+            layer_module = model.get_base_model().model.layers[layer_idx]
+        else:
+            layer_module = model.model.layers[layer_idx]
+
+        intro_dir = cached_directions[layer_idx]["introspection"]
+        control_dirs = cached_directions[layer_idx]["controls"]
+
+        # Helper to run all questions for one direction+multiplier
+        def run_condition(direction_vector, mult, result_storage):
+            hook = SteeringHook(direction_vector, mult, pre_normalized=True)
             hook.register(layer_module)
-
-            # Helper to run sweep over multipliers
-            def run_mult_sweep(direction_vector, result_dict):
-                # direction_vector: (H,)
-                
-                for mult in nonzero_multipliers:
-                    # Delta: (H,) * scalar -> (H,)
-                    delta = direction_vector * mult
-                    # Expand to batch: (Batch, H)
-                    delta_batch = delta.unsqueeze(0).expand(B, -1)
-                    
-                    hook.set_delta(delta_batch)
-                    
+            try:
+                for batch_indices, batch_inputs in gpu_batches:
                     with torch.inference_mode():
-                        out = model(**base_step_inputs)
+                        out = model(**batch_inputs)
                         logits = out.logits[:, -1, :][:, option_token_ids]
                         probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-                    
                     for i, q_idx in enumerate(batch_indices):
                         p = probs[i]
                         resp = options[np.argmax(p)]
                         conf = local_response_to_confidence(resp, p, mappings[q_idx])
                         m_val = direct_metric_values[q_idx]
                         align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
-                        
-                        result_dict[mult][q_idx] = {
+                        result_storage[mult][q_idx] = {
                             "question_idx": q_idx, "response": resp, "confidence": conf,
                             "metric": float(m_val), "alignment": float(align)
                         }
-
-            try:
-                # Introspection
-                run_mult_sweep(intro_dir, final_layer_results[layer_idx]["introspection"])
-                
-                # Controls
-                for i_c, ctrl_dir in enumerate(control_dirs):
-                    run_mult_sweep(ctrl_dir, final_layer_results[layer_idx]["controls"][f"control_{i_c}"])
             finally:
                 hook.remove()
+
+        # Introspection
+        for mult in nonzero_multipliers:
+            run_condition(intro_dir, mult, final_layer_results[layer_idx]["introspection"])
+
+        # Controls
+        for i_c, ctrl_dir in enumerate(control_dirs):
+            for mult in nonzero_multipliers:
+                run_condition(ctrl_dir, mult, final_layer_results[layer_idx]["controls"][f"control_{i_c}"])
 
     return {
         "layers": layers,
@@ -1293,9 +1437,308 @@ def run_steering_experiment(
         "layer_results": final_layer_results
     }
 
+
+def run_steering_experiment(
+    model,
+    tokenizer,
+    questions: List[Dict],
+    direct_metric_values: np.ndarray,
+    layers: List[int],
+    directions: Dict,
+    multipliers: List[float],
+    num_controls: int,
+    use_chat_template: bool,
+    cached_directions: Optional[Dict] = None
+) -> Dict:
+    """Run steering experiment with KV cache optimization (Robust Fix)."""
+
+    metric_mean = direct_metric_values.mean()
+    metric_std = direct_metric_values.std()
+
+    prompts = []
+    mappings = []
+    for q_idx, question in enumerate(questions):
+        if META_TASK == "delegate":
+            prompt, _, mapping = format_delegate_prompt(question, tokenizer, use_chat_template, trial_index=q_idx)
+        else:
+            prompt = format_meta_prompt(question, tokenizer, use_chat_template)
+            mapping = None
+        prompts.append(prompt)
+        mappings.append(mapping)
+
+    cached_inputs = pretokenize_prompts(prompts, tokenizer, DEVICE)
+
+    if META_TASK == "delegate":
+        option_token_ids = _CACHED_TOKEN_IDS["delegate_options"]
+        options = DELEGATE_OPTIONS
+    else:
+        option_token_ids = _CACHED_TOKEN_IDS["meta_options"]
+        options = META_OPTIONS
+
+    if cached_directions is None:
+        cached_directions = precompute_direction_tensors(
+            directions, layers, num_controls, DEVICE,
+            torch.float16 if DEVICE == "cuda" else torch.float32
+        )
+
+    # Fallback if not intervening on last token
+    if INTERVENTION_POSITION != "last":
+        print(f"\nRunning steering experiment (full forward fallback)...")
+        # Ensure _run_steering_full_forward is defined or just return/error
+        return _run_steering_full_forward(
+            model, tokenizer, questions, direct_metric_values,
+            layers, multipliers, num_controls,
+            cached_directions, option_token_ids, options, mappings, cached_inputs
+        )
+
+    print(f"\nRunning steering experiment (KV Cache + batched multipliers)...")
+
+    nonzero_multipliers = [m for m in multipliers if m != 0.0]
+    k_mult = len(nonzero_multipliers)
+
+    # Initialize results
+    shared_baseline = [None] * len(questions)
+    final_layer_results = {}
+    for l in layers:
+        final_layer_results[l] = {
+            "baseline": shared_baseline,
+            "introspection": {m: [None] * len(questions) for m in multipliers},
+            "controls": {f"control_{i}": {m: [None] * len(questions) for m in multipliers} for i in range(num_controls)},
+        }
+        if 0.0 in multipliers:
+            final_layer_results[l]["introspection"][0.0] = shared_baseline
+            for k in final_layer_results[l]["controls"]:
+                final_layer_results[l]["controls"][k][0.0] = shared_baseline
+
+    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
+    print(f"Processing {len(gpu_batches)} batches, {k_mult} multipliers batched per forward pass...")
+
+    for batch_indices, batch_inputs in tqdm(gpu_batches, desc="Batches"):
+        B = len(batch_indices)
+
+        # 1. Compute KV Cache (Snapshot)
+        base_step_data = get_kv_cache(model, batch_inputs)
+        keys_snapshot, values_snapshot = base_step_data["past_key_values_data"]
+
+        # 2. Compute Baseline (No steering)
+        # Reconstruct fresh cache (size 1)
+        fresh_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
+        
+        baseline_inputs = {
+            "input_ids": base_step_data["input_ids"],
+            "attention_mask": base_step_data["attention_mask"],
+            "past_key_values": fresh_cache,
+            "use_cache": True
+        }
+        if "position_ids" in base_step_data:
+            baseline_inputs["position_ids"] = base_step_data["position_ids"]
+
+        with torch.inference_mode():
+            out = model(**baseline_inputs)
+            logits = out.logits[:, -1, :][:, option_token_ids]
+            probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+        
+        for i, q_idx in enumerate(batch_indices):
+            p = probs[i]
+            resp = options[np.argmax(p)]
+            conf = local_response_to_confidence(resp, p, mappings[q_idx])
+            m_val = direct_metric_values[q_idx]
+            align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+            shared_baseline[q_idx] = {
+                "question_idx": q_idx, "response": resp, "confidence": conf,
+                "metric": float(m_val), "alignment": float(align)
+            }
+
+        # 3. Prepare Inputs for Steering (Expansion)
+        expanded_input_ids = base_step_data["input_ids"].repeat_interleave(k_mult, dim=0)
+        expanded_attention_mask = base_step_data["attention_mask"].repeat_interleave(k_mult, dim=0)
+        
+        expanded_inputs_template = {
+            "input_ids": expanded_input_ids,
+            "attention_mask": expanded_attention_mask,
+            "use_cache": True
+        }
+        if "position_ids" in base_step_data:
+            expanded_inputs_template["position_ids"] = base_step_data["position_ids"].repeat_interleave(k_mult, dim=0)
+
+        # 4. Iterate Layers
+        for layer_idx in layers:
+            if hasattr(model, 'get_base_model'):
+                layer_module = model.get_base_model().model.layers[layer_idx]
+            else:
+                layer_module = model.model.layers[layer_idx]
+
+            intro_dir = cached_directions[layer_idx]["introspection"]
+            control_dirs = cached_directions[layer_idx]["controls"]
+
+            hook = BatchSteeringHook()
+            hook.register(layer_module)
+
+            def run_batched_mult_sweep(direction_vector, result_dict):
+                # 1. Create FRESH cache expanded for this pass
+                # (Re-creating the cache object is fast compared to the model run)
+                pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=k_mult)
+                
+                # 2. Attach cache to inputs
+                current_inputs = expanded_inputs_template.copy()
+                current_inputs["past_key_values"] = pass_cache
+
+                # 3. Set Deltas
+                # delta_bh: [B * k_mult, Hidden]
+                deltas = []
+                for _ in range(B):
+                    for mult in nonzero_multipliers:
+                        deltas.append(direction_vector * mult)
+                delta_bh = torch.stack(deltas, dim=0)
+                hook.set_delta(delta_bh)
+
+                # 4. Run Model
+                with torch.inference_mode():
+                    out = model(**current_inputs)
+                    logits = out.logits[:, -1, :][:, option_token_ids]
+                    probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+
+                # 5. Store Results
+                for i, q_idx in enumerate(batch_indices):
+                    for j, mult in enumerate(nonzero_multipliers):
+                        idx = i * k_mult + j
+                        p = probs[idx]
+                        resp = options[np.argmax(p)]
+                        conf = local_response_to_confidence(resp, p, mappings[q_idx])
+                        m_val = direct_metric_values[q_idx]
+                        align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+
+                        result_dict[mult][q_idx] = {
+                            "question_idx": q_idx, "response": resp, "confidence": conf,
+                            "metric": float(m_val), "alignment": float(align)
+                        }
+
+            try:
+                # Introspection
+                run_batched_mult_sweep(intro_dir, final_layer_results[layer_idx]["introspection"])
+                # Controls
+                for i_c, ctrl_dir in enumerate(control_dirs):
+                    run_batched_mult_sweep(ctrl_dir, final_layer_results[layer_idx]["controls"][f"control_{i_c}"])
+            finally:
+                hook.remove()
+
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+
+    return {
+        "layers": layers,
+        "multipliers": multipliers,
+        "num_questions": len(questions),
+        "num_controls": num_controls,
+        "layer_results": final_layer_results
+    }
+    
 # ============================================================================
 # ABLATION EXPERIMENT
 # ============================================================================
+
+def _run_ablation_full_forward(
+    model,
+    tokenizer,
+    questions: List[Dict],
+    direct_metric_values: np.ndarray,
+    layers: List[int],
+    num_controls: int,
+    cached_directions: Dict,
+    option_token_ids: List[int],
+    options: List[str],
+    mappings: List,
+    cached_inputs: List[Dict],
+    baseline_results: Optional[List[Dict]] = None,
+) -> Dict:
+    """Fallback: Full forward pass implementation for INTERVENTION_POSITION='all'."""
+    print("Using full forward passes (INTERVENTION_POSITION='all')...")
+
+    metric_mean = direct_metric_values.mean()
+    metric_std = direct_metric_values.std()
+
+    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
+
+    # Compute baseline if not provided
+    if baseline_results is None:
+        print("Computing baseline...")
+        baseline_results = [None] * len(questions)
+        for batch_indices, batch_inputs in gpu_batches:
+            with torch.inference_mode():
+                out = model(**batch_inputs)
+                logits = out.logits[:, -1, :][:, option_token_ids]
+                probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+            for i, q_idx in enumerate(batch_indices):
+                p = probs[i]
+                resp = options[np.argmax(p)]
+                conf = local_response_to_confidence(resp, p, mappings[q_idx])
+                m_val = direct_metric_values[q_idx]
+                align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+                baseline_results[q_idx] = {
+                    "question_idx": q_idx, "response": resp, "confidence": conf,
+                    "metric": float(m_val), "alignment": float(align)
+                }
+
+    final_layer_results = {}
+    for l in layers:
+        final_layer_results[l] = {
+            "baseline": baseline_results,
+            "introspection_ablated": [None] * len(questions),
+            "controls_ablated": {f"control_{i}": [None] * len(questions) for i in range(num_controls)}
+        }
+
+    # Process each layer
+    for layer_idx in tqdm(layers, desc="Layers"):
+        if hasattr(model, 'get_base_model'):
+            layer_module = model.get_base_model().model.layers[layer_idx]
+        else:
+            layer_module = model.model.layers[layer_idx]
+
+        intro_dir = cached_directions[layer_idx]["introspection"]
+        control_dirs = cached_directions[layer_idx]["controls"]
+
+        # Helper to run all questions for one direction
+        def run_ablation_condition(direction_vector, result_storage, key=None):
+            hook = AblationHook(direction_vector, pre_normalized=True)
+            hook.register(layer_module)
+            try:
+                for batch_indices, batch_inputs in gpu_batches:
+                    with torch.inference_mode():
+                        out = model(**batch_inputs)
+                        logits = out.logits[:, -1, :][:, option_token_ids]
+                        probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+                    for i, q_idx in enumerate(batch_indices):
+                        p = probs[i]
+                        resp = options[np.argmax(p)]
+                        conf = local_response_to_confidence(resp, p, mappings[q_idx])
+                        m_val = direct_metric_values[q_idx]
+                        align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+                        data = {
+                            "question_idx": q_idx, "response": resp, "confidence": conf,
+                            "metric": float(m_val), "alignment": float(align)
+                        }
+                        if key:
+                            result_storage[key][q_idx] = data
+                        else:
+                            result_storage[q_idx] = data
+            finally:
+                hook.remove()
+
+        # Introspection ablation
+        run_ablation_condition(intro_dir, final_layer_results[layer_idx]["introspection_ablated"])
+
+        # Control ablations
+        for i_c, ctrl_dir in enumerate(control_dirs):
+            run_ablation_condition(ctrl_dir, final_layer_results[layer_idx]["controls_ablated"], key=f"control_{i_c}")
+
+    return {
+        "layers": layers,
+        "num_questions": len(questions),
+        "num_controls": num_controls,
+        "layer_results": final_layer_results
+    }
+
+
 def run_ablation_experiment(
     model,
     tokenizer,
@@ -1308,13 +1751,8 @@ def run_ablation_experiment(
     baseline_results: Optional[List[Dict]] = None,
     cached_directions: Optional[Dict] = None
 ) -> Dict:
-    print(f"\nRunning ablation experiment (KV Cache - Memory Safe)...")
-    
-    if INTERVENTION_POSITION != "last":
-        print("Warning: INTERVENTION_POSITION != 'last'. KV Cache optimization disabled.")
-        return {} 
+    """Run ablation experiment with KV cache optimization (Robust Fix)."""
 
-    # 1. Setup
     metric_mean = direct_metric_values.mean()
     metric_std = direct_metric_values.std()
 
@@ -1338,18 +1776,32 @@ def run_ablation_experiment(
         option_token_ids = _CACHED_TOKEN_IDS["meta_options"]
         options = META_OPTIONS
 
-    transformer, lm_head = _get_transformer_and_lm_head(model)
-    W_opt = _prepare_option_weight(lm_head, model, option_token_ids)
+    if cached_directions is None:
+        cached_directions = precompute_direction_tensors(
+            directions, layers, num_controls, DEVICE,
+            torch.float16 if DEVICE == "cuda" else torch.float32
+        )
 
-    # 2. Compute Baseline (Standard forward pass is fine, or use KV)
+    if INTERVENTION_POSITION != "last":
+        print(f"\nRunning ablation experiment (full forward fallback)...")
+        return _run_ablation_full_forward(
+            model, tokenizer, questions, direct_metric_values,
+            layers, num_controls, cached_directions,
+            option_token_ids, options, mappings, cached_inputs, baseline_results
+        )
+
+    print(f"\nRunning ablation experiment (KV Cache)...")
+
+    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
+    
+    # Compute baseline if not provided
     if baseline_results is None:
         print("Computing baseline...")
-        gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
         baseline_results = [None] * len(questions)
         for batch_indices, batch_inputs in gpu_batches:
-            # We can use KV cache logic here too for consistency, but standard forward is fine for baseline
             with torch.inference_mode():
-                logits = _compute_batch_option_logits(model, transformer, W_opt, option_token_ids, batch_inputs)
+                out = model(**batch_inputs)
+                logits = out.logits[:, -1, :][:, option_token_ids]
                 probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
             for i, q_idx in enumerate(batch_indices):
                 p = probs[i]
@@ -1358,7 +1810,7 @@ def run_ablation_experiment(
                 m_val = direct_metric_values[q_idx]
                 align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
                 baseline_results[q_idx] = {
-                    "question_idx": q_idx, "response": resp, "confidence": conf, 
+                    "question_idx": q_idx, "response": resp, "confidence": conf,
                     "metric": float(m_val), "alignment": float(align)
                 }
 
@@ -1370,58 +1822,60 @@ def run_ablation_experiment(
             "controls_ablated": {f"control_{i}": [None] * len(questions) for i in range(num_controls)}
         }
 
-    # 3. Main Loop
-    if cached_directions is None:
-        cached_directions = precompute_direction_tensors(
-            directions, layers, num_controls, DEVICE, 
-            torch.float16 if DEVICE == "cuda" else torch.float32
-        )
-
-    # Use standard batch size (e.g., 8). No expansion needed.
-    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
     print(f"Processing {len(gpu_batches)} batches (KV-Cached)...")
-    
+
     for batch_indices, batch_inputs in tqdm(gpu_batches, desc="Batches"):
         B = len(batch_indices)
+
+        # 1. Compute KV Cache (Snapshot)
+        base_step_data = get_kv_cache(model, batch_inputs)
+        keys_snapshot, values_snapshot = base_step_data["past_key_values_data"]
         
-        # A. Compute KV Cache for this specific batch of questions
-        # This runs the heavy prefix (~200+ tokens) ONCE per batch.
-        base_step_inputs = get_kv_cache(model, batch_inputs)
-        
-        # B. Iterate Layers
+        inputs_template = {
+            "input_ids": base_step_data["input_ids"],
+            "attention_mask": base_step_data["attention_mask"],
+            "use_cache": True
+        }
+        if "position_ids" in base_step_data:
+            inputs_template["position_ids"] = base_step_data["position_ids"]
+
+        # Iterate Layers
         for layer_idx in layers:
             if hasattr(model, 'get_base_model'):
                 layer_module = model.get_base_model().model.layers[layer_idx]
             else:
                 layer_module = model.model.layers[layer_idx]
 
-            intro_dir = cached_directions[layer_idx]["introspection"] # (H,)
-            control_dirs = cached_directions[layer_idx]["controls"]   # List[(H,)]
+            intro_dir = cached_directions[layer_idx]["introspection"]
+            control_dirs = cached_directions[layer_idx]["controls"]
 
-            # Setup Hook
             hook = BatchAblationHook()
             hook.register(layer_module)
-            
-            # --- Helper to run one direction ---
+
             def run_single_ablation(direction_vector, result_storage, key=None):
-                # direction_vector is (H,). We need (Batch, H)
+                # 1. Reconstruct Cache
+                pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
+                
+                current_inputs = inputs_template.copy()
+                current_inputs["past_key_values"] = pass_cache
+                
+                # 2. Set Direction
                 dirs_batch = direction_vector.unsqueeze(0).expand(B, -1)
-                
                 hook.set_directions(dirs_batch)
-                
+
+                # 3. Run
                 with torch.inference_mode():
-                    # This runs ONLY the last token (Length=1). Very fast.
-                    out = model(**base_step_inputs)
+                    out = model(**current_inputs)
                     logits = out.logits[:, -1, :][:, option_token_ids]
                     probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-                
+
                 for i, q_idx in enumerate(batch_indices):
                     p = probs[i]
                     resp = options[np.argmax(p)]
                     conf = local_response_to_confidence(resp, p, mappings[q_idx])
                     m_val = direct_metric_values[q_idx]
                     align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
-                    
+
                     data = {
                         "question_idx": q_idx, "response": resp, "confidence": conf,
                         "metric": float(m_val), "alignment": float(align)
@@ -1430,18 +1884,14 @@ def run_ablation_experiment(
                     else: result_storage[q_idx] = data
 
             try:
-                # 1. Run Introspection
                 run_single_ablation(intro_dir, final_layer_results[layer_idx]["introspection_ablated"])
-                
-                # 2. Run Controls (Sequentially reuse the same KV cache)
                 for i_c, ctrl_dir in enumerate(control_dirs):
-                    run_single_ablation(
-                        ctrl_dir, 
-                        final_layer_results[layer_idx]["controls_ablated"], 
-                        key=f"control_{i_c}"
-                    )
+                    run_single_ablation(ctrl_dir, final_layer_results[layer_idx]["controls_ablated"], key=f"control_{i_c}")
             finally:
                 hook.remove()
+
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
 
     return {
         "layers": layers,
@@ -1449,7 +1899,7 @@ def run_ablation_experiment(
         "num_controls": num_controls,
         "layer_results": final_layer_results
     }
-
+    
 def compute_correlation(confidences: np.ndarray, metric_values: np.ndarray) -> float:
     """Compute Pearson correlation between confidence and uncertainty metric."""
     # We expect negative correlation for entropy-like metrics: high metric = low confidence
@@ -1661,12 +2111,20 @@ def get_expected_slope_sign(metric: str) -> int:
 
 
 def analyze_results(results: Dict, metric: str = None) -> Dict:
-    """Compute summary statistics.
+    """Compute summary statistics with statistical significance testing.
 
     Args:
         results: Raw steering results
         metric: The uncertainty metric used (for sign interpretation). If None,
                 sign interpretation is skipped.
+
+    Statistical approach (mirrors ablation analysis):
+    1. Compute confidence slope for introspection direction
+    2. Compute confidence slope for each control direction (not just average)
+    3. Pool all control slopes across layers for null distribution
+    4. Per-layer p-value: fraction of control slopes with |slope| >= |introspection slope|
+    5. FDR correction for multiple testing
+    6. Bootstrap CIs for control slope distribution
     """
     analysis = {
         "layers": results["layers"],
@@ -1675,32 +2133,65 @@ def analyze_results(results: Dict, metric: str = None) -> Dict:
         "effects": {},
     }
 
+    multipliers = results["multipliers"]
+
+    # First pass: collect all slopes for pooled null distribution
+    all_control_slopes = []  # Pooled across all layers
+    layer_data = {}  # Store for second pass
+
     for layer_idx in results["layers"]:
         lr = results["layer_results"][layer_idx]
-        multipliers = results["multipliers"]
 
         baseline_align = np.mean([r["alignment"] for r in lr["baseline"]])
         baseline_conf = np.mean([r["confidence"] for r in lr["baseline"]])
 
-        effects = {"introspection": {}, "control_avg": {}}
-
+        # Introspection: confidence change per multiplier
+        intro_conf_changes = []
+        intro_align_changes = []
         for mult in multipliers:
-            # Introspection
-            intro_align = np.mean([r["alignment"] for r in lr["introspection"][mult]])
             intro_conf = np.mean([r["confidence"] for r in lr["introspection"][mult]])
+            intro_align = np.mean([r["alignment"] for r in lr["introspection"][mult]])
+            intro_conf_changes.append(intro_conf - baseline_conf)
+            intro_align_changes.append(intro_align - baseline_align)
+
+        intro_conf_slope = np.polyfit(multipliers, intro_conf_changes, 1)[0]
+        intro_align_slope = np.polyfit(multipliers, intro_align_changes, 1)[0]
+
+        # Per-control slopes (not just average)
+        control_slopes = []
+        control_align_slopes = []
+        for ctrl_key in lr["controls"]:
+            ctrl_conf_changes = []
+            ctrl_align_changes = []
+            for mult in multipliers:
+                ctrl_conf = np.mean([r["confidence"] for r in lr["controls"][ctrl_key][mult]])
+                ctrl_align = np.mean([r["alignment"] for r in lr["controls"][ctrl_key][mult]])
+                ctrl_conf_changes.append(ctrl_conf - baseline_conf)
+                ctrl_align_changes.append(ctrl_align - baseline_align)
+            ctrl_slope = np.polyfit(multipliers, ctrl_conf_changes, 1)[0]
+            ctrl_align_slope = np.polyfit(multipliers, ctrl_align_changes, 1)[0]
+            control_slopes.append(ctrl_slope)
+            control_align_slopes.append(ctrl_align_slope)
+
+        # Add to pooled null
+        all_control_slopes.extend(control_slopes)
+
+        # Build by_multiplier dict for backward compatibility
+        effects = {"introspection": {}, "control_avg": {}}
+        for mult in multipliers:
+            intro_conf = np.mean([r["confidence"] for r in lr["introspection"][mult]])
+            intro_align = np.mean([r["alignment"] for r in lr["introspection"][mult]])
             effects["introspection"][mult] = {
                 "alignment": float(intro_align),
                 "alignment_change": float(intro_align - baseline_align),
                 "confidence": float(intro_conf),
                 "confidence_change": float(intro_conf - baseline_conf),
             }
-
-            # Control average
-            ctrl_aligns = []
             ctrl_confs = []
+            ctrl_aligns = []
             for ctrl_key in lr["controls"]:
-                ctrl_aligns.extend([r["alignment"] for r in lr["controls"][ctrl_key][mult]])
                 ctrl_confs.extend([r["confidence"] for r in lr["controls"][ctrl_key][mult]])
+                ctrl_aligns.extend([r["alignment"] for r in lr["controls"][ctrl_key][mult]])
             effects["control_avg"][mult] = {
                 "alignment": float(np.mean(ctrl_aligns)),
                 "alignment_change": float(np.mean(ctrl_aligns) - baseline_align),
@@ -1708,26 +2199,111 @@ def analyze_results(results: Dict, metric: str = None) -> Dict:
                 "confidence_change": float(np.mean(ctrl_confs) - baseline_conf),
             }
 
-        # Compute slopes - use confidence_change as primary metric
-        # (steering should shift confidence systematically, not alignment which conflates two effects)
-        intro_conf_slope = np.polyfit(multipliers, [effects["introspection"][m]["confidence_change"] for m in multipliers], 1)[0]
-        ctrl_conf_slope = np.polyfit(multipliers, [effects["control_avg"][m]["confidence_change"] for m in multipliers], 1)[0]
+        layer_data[layer_idx] = {
+            "intro_conf_slope": intro_conf_slope,
+            "intro_align_slope": intro_align_slope,
+            "control_slopes": control_slopes,
+            "control_align_slopes": control_align_slopes,
+            "baseline_align": baseline_align,
+            "baseline_conf": baseline_conf,
+            "effects": effects,
+        }
 
-        # Keep alignment slopes for reference
-        intro_align_slope = np.polyfit(multipliers, [effects["introspection"][m]["alignment_change"] for m in multipliers], 1)[0]
-        ctrl_align_slope = np.polyfit(multipliers, [effects["control_avg"][m]["alignment_change"] for m in multipliers], 1)[0]
+    # Convert pooled null to array
+    pooled_null = np.array(all_control_slopes)
+    pooled_null_abs = np.abs(pooled_null)
+
+    # Second pass: compute p-values and statistics
+    raw_p_values = []
+
+    for layer_idx in results["layers"]:
+        ld = layer_data[layer_idx]
+
+        intro_slope = ld["intro_conf_slope"]
+        intro_slope_abs = abs(intro_slope)
+        control_slopes = np.array(ld["control_slopes"])
+
+        # Average control slope (for backward compatibility)
+        avg_ctrl_slope = float(np.mean(control_slopes))
+        std_ctrl_slope = float(np.std(control_slopes))
+
+        # Per-layer p-value: two-tailed test (|introspection| vs |controls|)
+        n_controls_larger_local = np.sum(np.abs(control_slopes) >= intro_slope_abs)
+        p_value_local = (n_controls_larger_local + 1) / (len(control_slopes) + 1)
+
+        # Pooled p-value: compare to all control slopes across all layers
+        n_pooled_larger = np.sum(pooled_null_abs >= intro_slope_abs)
+        p_value_pooled = (n_pooled_larger + 1) / (len(pooled_null) + 1)
+
+        # Bootstrap 95% CI for control slope magnitude
+        n_bootstrap = 1000
+        bootstrap_means = []
+        for _ in range(n_bootstrap):
+            boot_sample = np.random.choice(control_slopes, size=len(control_slopes), replace=True)
+            bootstrap_means.append(np.mean(np.abs(boot_sample)))
+        ci_low = np.percentile(bootstrap_means, 2.5)
+        ci_high = np.percentile(bootstrap_means, 97.5)
+
+        # Effect size: how many SDs away from control mean?
+        if std_ctrl_slope > 0:
+            effect_size_z = (intro_slope_abs - np.mean(np.abs(control_slopes))) / np.std(np.abs(control_slopes))
+        else:
+            effect_size_z = 0.0
+
+        raw_p_values.append((layer_idx, p_value_pooled))
 
         analysis["effects"][layer_idx] = {
-            "by_multiplier": effects,
+            "by_multiplier": ld["effects"],
             "slopes": {
-                "introspection": float(intro_conf_slope),
-                "control_avg": float(ctrl_conf_slope),
-                "introspection_alignment": float(intro_align_slope),
-                "control_avg_alignment": float(ctrl_align_slope),
+                "introspection": float(intro_slope),
+                "control_avg": avg_ctrl_slope,
+                "control_std": std_ctrl_slope,
+                "introspection_alignment": float(ld["intro_align_slope"]),
+                "control_avg_alignment": float(np.mean(ld["control_align_slopes"])),
             },
-            "baseline_alignment": float(baseline_align),
-            "baseline_confidence": float(baseline_conf),
+            "statistics": {
+                "p_value_local": float(p_value_local),
+                "p_value_pooled": float(p_value_pooled),
+                "effect_size_z": float(effect_size_z),
+                "control_slope_ci95": [float(ci_low), float(ci_high)],
+                "n_controls": len(control_slopes),
+            },
+            "baseline_alignment": float(ld["baseline_align"]),
+            "baseline_confidence": float(ld["baseline_conf"]),
         }
+
+    # FDR correction (Benjamini-Hochberg)
+    sorted_pvals = sorted(raw_p_values, key=lambda x: x[1])
+    n_tests = len(sorted_pvals)
+    fdr_adjusted = {}
+
+    for rank, (layer_idx, p_val) in enumerate(sorted_pvals, 1):
+        adjusted = min(1.0, p_val * n_tests / rank)
+        fdr_adjusted[layer_idx] = adjusted
+
+    # Make monotonic
+    prev_adjusted = 0.0
+    for layer_idx, _ in sorted(sorted_pvals, key=lambda x: x[1]):
+        fdr_adjusted[layer_idx] = max(fdr_adjusted[layer_idx], prev_adjusted)
+        prev_adjusted = fdr_adjusted[layer_idx]
+
+    # Add FDR-adjusted p-values
+    for layer_idx in results["layers"]:
+        analysis["effects"][layer_idx]["statistics"]["p_value_fdr"] = fdr_adjusted[layer_idx]
+
+    # Summary statistics
+    significant_layers_pooled = [l for l in results["layers"]
+                                  if analysis["effects"][l]["statistics"]["p_value_pooled"] < 0.05]
+    significant_layers_fdr = [l for l in results["layers"]
+                              if analysis["effects"][l]["statistics"]["p_value_fdr"] < 0.05]
+
+    analysis["summary"] = {
+        "pooled_null_size": len(pooled_null),
+        "significant_layers_pooled_p05": significant_layers_pooled,
+        "significant_layers_fdr_p05": significant_layers_fdr,
+        "n_significant_pooled": len(significant_layers_pooled),
+        "n_significant_fdr": len(significant_layers_fdr),
+    }
 
     # Add sign interpretation metadata
     if metric:
@@ -1758,7 +2334,7 @@ def analyze_results(results: Dict, metric: str = None) -> Dict:
 
 
 def plot_results(analysis: Dict, output_prefix: str):
-    """Create visualizations."""
+    """Create visualizations with statistical significance."""
     layers = analysis["layers"]
     multipliers = analysis["multipliers"]
 
@@ -1766,23 +2342,56 @@ def plot_results(analysis: Dict, output_prefix: str):
         print("  Skipping plot - no layers to visualize")
         return
 
+    # Check if we have statistics (new format)
+    has_stats = "statistics" in analysis["effects"].get(layers[0], {})
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    # Plot 1: Confidence slopes by layer
+    # Plot 1: Confidence slopes by layer with error bars and significance
     ax1 = axes[0]
     intro_slopes = [analysis["effects"][l]["slopes"]["introspection"] for l in layers]
     ctrl_slopes = [analysis["effects"][l]["slopes"]["control_avg"] for l in layers]
 
     x = np.arange(len(layers))
     width = 0.35
-    ax1.bar(x - width/2, intro_slopes, width, label='Introspection', color='green', alpha=0.7)
-    ax1.bar(x + width/2, ctrl_slopes, width, label='Control (avg)', color='gray', alpha=0.7)
+
+    if has_stats:
+        ctrl_stds = [analysis["effects"][l]["slopes"]["control_std"] for l in layers]
+        # Color bars by significance
+        intro_colors = []
+        for l in layers:
+            p_fdr = analysis["effects"][l]["statistics"]["p_value_fdr"]
+            if p_fdr < 0.01:
+                intro_colors.append('darkgreen')
+            elif p_fdr < 0.05:
+                intro_colors.append('green')
+            else:
+                intro_colors.append('lightgreen')
+
+        ax1.bar(x - width/2, intro_slopes, width, label='Introspection', color=intro_colors, alpha=0.8)
+        ax1.bar(x + width/2, ctrl_slopes, width, yerr=ctrl_stds, label='Control (avg±SD)',
+                color='gray', alpha=0.7, capsize=3)
+
+        # Add significance markers
+        for i, l in enumerate(layers):
+            p_fdr = analysis["effects"][l]["statistics"]["p_value_fdr"]
+            y_pos = max(abs(intro_slopes[i]), abs(ctrl_slopes[i]) + ctrl_stds[i]) * 1.1
+            if intro_slopes[i] < 0:
+                y_pos = -y_pos
+            if p_fdr < 0.01:
+                ax1.text(x[i] - width/2, y_pos, '**', ha='center', va='bottom' if y_pos > 0 else 'top', fontsize=12, fontweight='bold')
+            elif p_fdr < 0.05:
+                ax1.text(x[i] - width/2, y_pos, '*', ha='center', va='bottom' if y_pos > 0 else 'top', fontsize=12, fontweight='bold')
+    else:
+        ax1.bar(x - width/2, intro_slopes, width, label='Introspection', color='green', alpha=0.7)
+        ax1.bar(x + width/2, ctrl_slopes, width, label='Control (avg)', color='gray', alpha=0.7)
+
     ax1.axhline(y=0, color='black', linestyle='--', alpha=0.3)
     ax1.set_xticks(x)
     ax1.set_xticklabels(layers)
     ax1.set_xlabel("Layer")
     ax1.set_ylabel("Confidence Slope (Δconf / Δmult)")
-    ax1.set_title("Steering Effect on Confidence")
+    ax1.set_title("Steering Effect on Confidence" + (" (* p<.05, ** p<.01 FDR)" if has_stats else ""))
     ax1.legend()
 
     # Plot 2: Best layer detail - show confidence change
@@ -1818,15 +2427,32 @@ Best Layer: {best_layer}
   Confidence slope: {intro_slope:.4f}
   Control slope: {ctrl_slope:.4f}
   Difference: {abs(intro_slope) - abs(ctrl_slope):.4f}
+"""
 
+    if has_stats:
+        best_stats = analysis["effects"][best_layer]["statistics"]
+        summary += f"""
+Statistics:
+  p-value (pooled): {best_stats['p_value_pooled']:.4f}
+  p-value (FDR): {best_stats['p_value_fdr']:.4f}
+  Effect size (Z): {best_stats['effect_size_z']:.2f}
+"""
+        # Add overall summary
+        summ = analysis.get("summary", {})
+        if summ:
+            n_sig = summ.get("n_significant_fdr", 0)
+            summary += f"""
+Significant layers: {n_sig}/{len(layers)} (FDR<0.05)
+"""
+
+    summary += """
 Interpretation:
 """
     # Check if introspection direction causes systematic confidence shift
     if abs(intro_slope) > abs(ctrl_slope) + 0.01:
         direction_str = "lower" if intro_slope < 0 else "higher"
-        summary += f"""  ✓ Steering shifts confidence systematically
-  +multiplier → {direction_str} confidence
-  Effect stronger than controls."""
+        summary += f"""  ✓ Steering shifts confidence
+  +mult → {direction_str} confidence"""
 
         # Check sign against expectation
         if metric and metric != "unknown":
@@ -1834,21 +2460,16 @@ Interpretation:
             actual_sign = 1 if intro_slope > 0 else -1
             if actual_sign == expected_sign:
                 summary += f"""
-
   ✓ Sign correct for {metric}"""
             else:
                 summary += f"""
-
-  ⚠ Sign OPPOSITE to expected!"""
+  ⚠ Sign OPPOSITE!"""
     elif abs(intro_slope) > 0.01:
-        summary += """  ⚠ Weak steering effect
-  Some confidence shift but
-  not clearly above controls."""
+        summary += """  ⚠ Weak steering effect"""
     else:
-        summary += """  ✗ No steering effect detected
-  Direction doesn't shift confidence."""
+        summary += """  ✗ No steering effect"""
 
-    ax3.text(0.1, 0.9, summary, transform=ax3.transAxes, fontsize=11,
+    ax3.text(0.05, 0.95, summary, transform=ax3.transAxes, fontsize=10,
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
@@ -1859,7 +2480,7 @@ Interpretation:
 
 
 def print_summary(analysis: Dict):
-    """Print summary of results."""
+    """Print summary of results with statistical significance."""
     print("\n" + "=" * 70)
     print("STEERING EXPERIMENT RESULTS")
     print("=" * 70)
@@ -1875,13 +2496,55 @@ def print_summary(analysis: Dict):
         print(f"\nMetric: {metric}")
         print(f"Expected slope sign: {expected_direction} (+direction → {'less' if expected_sign < 0 else 'more'} confident)")
 
-    print("\n--- Confidence Slopes by Layer ---")
-    print(f"{'Layer':<8} {'Introspection':<15} {'Control':<15}")
-    print("-" * 40)
+    # Check if we have statistics (new format)
+    has_stats = "statistics" in analysis["effects"].get(analysis["layers"][0], {})
 
-    for layer in analysis["layers"]:
-        s = analysis["effects"][layer]["slopes"]
-        print(f"{layer:<8} {s['introspection']:<15.4f} {s['control_avg']:<15.4f}")
+    if has_stats:
+        print("\n--- Confidence Slopes by Layer (with significance) ---")
+        print(f"{'Layer':<8} {'Intro Slope':<12} {'Ctrl (±SD)':<16} {'p(pooled)':<10} {'p(FDR)':<10} {'Z-score':<8} {'Sig':<5}")
+        print("-" * 75)
+
+        for layer in analysis["layers"]:
+            s = analysis["effects"][layer]["slopes"]
+            stats = analysis["effects"][layer]["statistics"]
+            p_pooled = stats["p_value_pooled"]
+            p_fdr = stats["p_value_fdr"]
+            z = stats["effect_size_z"]
+
+            # Significance markers
+            if p_fdr < 0.01:
+                sig = "**"
+            elif p_fdr < 0.05:
+                sig = "*"
+            elif p_pooled < 0.05:
+                sig = "~"  # nominally significant but not FDR-corrected
+            else:
+                sig = ""
+
+            ctrl_str = f"{s['control_avg']:.4f}±{s['control_std']:.4f}"
+            print(f"{layer:<8} {s['introspection']:<12.4f} {ctrl_str:<16} {p_pooled:<10.4f} {p_fdr:<10.4f} {z:<8.2f} {sig:<5}")
+
+        # Print summary
+        summary = analysis.get("summary", {})
+        if summary:
+            print(f"\nPooled null size: {summary.get('pooled_null_size', 'N/A')} control slopes")
+            n_sig_pooled = summary.get("n_significant_pooled", 0)
+            n_sig_fdr = summary.get("n_significant_fdr", 0)
+            print(f"Significant layers (p<0.05 pooled): {n_sig_pooled}/{len(analysis['layers'])}")
+            print(f"Significant layers (FDR<0.05): {n_sig_fdr}/{len(analysis['layers'])}")
+            if summary.get("significant_layers_fdr_p05"):
+                print(f"  FDR-significant: {summary['significant_layers_fdr_p05']}")
+
+        print("\nLegend: ** p_FDR<0.01, * p_FDR<0.05, ~ p_pooled<0.05 (not FDR-corrected)")
+    else:
+        # Old format without statistics
+        print("\n--- Confidence Slopes by Layer ---")
+        print(f"{'Layer':<8} {'Introspection':<15} {'Control':<15}")
+        print("-" * 40)
+
+        for layer in analysis["layers"]:
+            s = analysis["effects"][layer]["slopes"]
+            print(f"{layer:<8} {s['introspection']:<15.4f} {s['control_avg']:<15.4f}")
 
     # Best layer - pick largest magnitude slope
     best_layer = max(analysis["layers"], key=lambda l: abs(analysis["effects"][l]["slopes"]["introspection"]))
@@ -1891,6 +2554,12 @@ def print_summary(analysis: Dict):
     print(f"\nStrongest steering effect: Layer {best_layer}")
     print(f"  Confidence slope: {best_intro:.4f}")
     print(f"  Control slope: {best_ctrl:.4f}")
+
+    if has_stats:
+        best_stats = analysis["effects"][best_layer]["statistics"]
+        print(f"  p-value (pooled): {best_stats['p_value_pooled']:.4f}")
+        print(f"  p-value (FDR): {best_stats['p_value_fdr']:.4f}")
+        print(f"  Effect size (Z): {best_stats['effect_size_z']:.2f}")
 
     if abs(best_intro) > abs(best_ctrl) + 0.01:
         direction = "lower" if best_intro < 0 else "higher"
@@ -2165,6 +2834,125 @@ Interpretation:
     plt.close()
 
 
+def plot_other_confidence_comparison(
+    steering_analysis: Optional[Dict],
+    ablation_analysis: Optional[Dict],
+    output_prefix: str
+):
+    """
+    Plot comparison of self-confidence vs other-confidence effects.
+
+    Creates a figure showing how interventions affect self-reported confidence
+    vs "other-confidence" (human difficulty estimation) - a control task.
+
+    If the intervention is introspection-specific, it should affect self-confidence
+    more than other-confidence.
+    """
+    has_steering = steering_analysis is not None and len(steering_analysis) > 0
+    has_ablation = ablation_analysis is not None and len(ablation_analysis) > 0
+
+    if not has_steering and not has_ablation:
+        print("No other-confidence data to plot")
+        return
+
+    n_plots = (1 if has_steering else 0) + (1 if has_ablation else 0)
+    fig, axes = plt.subplots(1, n_plots, figsize=(7 * n_plots, 5))
+    if n_plots == 1:
+        axes = [axes]
+
+    plot_idx = 0
+
+    # Steering comparison
+    if has_steering:
+        ax = axes[plot_idx]
+        layers = sorted([int(k) for k in steering_analysis.keys()])
+        x = np.arange(len(layers))
+        width = 0.35
+
+        self_effects = [steering_analysis[str(l)]["self_effect_mean"] for l in layers]
+        other_effects = [steering_analysis[str(l)]["other_effect_mean"] for l in layers]
+        ratios = [steering_analysis[str(l)]["self_vs_other_ratio"] for l in layers]
+
+        bars1 = ax.bar(x - width/2, self_effects, width, label='Self-confidence', color='steelblue', alpha=0.8)
+        bars2 = ax.bar(x + width/2, other_effects, width, label='Other-confidence', color='coral', alpha=0.8)
+
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Mean Δ Confidence (steered - baseline)')
+        ax.set_title('Steering: Self vs Other Confidence Effect')
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(l) for l in layers])
+        ax.legend()
+
+        # Add ratio annotations
+        for i, (l, ratio) in enumerate(zip(layers, ratios)):
+            if not np.isinf(ratio):
+                ax.annotate(f'{ratio:.1f}x', xy=(i, max(self_effects[i], other_effects[i])),
+                           ha='center', va='bottom', fontsize=8, color='gray')
+
+        # Add summary text
+        mean_ratio = np.mean([r for r in ratios if not np.isinf(r)])
+        if mean_ratio > 2.0:
+            interpretation = "Introspection-specific"
+        elif mean_ratio > 1.2:
+            interpretation = "Self > Other"
+        elif mean_ratio > 0.8:
+            interpretation = "Similar effect"
+        else:
+            interpretation = "Other > Self (!)"
+        ax.text(0.02, 0.98, f'Mean ratio: {mean_ratio:.2f}x\n{interpretation}',
+               transform=ax.transAxes, fontsize=9, verticalalignment='top',
+               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        plot_idx += 1
+
+    # Ablation comparison
+    if has_ablation:
+        ax = axes[plot_idx]
+        layers = sorted([int(k) for k in ablation_analysis.keys()])
+        x = np.arange(len(layers))
+        width = 0.35
+
+        self_effects = [ablation_analysis[str(l)]["self_effect_mean_abs"] for l in layers]
+        other_effects = [ablation_analysis[str(l)]["other_effect_mean_abs"] for l in layers]
+        ratios = [ablation_analysis[str(l)]["self_vs_other_ratio"] for l in layers]
+
+        bars1 = ax.bar(x - width/2, self_effects, width, label='Self-confidence', color='steelblue', alpha=0.8)
+        bars2 = ax.bar(x + width/2, other_effects, width, label='Other-confidence', color='coral', alpha=0.8)
+
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Mean |Δ Confidence| (ablated vs baseline)')
+        ax.set_title('Ablation: Self vs Other Confidence Effect')
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(l) for l in layers])
+        ax.legend()
+
+        # Add ratio annotations
+        for i, (l, ratio) in enumerate(zip(layers, ratios)):
+            if not np.isinf(ratio):
+                ax.annotate(f'{ratio:.1f}x', xy=(i, max(self_effects[i], other_effects[i])),
+                           ha='center', va='bottom', fontsize=8, color='gray')
+
+        # Add summary text
+        mean_ratio = np.mean([r for r in ratios if not np.isinf(r)])
+        if mean_ratio > 2.0:
+            interpretation = "Introspection-specific"
+        elif mean_ratio > 1.2:
+            interpretation = "Self > Other"
+        elif mean_ratio > 0.8:
+            interpretation = "Similar effect"
+        else:
+            interpretation = "Other > Self (!)"
+        ax.text(0.02, 0.98, f'Mean ratio: {mean_ratio:.2f}x\n{interpretation}',
+               transform=ax.transAxes, fontsize=9, verticalalignment='top',
+               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+    plt.savefig(f"{output_prefix}_other_confidence_comparison.png", dpi=300, bbox_inches='tight')
+    print(f"Saved {output_prefix}_other_confidence_comparison.png")
+    plt.close()
+
+
 def print_ablation_summary(analysis: Dict):
     """Print summary of ablation results with improved statistics."""
     print("\n" + "=" * 70)
@@ -2433,10 +3221,15 @@ def main():
 
     # Compute number of control directions (dynamic or fixed)
     if NUM_CONTROL_DIRECTIONS is None:
-        # Dynamic: scale to target ~100 pooled samples across all layers
-        num_controls = max(MIN_CONTROLS_PER_LAYER, TARGET_POOLED_SAMPLES // len(layers))
+        # Dynamic: ensure enough power for FDR correction
+        # For FDR at α with N layers, need pooled_samples > N/α = 20*N (for α=0.05)
+        # We use FDR_SAFETY_FACTOR * N for margin, so controls_per_layer = FDR_SAFETY_FACTOR
+        num_controls = max(MIN_CONTROLS_PER_LAYER, FDR_SAFETY_FACTOR)
+        target_pooled = num_controls * len(layers)
+        min_p_achievable = 1.0 / (target_pooled + 1)
+        fdr_threshold = FDR_ALPHA / len(layers)  # Approx threshold for best layer
         print(f"Dynamic control directions: {num_controls} per layer "
-              f"(target {TARGET_POOLED_SAMPLES} pooled, {len(layers)} layers)")
+              f"({target_pooled} pooled samples, min_p={min_p_achievable:.4f}, FDR_thresh≈{fdr_threshold:.4f})")
     else:
         num_controls = NUM_CONTROL_DIRECTIONS
         print(f"Fixed control directions: {num_controls} per layer")
@@ -2509,6 +3302,9 @@ def main():
     # without knowing a question's actual uncertainty. Ablation still makes sense: removing
     # "awareness of calibration" should degrade the metric-confidence correlation.
     baseline_from_steering = None
+    other_confidence_steering_analysis = None  # Track for plotting
+    other_confidence_ablation_analysis = None  # Track for plotting
+
     if run_steering:
         if DIRECTION_TYPE == "introspection":
             print("\n" + "=" * 70)
@@ -2572,52 +3368,69 @@ def main():
                 )
 
                 # Analyze: compare self vs other effects for each layer
-                other_confidence_analysis = {}
+                other_confidence_steering_analysis = {}
                 for layer_idx in layers:
                     # Get self-confidence baseline and steered results for this layer
+                    # Structure: layer_results[layer_idx]["baseline"] and layer_results[layer_idx]["introspection"][multiplier]
                     layer_results = results["layer_results"].get(layer_idx, {})
                     self_baseline = layer_results.get("baseline", [])
-                    self_steered = layer_results.get("steered", {}).get(max_mult, [])
+                    self_steered = layer_results.get("introspection", {}).get(max_mult, [])
 
-                    if self_baseline and self_steered:
+                    if self_baseline and self_steered and None not in self_baseline and None not in self_steered:
                         effect = analyze_other_confidence_effect(
                             other_baseline, other_steered,
                             self_baseline, self_steered, layer_idx
                         )
                         if effect is not None:
-                            other_confidence_analysis[str(layer_idx)] = effect
+                            other_confidence_steering_analysis[str(layer_idx)] = effect
 
                 # Store in results
                 results["other_confidence"] = {
                     "baseline": other_baseline,
                     "steered": other_steered,
                     "steering_multiplier": max_mult,
-                    "analysis": other_confidence_analysis,
+                    "analysis": other_confidence_steering_analysis,
                 }
 
-                # Print other-confidence summary
-                print("\n--- Other-Confidence Control Results ---")
+                # Print other-confidence summary with statistics
+                print("\n--- Other-Confidence Control Results (Steering) ---")
                 print(f"Comparing steering effect (multiplier={max_mult}) on self vs other confidence:")
-                for layer_str, effect in other_confidence_analysis.items():
+                print(f"{'Layer':<8} {'Self':<10} {'Other':<10} {'Ratio':<8} {'Diff':<10} {'95% CI':<16} {'p(perm)':<10} {'Sig':<5}")
+                print("-" * 85)
+                for layer_str, effect in other_confidence_steering_analysis.items():
                     self_eff = effect["self_effect_mean"]
                     other_eff = effect["other_effect_mean"]
                     ratio = effect["self_vs_other_ratio"]
-                    print(f"  Layer {layer_str}: self={self_eff:+.3f}, other={other_eff:+.3f}, ratio={ratio:.2f}x")
+                    ratio_str = f"{ratio:.2f}x" if not np.isnan(ratio) else "N/A"
+                    diff = effect.get("diff_abs_effect", 0)
+                    ci = effect.get("diff_abs_effect_ci95", [0, 0])
+                    p_perm = effect.get("p_value_permutation", float('nan'))
+                    sig = "*" if p_perm < 0.05 else ""
+                    ci_str = f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
+                    print(f"  {layer_str:<6} {self_eff:+.4f}   {other_eff:+.4f}   {ratio_str:<8} {diff:+.4f}   {ci_str:<16} {p_perm:.4f}    {sig}")
 
                 # Overall assessment
-                if other_confidence_analysis:
-                    mean_ratio = np.mean([e["self_vs_other_ratio"] for e in other_confidence_analysis.values() if not np.isinf(e["self_vs_other_ratio"])])
-                    mean_self = np.mean([e["self_effect_mean"] for e in other_confidence_analysis.values()])
-                    mean_other = np.mean([e["other_effect_mean"] for e in other_confidence_analysis.values()])
-                    print(f"\n  Mean across layers: self={mean_self:+.3f}, other={mean_other:+.3f}, ratio={mean_ratio:.2f}x")
-                    if mean_ratio > 2.0:
-                        print("  → Steering primarily affects SELF-confidence (introspection-specific)")
-                    elif mean_ratio > 1.2:
-                        print("  → Steering affects self-confidence more than other-confidence")
-                    elif mean_ratio > 0.8:
-                        print("  → Steering affects self and other confidence similarly (general effect)")
+                if other_confidence_steering_analysis:
+                    # Filter out inf and nan ratios
+                    valid_ratios = [e["self_vs_other_ratio"] for e in other_confidence_steering_analysis.values()
+                                   if not np.isinf(e["self_vs_other_ratio"]) and not np.isnan(e["self_vs_other_ratio"])]
+                    mean_ratio = np.mean(valid_ratios) if valid_ratios else float('nan')
+                    mean_self = np.mean([e["self_effect_mean"] for e in other_confidence_steering_analysis.values()])
+                    mean_other = np.mean([e["other_effect_mean"] for e in other_confidence_steering_analysis.values()])
+
+                    if np.isnan(mean_ratio):
+                        print(f"\n  Mean across layers: self={mean_self:+.3f}, other={mean_other:+.3f}, ratio=N/A")
+                        print("  → No measurable effect on either self or other confidence")
                     else:
-                        print("  → Steering affects other-confidence more than self (unexpected)")
+                        print(f"\n  Mean across layers: self={mean_self:+.3f}, other={mean_other:+.3f}, ratio={mean_ratio:.2f}x")
+                        if mean_ratio > 2.0:
+                            print("  → Steering primarily affects SELF-confidence (introspection-specific)")
+                        elif mean_ratio > 1.2:
+                            print("  → Steering affects self-confidence more than other-confidence")
+                        elif mean_ratio > 0.8:
+                            print("  → Steering affects self and other confidence similarly (general effect)")
+                        else:
+                            print("  → Steering affects other-confidence more than self (unexpected)")
 
     # ==========================================================================
     # ABLATION EXPERIMENT
@@ -2683,11 +3496,12 @@ def main():
             other_confidence_ablation_analysis = {}
             for layer_idx in layers:
                 # Get self-confidence baseline and ablated results for this layer
-                layer_results = ablation_results["layer_results"].get(str(layer_idx), {})
+                # Structure: layer_results[layer_idx]["baseline"] and layer_results[layer_idx]["introspection_ablated"]
+                layer_results = ablation_results["layer_results"].get(layer_idx, {})
                 self_baseline = layer_results.get("baseline", [])
                 self_ablated = layer_results.get("introspection_ablated", [])
 
-                if self_baseline and self_ablated:
+                if self_baseline and self_ablated and None not in self_baseline and None not in self_ablated:
                     effect = analyze_other_confidence_ablation_effect(
                         other_baseline_abl, other_ablated,
                         self_baseline, self_ablated, layer_idx
@@ -2707,29 +3521,58 @@ def main():
                 json.dump(ablation_results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
             print(f"\nRe-saved {ablation_results_path} with other-confidence data")
 
-            # Print other-confidence ablation summary
+            # Print other-confidence ablation summary with statistics
             print("\n--- Other-Confidence Control Results (Ablation) ---")
             print("Comparing ablation effect on self vs other confidence:")
+            print(f"{'Layer':<8} {'|Δself|':<10} {'|Δother|':<10} {'Ratio':<8} {'Diff':<10} {'95% CI':<16} {'p(perm)':<10} {'Sig':<5}")
+            print("-" * 85)
             for layer_str, effect in other_confidence_ablation_analysis.items():
                 self_eff = effect["self_effect_mean_abs"]
                 other_eff = effect["other_effect_mean_abs"]
                 ratio = effect["self_vs_other_ratio"]
-                print(f"  Layer {layer_str}: |Δself|={self_eff:.3f}, |Δother|={other_eff:.3f}, ratio={ratio:.2f}x")
+                ratio_str = f"{ratio:.2f}x" if not np.isnan(ratio) else "N/A"
+                diff = effect.get("diff_abs_effect", 0)
+                ci = effect.get("diff_abs_effect_ci95", [0, 0])
+                p_perm = effect.get("p_value_permutation", float('nan'))
+                sig = "*" if p_perm < 0.05 else ""
+                ci_str = f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
+                print(f"  {layer_str:<6} {self_eff:.4f}    {other_eff:.4f}    {ratio_str:<8} {diff:+.4f}   {ci_str:<16} {p_perm:.4f}    {sig}")
 
             # Overall assessment
             if other_confidence_ablation_analysis:
-                mean_ratio = np.mean([e["self_vs_other_ratio"] for e in other_confidence_ablation_analysis.values() if not np.isinf(e["self_vs_other_ratio"])])
+                # Filter out inf and nan ratios
+                valid_ratios = [e["self_vs_other_ratio"] for e in other_confidence_ablation_analysis.values()
+                               if not np.isinf(e["self_vs_other_ratio"]) and not np.isnan(e["self_vs_other_ratio"])]
+                mean_ratio = np.mean(valid_ratios) if valid_ratios else float('nan')
                 mean_self = np.mean([e["self_effect_mean_abs"] for e in other_confidence_ablation_analysis.values()])
                 mean_other = np.mean([e["other_effect_mean_abs"] for e in other_confidence_ablation_analysis.values()])
-                print(f"\n  Mean across layers: |Δself|={mean_self:.3f}, |Δother|={mean_other:.3f}, ratio={mean_ratio:.2f}x")
-                if mean_ratio > 2.0:
-                    print("  → Ablation primarily affects SELF-confidence (introspection-specific)")
-                elif mean_ratio > 1.2:
-                    print("  → Ablation affects self-confidence more than other-confidence")
-                elif mean_ratio > 0.8:
-                    print("  → Ablation affects self and other confidence similarly (general effect)")
+
+                if np.isnan(mean_ratio):
+                    print(f"\n  Mean across layers: |Δself|={mean_self:.3f}, |Δother|={mean_other:.3f}, ratio=N/A")
+                    print("  → No measurable effect on either self or other confidence")
                 else:
-                    print("  → Ablation affects other-confidence more than self (unexpected)")
+                    print(f"\n  Mean across layers: |Δself|={mean_self:.3f}, |Δother|={mean_other:.3f}, ratio={mean_ratio:.2f}x")
+                    if mean_ratio > 2.0:
+                        print("  → Ablation primarily affects SELF-confidence (introspection-specific)")
+                    elif mean_ratio > 1.2:
+                        print("  → Ablation affects self-confidence more than other-confidence")
+                    elif mean_ratio > 0.8:
+                        print("  → Ablation affects self and other confidence similarly (general effect)")
+                    else:
+                        print("  → Ablation affects other-confidence more than self (unexpected)")
+
+    # ==================================================================
+    # PLOT OTHER-CONFIDENCE COMPARISON (if any data available)
+    # ==================================================================
+    if other_confidence_steering_analysis or other_confidence_ablation_analysis:
+        print("\n" + "-" * 50)
+        print("PLOTTING OTHER-CONFIDENCE COMPARISON")
+        print("-" * 50)
+        plot_other_confidence_comparison(
+            other_confidence_steering_analysis,
+            other_confidence_ablation_analysis,
+            f"{output_prefix}{direction_suffix}"
+        )
 
     print("\n" + "=" * 70)
     print("EXPERIMENTS COMPLETE")

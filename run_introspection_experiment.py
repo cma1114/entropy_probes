@@ -55,7 +55,6 @@ from tasks import (
     get_stated_confidence_signal,
     # Other-confidence task (control: estimate human difficulty)
     OTHER_CONFIDENCE_SETUP,
-    OTHER_CONFIDENCE_OPTIONS,
     OTHER_CONFIDENCE_QUESTION,
     format_other_confidence_prompt,
     get_other_confidence_signal,
@@ -73,8 +72,8 @@ load_dotenv()
 
 # Configuration
 BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path for fine-tuned model
-DATASET_NAME = "SimpleMC"
+MODEL_NAME = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###BASE_MODEL_NAME  # 
+DATASET_NAME = "TriviaMC"
 NUM_QUESTIONS = 447 if DATASET_NAME.startswith("GP") else 500
 # DEVICE imported from core.model_utils
 SEED = 42
@@ -107,7 +106,7 @@ PRETRAINED_PROBE_PATH = "mc_probe_trained.pkl"  # If saved from run_mc_experimen
 #   logit_gap - z(top) - z(second) - logit gap between top two
 #   top_logit - z(top) - mean(z) - centered top logit
 AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
-METRIC = "logit_gap"  # Which metric to probe (set via --metric flag)
+METRIC = "entropy"  # Which metric to probe (set via --metric flag)
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -292,6 +291,52 @@ def compute_uncertainty_metrics(probs: np.ndarray, logits: np.ndarray = None) ->
 
 
 # ============================================================================
+# KV CACHE UTILITIES FOR PREFIX SHARING
+# ============================================================================
+
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:
+    DynamicCache = None
+
+
+def extract_cache_tensors(past_key_values):
+    """Extract immutable tensors from cache object."""
+    keys, values = [], []
+    try:
+        num_layers = len(past_key_values)
+    except TypeError:
+        if hasattr(past_key_values, "to_legacy_cache"):
+            return extract_cache_tensors(past_key_values.to_legacy_cache())
+        raise ValueError(f"Cannot determine length of cache: {type(past_key_values)}")
+    for i in range(num_layers):
+        k, v = past_key_values[i]
+        keys.append(k)
+        values.append(v)
+    return keys, values
+
+
+def create_fresh_cache(key_tensors, value_tensors, expand_size=1):
+    """Reconstruct a fresh cache object from tensors."""
+    if DynamicCache is not None:
+        cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(key_tensors, value_tensors)):
+            if expand_size > 1:
+                k = k.repeat_interleave(expand_size, dim=0)
+                v = v.repeat_interleave(expand_size, dim=0)
+            cache.update(k, v, i)
+        return cache
+    else:
+        layers = []
+        for k, v in zip(key_tensors, value_tensors):
+            if expand_size > 1:
+                k = k.repeat_interleave(expand_size, dim=0)
+                v = v.repeat_interleave(expand_size, dim=0)
+            layers.append((k, v))
+        return tuple(layers)
+
+
+# ============================================================================
 # BATCHED ACTIVATION + LOGIT EXTRACTION
 # ============================================================================
 
@@ -394,6 +439,80 @@ class BatchedExtractor:
 
         return all_layer_activations, all_probs, all_logits, all_metrics
 
+    def compute_prefix_cache(self, input_ids: torch.Tensor):
+        """Run shared prefix once to get cache snapshot (no hooks)."""
+        with torch.inference_mode():
+            outputs = self.model(input_ids=input_ids, use_cache=True)
+        return extract_cache_tensors(outputs.past_key_values)
+
+    def extract_batch_with_cache(
+        self,
+        suffix_ids: torch.Tensor,
+        prefix_cache_data: Tuple,
+        option_token_ids: List[int],
+        pad_token_id: int = 0
+    ) -> Tuple[List[Dict], List[np.ndarray], List[np.ndarray], List[Dict]]:
+        """
+        Extract activations AND compute option probabilities/metrics using KV cache prefix.
+
+        Args:
+            suffix_ids: (batch_size, suffix_len) - left-padded suffix token IDs
+            prefix_cache_data: (keys, values) tuple from compute_prefix_cache
+            option_token_ids: List of token IDs for the options
+            pad_token_id: Token ID used for padding (default 0)
+
+        Returns:
+            Same as extract_batch
+        """
+        self.activations = {}
+        batch_size = suffix_ids.shape[0]
+
+        keys, values = prefix_cache_data
+        prefix_len = keys[0].shape[2]
+        suffix_len = suffix_ids.shape[1]
+
+        # Build attention mask for prefix + suffix
+        mask = torch.ones((batch_size, prefix_len + suffix_len), dtype=torch.long, device=suffix_ids.device)
+        # Handle left-padding in suffix
+        mask[:, prefix_len:] = (suffix_ids != pad_token_id).long()
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=suffix_ids,
+                attention_mask=mask,
+                past_key_values=create_fresh_cache(keys, values, expand_size=batch_size),
+                use_cache=False
+            )
+
+        # Single CPU transfer: stack all layers and transfer at once
+        stacked = torch.stack([self.activations[i] for i in range(self.num_layers)], dim=0)
+        stacked_cpu = stacked.cpu().numpy()
+
+        # Distribute to per-batch-item dicts
+        all_layer_activations = []
+        for batch_idx in range(batch_size):
+            item_activations = {
+                layer_idx: stacked_cpu[layer_idx, batch_idx]
+                for layer_idx in range(self.num_layers)
+            }
+            all_layer_activations.append(item_activations)
+
+        # Extract logits and compute probabilities/metrics for each batch item
+        all_probs = []
+        all_logits = []
+        all_metrics = []
+        for batch_idx in range(batch_size):
+            final_logits = outputs.logits[batch_idx, -1, :]
+            option_logits = final_logits[option_token_ids]
+            option_logits_np = option_logits.cpu().numpy()
+            probs = torch.softmax(option_logits, dim=-1).cpu().numpy()
+            metrics = compute_uncertainty_metrics(probs, option_logits_np)
+            all_probs.append(probs)
+            all_logits.append(option_logits_np)
+            all_metrics.append(metrics)
+
+        return all_layer_activations, all_probs, all_logits, all_metrics
+
 
 # ============================================================================
 # MAIN DATA COLLECTION
@@ -401,6 +520,116 @@ class BatchedExtractor:
 
 # Batch size for processing (adjust based on GPU memory)
 BATCH_SIZE = 4  # Conservative default; increase if you have more VRAM
+
+
+def find_common_prefix_length(input_ids_list: List[List[int]]) -> int:
+    """Find the length of the common token prefix across all sequences."""
+    if not input_ids_list:
+        return 0
+    ref_ids = input_ids_list[0]
+    min_len = min(len(ids) for ids in input_ids_list)
+    common_len = 0
+    for i in range(min_len):
+        if all(ids[i] == ref_ids[i] for ids in input_ids_list):
+            common_len += 1
+        else:
+            break
+    return common_len
+
+
+def process_prompts_with_prefix_cache(
+    prompts: List[str],
+    options_list: List[List[str]],
+    tokenizer,
+    extractor: BatchedExtractor,
+    batch_size: int,
+    desc: str,
+    collect_activations: bool = True
+) -> Tuple[List[Dict], List[np.ndarray], List[np.ndarray], List[Dict], List[str]]:
+    """
+    Process prompts efficiently with prefix caching.
+
+    When prompts share a common prefix (e.g., same system message and instructions),
+    computes the KV cache for the prefix once and reuses it for all suffixes.
+
+    Args:
+        prompts: List of full prompt strings
+        options_list: List of option lists (one per prompt)
+        tokenizer: The tokenizer
+        extractor: BatchedExtractor instance (with hooks registered)
+        batch_size: Batch size for processing
+        desc: Progress bar description
+        collect_activations: Whether to collect layer activations
+
+    Returns:
+        (layer_activations, probs, logits, metrics, responses)
+    """
+    # 1. Tokenize all prompts
+    encodings = tokenizer(prompts, add_special_tokens=False)
+    input_ids_list = encodings["input_ids"]
+
+    # 2. Find common prefix
+    common_len = find_common_prefix_length(input_ids_list)
+
+    # 3. Compute prefix cache if prefix is substantial (>20 tokens)
+    MIN_PREFIX_FOR_CACHE = 20
+    if common_len > MIN_PREFIX_FOR_CACHE:
+        print(f"  Found common prefix ({common_len} tokens). Computing prefix cache...")
+        prefix_ids = torch.tensor([input_ids_list[0][:common_len]], device=DEVICE)
+        prefix_cache = extractor.compute_prefix_cache(prefix_ids)
+        suffixes = [ids[common_len:] for ids in input_ids_list]
+        use_cache = True
+    else:
+        if common_len > 0:
+            print(f"  Common prefix too short ({common_len} tokens). Using standard processing.")
+        suffixes = input_ids_list
+        prefix_cache = None
+        use_cache = False
+
+    # Get pad token id from tokenizer
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    # 4. Process in batches
+    results_acts = []
+    results_probs = []
+    results_logits = []
+    results_metrics = []
+    results_responses = []
+
+    for b in tqdm(range(0, len(prompts), batch_size), desc=desc):
+        batch_suffixes = suffixes[b:b+batch_size]
+        batch_opts = options_list[b:b+batch_size]
+        actual_batch_size = len(batch_suffixes)
+
+        # Left-pad suffixes to same length
+        max_len = max(len(s) for s in batch_suffixes)
+        padded = torch.full((actual_batch_size, max_len), pad_token_id, dtype=torch.long, device=DEVICE)
+        for i, s in enumerate(batch_suffixes):
+            padded[i, max_len-len(s):] = torch.tensor(s, dtype=torch.long, device=DEVICE)
+
+        # Get option token IDs (assume all items in batch have same options)
+        opt_ids = [tokenizer.encode(o, add_special_tokens=False)[0] for o in batch_opts[0]]
+
+        if use_cache:
+            acts, probs, logits, metrics = extractor.extract_batch_with_cache(
+                padded, prefix_cache, opt_ids, pad_token_id=pad_token_id
+            )
+        else:
+            # Build full inputs with attention mask
+            mask = (padded != pad_token_id).long()
+            acts, probs, logits, metrics = extractor.extract_batch(padded, mask, opt_ids)
+
+        if collect_activations:
+            results_acts.extend(acts)
+        results_probs.extend(probs)
+        results_logits.extend(logits)
+        results_metrics.extend(metrics)
+
+        # Determine responses based on argmax
+        for i, p in enumerate(probs):
+            results_responses.append(batch_opts[i][np.argmax(p)])
+
+    return results_acts, results_probs, results_logits, results_metrics, results_responses
 
 
 def collect_paired_data(
@@ -415,7 +644,7 @@ def collect_paired_data(
     Collect activations and uncertainty metrics for both direct and meta prompts.
 
     Uses batched processing with combined activation+logit extraction
-    for ~4x speedup over the naive approach.
+    and KV cache prefix sharing for meta prompts (~2-3x overall speedup).
 
     Returns dict with:
         - direct_activations: {layer_idx: np.array of shape (n_questions, hidden_dim)}
@@ -436,32 +665,25 @@ def collect_paired_data(
 
     # Storage
     direct_layer_acts = {i: [] for i in range(num_layers)}
-    meta_layer_acts = {i: [] for i in range(num_layers)}
     direct_metrics_lists = {metric: [] for metric in AVAILABLE_METRICS}
     direct_probs_list = []
     direct_logits_list = []
-    meta_entropies = []
-    meta_probs_list = []
-    meta_responses = []
-    meta_mappings = []  # Store mappings for delegate task
 
     model.eval()
 
-    # Pre-compute option token IDs (same for all questions of each type)
-    # Direct options vary by question, but meta options depend on META_TASK
+    # Pre-compute option token IDs for meta task
     meta_options = get_meta_options()
-    meta_option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in meta_options]
 
     try:
-        # Process in batches
+        # ============ PHASE 1: DIRECT PROMPTS ============
+        print("\nProcessing direct prompts...")
         num_batches = (len(questions) + batch_size - 1) // batch_size
 
-        for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+        for batch_idx in tqdm(range(num_batches), desc="Direct prompts"):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(questions))
             batch_questions = questions[start_idx:end_idx]
 
-            # ============ DIRECT CASE (batched) ============
             direct_prompts = []
             direct_options_list = []
             for q in batch_questions:
@@ -469,15 +691,12 @@ def collect_paired_data(
                 direct_prompts.append(prompt)
                 direct_options_list.append(options)
 
-            # For direct case, options can vary per question (A/B/C/D vs A/B etc.)
-            # We need to handle this - tokenize each and get token IDs
-            # Most MC questions have A/B/C/D, so we'll assume that for batching
-            # and fall back to per-item processing if options differ
+            # Check if all questions have same options (most MC questions do)
             first_options = direct_options_list[0]
             all_same_options = all(opts == first_options for opts in direct_options_list)
 
             if all_same_options:
-                # Batch process - all questions have same options
+                # Batch process
                 direct_option_token_ids = [
                     tokenizer.encode(opt, add_special_tokens=False)[0] for opt in first_options
                 ]
@@ -494,7 +713,7 @@ def collect_paired_data(
                     direct_option_token_ids
                 )
 
-                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
+                for acts, probs, logits, metrics in zip(batch_acts, batch_probs, batch_logits, batch_metrics):
                     for layer_idx, act in acts.items():
                         direct_layer_acts[layer_idx].append(act)
                     direct_probs_list.append(probs.tolist())
@@ -504,13 +723,10 @@ def collect_paired_data(
 
                 del inputs
             else:
-                # Fall back to per-item processing if options differ
-                for i, (prompt, options) in enumerate(zip(direct_prompts, direct_options_list)):
+                # Fall back to per-item processing
+                for prompt, options in zip(direct_prompts, direct_options_list):
                     option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in options]
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                    ).to(DEVICE)
+                    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
                     batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                         inputs["input_ids"],
@@ -527,45 +743,24 @@ def collect_paired_data(
 
                     del inputs
 
-            # ============ META CASE ============
-            if META_TASK == "delegate":
-                # For delegate task, process individually due to alternating mapping
-                for i, q in enumerate(batch_questions):
-                    trial_idx = start_idx + i
-                    prompt, _, mapping = format_delegate_prompt(q, tokenizer, use_chat_template, trial_idx)
+            if (batch_idx + 1) % 10 == 0:
+                torch.cuda.empty_cache()
 
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                    ).to(DEVICE)
+        # ============ PHASE 2: META PROMPTS ============
+        print("\nProcessing meta prompts...")
 
-                    batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
-                        inputs["input_ids"],
-                        inputs["attention_mask"],
-                        meta_option_token_ids
-                    )
+        if META_TASK == "delegate":
+            # Delegate task: process individually due to alternating mapping
+            meta_layer_acts = {i: [] for i in range(num_layers)}
+            meta_probs_list = []
+            meta_entropies = []
+            meta_responses = []
+            meta_mappings = []
+            meta_option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in meta_options]
 
-                    for layer_idx, act in batch_acts[0].items():
-                        meta_layer_acts[layer_idx].append(act)
-                    meta_probs_list.append(batch_probs[0].tolist())
-                    meta_entropies.append(batch_metrics[0]["entropy"])
-                    meta_response = meta_options[np.argmax(batch_probs[0])]
-                    meta_responses.append(meta_response)
-                    meta_mappings.append(mapping)
-
-                    del inputs
-            else:
-                # For confidence task, batch process (all prompts same format)
-                meta_prompts = []
-                for q in batch_questions:
-                    prompt, _ = format_meta_prompt(q, tokenizer, use_chat_template)
-                    meta_prompts.append(prompt)
-
-                inputs = tokenizer(
-                    meta_prompts,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(DEVICE)
+            for trial_idx, q in enumerate(tqdm(questions, desc="Delegate prompts")):
+                prompt, _, mapping = format_delegate_prompt(q, tokenizer, use_chat_template, trial_idx)
+                inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
                 batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                     inputs["input_ids"],
@@ -573,20 +768,46 @@ def collect_paired_data(
                     meta_option_token_ids
                 )
 
-                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
-                    for layer_idx, act in acts.items():
-                        meta_layer_acts[layer_idx].append(act)
-                    meta_probs_list.append(probs.tolist())
-                    meta_entropies.append(metrics["entropy"])
-                    meta_response = meta_options[np.argmax(probs)]
-                    meta_responses.append(meta_response)
-                    meta_mappings.append(None)  # No mapping for confidence task
+                for layer_idx, act in batch_acts[0].items():
+                    meta_layer_acts[layer_idx].append(act)
+                meta_probs_list.append(batch_probs[0].tolist())
+                meta_entropies.append(batch_metrics[0]["entropy"])
+                meta_response = meta_options[np.argmax(batch_probs[0])]
+                meta_responses.append(meta_response)
+                meta_mappings.append(mapping)
 
                 del inputs
 
-            # Clear memory periodically
-            if (batch_idx + 1) % 10 == 0:
-                torch.cuda.empty_cache()
+                if (trial_idx + 1) % 50 == 0:
+                    torch.cuda.empty_cache()
+        else:
+            # Confidence task: use prefix caching (all prompts share same prefix)
+            meta_prompts = []
+            meta_options_list = []
+            for q in questions:
+                prompt, opts = format_meta_prompt(q, tokenizer, use_chat_template)
+                meta_prompts.append(prompt)
+                meta_options_list.append(opts)
+
+            # Use prefix caching for efficiency
+            meta_acts, meta_probs_raw, _, meta_metrics_raw, meta_responses = process_prompts_with_prefix_cache(
+                meta_prompts,
+                meta_options_list,
+                tokenizer,
+                extractor,
+                batch_size,
+                desc="Meta prompts (with prefix cache)"
+            )
+
+            # Convert to expected format
+            meta_layer_acts = {i: [] for i in range(num_layers)}
+            for acts in meta_acts:
+                for layer_idx, act in acts.items():
+                    meta_layer_acts[layer_idx].append(act)
+
+            meta_probs_list = [p.tolist() for p in meta_probs_raw]
+            meta_entropies = [m["entropy"] for m in meta_metrics_raw]
+            meta_mappings = [None] * len(questions)  # No mapping for confidence task
 
     finally:
         extractor.remove_hooks()
@@ -602,7 +823,7 @@ def collect_paired_data(
         metric: np.array(values) for metric, values in direct_metrics_lists.items()
     }
 
-    print(f"Direct activations shape (per layer): {direct_activations[0].shape}")
+    print(f"\nDirect activations shape (per layer): {direct_activations[0].shape}")
     print(f"Meta activations shape (per layer): {meta_activations[0].shape}")
     print(f"\nDirect uncertainty metrics:")
     for metric_name, values in direct_metrics.items():
@@ -636,71 +857,31 @@ def collect_meta_only(
     Collect only meta prompt data, reusing direct activations from mc_entropy_probe.py.
 
     This is much faster than collect_paired_data when MC data already exists.
+    Uses KV cache prefix sharing for additional speedup on confidence task.
     """
     print(f"Collecting meta data only for {len(questions)} questions (reusing direct activations)...")
 
     extractor = BatchedExtractor(model, num_layers)
     extractor.register_hooks()
 
-    # Storage for meta only
-    meta_layer_acts = {i: [] for i in range(num_layers)}
-    meta_entropies = []
-    meta_probs_list = []
-    meta_responses = []
-    meta_mappings = []  # Store mappings for delegate task
-
     model.eval()
 
     # Meta options depend on META_TASK
     meta_options = get_meta_options()
-    meta_option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in meta_options]
 
     try:
-        num_batches = (len(questions) + batch_size - 1) // batch_size
+        if META_TASK == "delegate":
+            # Delegate task: process individually due to alternating mapping
+            meta_layer_acts = {i: [] for i in range(num_layers)}
+            meta_probs_list = []
+            meta_entropies = []
+            meta_responses = []
+            meta_mappings = []
+            meta_option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in meta_options]
 
-        for batch_idx in tqdm(range(num_batches), desc="Processing meta prompts"):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(questions))
-            batch_questions = questions[start_idx:end_idx]
-
-            if META_TASK == "delegate":
-                # For delegate task, process individually due to alternating mapping
-                for i, q in enumerate(batch_questions):
-                    trial_idx = start_idx + i
-                    prompt, _, mapping = format_delegate_prompt(q, tokenizer, use_chat_template, trial_idx)
-
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                    ).to(DEVICE)
-
-                    batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
-                        inputs["input_ids"],
-                        inputs["attention_mask"],
-                        meta_option_token_ids
-                    )
-
-                    for layer_idx, act in batch_acts[0].items():
-                        meta_layer_acts[layer_idx].append(act)
-                    meta_probs_list.append(batch_probs[0].tolist())
-                    meta_entropies.append(batch_metrics[0]["entropy"])
-                    meta_response = meta_options[np.argmax(batch_probs[0])]
-                    meta_responses.append(meta_response)
-                    meta_mappings.append(mapping)
-
-                    del inputs
-            else:
-                # For confidence task, batch process
-                meta_prompts = []
-                for q in batch_questions:
-                    prompt, _ = format_meta_prompt(q, tokenizer, use_chat_template)
-                    meta_prompts.append(prompt)
-
-                inputs = tokenizer(
-                    meta_prompts,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(DEVICE)
+            for trial_idx, q in enumerate(tqdm(questions, desc="Delegate prompts")):
+                prompt, _, mapping = format_delegate_prompt(q, tokenizer, use_chat_template, trial_idx)
+                inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
                 batch_acts, batch_probs, batch_logits, batch_metrics = extractor.extract_batch(
                     inputs["input_ids"],
@@ -708,19 +889,46 @@ def collect_meta_only(
                     meta_option_token_ids
                 )
 
-                for i, (acts, probs, logits, metrics) in enumerate(zip(batch_acts, batch_probs, batch_logits, batch_metrics)):
-                    for layer_idx, act in acts.items():
-                        meta_layer_acts[layer_idx].append(act)
-                    meta_probs_list.append(probs.tolist())
-                    meta_entropies.append(metrics["entropy"])
-                    meta_response = meta_options[np.argmax(probs)]
-                    meta_responses.append(meta_response)
-                    meta_mappings.append(None)
+                for layer_idx, act in batch_acts[0].items():
+                    meta_layer_acts[layer_idx].append(act)
+                meta_probs_list.append(batch_probs[0].tolist())
+                meta_entropies.append(batch_metrics[0]["entropy"])
+                meta_response = meta_options[np.argmax(batch_probs[0])]
+                meta_responses.append(meta_response)
+                meta_mappings.append(mapping)
 
                 del inputs
 
-            if (batch_idx + 1) % 10 == 0:
-                torch.cuda.empty_cache()
+                if (trial_idx + 1) % 50 == 0:
+                    torch.cuda.empty_cache()
+        else:
+            # Confidence task: use prefix caching (all prompts share same prefix)
+            meta_prompts = []
+            meta_options_list = []
+            for q in questions:
+                prompt, opts = format_meta_prompt(q, tokenizer, use_chat_template)
+                meta_prompts.append(prompt)
+                meta_options_list.append(opts)
+
+            # Use prefix caching for efficiency
+            meta_acts, meta_probs_raw, _, meta_metrics_raw, meta_responses = process_prompts_with_prefix_cache(
+                meta_prompts,
+                meta_options_list,
+                tokenizer,
+                extractor,
+                batch_size,
+                desc="Meta prompts (with prefix cache)"
+            )
+
+            # Convert to expected format
+            meta_layer_acts = {i: [] for i in range(num_layers)}
+            for acts in meta_acts:
+                for layer_idx, act in acts.items():
+                    meta_layer_acts[layer_idx].append(act)
+
+            meta_probs_list = [p.tolist() for p in meta_probs_raw]
+            meta_entropies = [m["entropy"] for m in meta_metrics_raw]
+            meta_mappings = [None] * len(questions)
 
     finally:
         extractor.remove_hooks()
@@ -783,6 +991,8 @@ def collect_other_confidence(
     task should correlate more strongly with its actual uncertainty metrics than
     this other-confidence task.
 
+    Uses KV cache prefix sharing for efficiency.
+
     Returns dict with:
         - other_probs: list of prob arrays over S-Z options
         - other_responses: list of predicted confidence letters
@@ -793,55 +1003,31 @@ def collect_other_confidence(
     extractor = BatchedExtractor(model, num_layers)
     extractor.register_hooks()
 
-    # Storage
-    other_probs_list = []
-    other_responses = []
-    other_signals = []
-
     model.eval()
 
-    # Other-confidence uses same S-Z options as stated confidence
-    other_options = list(OTHER_CONFIDENCE_OPTIONS.keys())
-    other_option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in other_options]
-
     try:
-        num_batches = (len(questions) + batch_size - 1) // batch_size
+        # Format all prompts
+        other_prompts = []
+        other_options_list = []
+        for q in questions:
+            prompt, opts = format_other_confidence_prompt(q, tokenizer, use_chat_template)
+            other_prompts.append(prompt)
+            other_options_list.append(opts)
 
-        for batch_idx in tqdm(range(num_batches), desc="Processing other-confidence"):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(questions))
-            batch_questions = questions[start_idx:end_idx]
+        # Use prefix caching for efficiency (no activations needed)
+        _, other_probs_raw, _, _, other_responses = process_prompts_with_prefix_cache(
+            other_prompts,
+            other_options_list,
+            tokenizer,
+            extractor,
+            batch_size,
+            desc="Other-confidence (with prefix cache)",
+            collect_activations=False
+        )
 
-            # Format prompts for other-confidence task
-            other_prompts = []
-            for q in batch_questions:
-                prompt, _ = format_other_confidence_prompt(q, tokenizer, use_chat_template)
-                other_prompts.append(prompt)
-
-            inputs = tokenizer(
-                other_prompts,
-                return_tensors="pt",
-                padding=True,
-            ).to(DEVICE)
-
-            _, batch_probs, _, _ = extractor.extract_batch(
-                inputs["input_ids"],
-                inputs["attention_mask"],
-                other_option_token_ids
-            )
-
-            for probs in batch_probs:
-                other_probs_list.append(probs.tolist())
-                other_response = other_options[np.argmax(probs)]
-                other_responses.append(other_response)
-                # Compute expected signal (weighted avg)
-                signal = get_other_confidence_signal(probs)
-                other_signals.append(signal)
-
-            del inputs
-
-            if (batch_idx + 1) % 10 == 0:
-                torch.cuda.empty_cache()
+        # Convert to expected format and compute signals
+        other_probs_list = [p.tolist() for p in other_probs_raw]
+        other_signals = [get_other_confidence_signal(p) for p in other_probs_raw]
 
     finally:
         extractor.remove_hooks()
