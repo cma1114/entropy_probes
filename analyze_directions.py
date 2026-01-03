@@ -152,7 +152,6 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
 
     # Patterns that are NOT dataset-specific or metric-specific (single file per model)
     simple_patterns = [
-        ("contrastive", f"{model_short}*_contrastive_directions.npz"),
         ("introspection_direction", f"{model_short}*_direction_vectors.npz"),
     ]
 
@@ -161,6 +160,37 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
         if matches:
             # Take the most recent if multiple
             direction_files[direction_type] = max(matches, key=lambda p: p.stat().st_mtime)
+
+    # Contrastive directions: {model}_{dataset}_{metric}_contrastive_directions.npz
+    for metric in AVAILABLE_METRICS:
+        if metric_filter and metric != metric_filter:
+            continue
+
+        contrastive_pattern = f"{model_short}*_{metric}_contrastive_directions.npz"
+        for path in output_dir.glob(contrastive_pattern):
+            dataset = extract_dataset_from_npz(path)
+            if dataset is None:
+                # Try to extract from filename: {model}_{dataset}_{metric}_contrastive_directions.npz
+                # Remove prefix and suffix to get dataset
+                name = path.name
+                prefix = f"{model_short}_"
+                suffix = f"_{metric}_contrastive_directions.npz"
+                if name.startswith(prefix) and name.endswith(suffix):
+                    dataset = name[len(prefix):-len(suffix)]
+                    # Handle adapter names in prefix
+                    if "_adapter-" in dataset:
+                        # Format: adapter-{adapter}_{dataset}
+                        parts = dataset.split("_", 1)
+                        if len(parts) > 1:
+                            dataset = parts[1]
+
+            if dataset:
+                key = f"contrastive_{metric}_{dataset}"
+            else:
+                key = f"contrastive_{metric}"
+
+            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                direction_files[key] = path
 
     # Introspection direction files from two sources:
     # 1. run_introspection_experiment.py: {model}_{dataset}_introspection[_{task}]_{metric}_directions.npz
@@ -368,20 +398,23 @@ def compute_pairwise_similarities(
     return similarities
 
 
-def load_lm_head_weight(model_name: str) -> torch.Tensor:
+def load_lm_head_and_norm(model_name: str) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Load lm_head weight directly from model files.
+    Load lm_head weight and final norm weight directly from model files.
 
-    This bypasses the model loading and directly loads just the lm_head weight
-    from the safetensors files. Much faster and uses less memory than loading
-    the full model.
+    This bypasses the model loading and directly loads just the weights needed
+    for logit lens from the safetensors files. Much faster and uses less memory
+    than loading the full model.
+
+    Returns:
+        Tuple of (lm_head_weight, norm_weight)
     """
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
 
-    print(f"  Downloading lm_head weight index...")
+    print(f"  Downloading weight index...")
 
-    # Download the index file to find which shard has lm_head
+    # Download the index file to find which shards have our weights
     index_file = hf_hub_download(
         repo_id=model_name,
         filename="model.safetensors.index.json",
@@ -391,16 +424,17 @@ def load_lm_head_weight(model_name: str) -> torch.Tensor:
     with open(index_file) as f:
         index = json.load(f)
 
-    # Find which file contains lm_head.weight
     weight_map = index.get("weight_map", {})
+
+    # Find which files contain our weights
     lm_head_file = weight_map.get("lm_head.weight")
+    norm_file = weight_map.get("model.norm.weight")
 
     if not lm_head_file:
         raise ValueError(f"Could not find lm_head.weight in model index")
 
+    # Download and load lm_head
     print(f"  Downloading {lm_head_file}...")
-
-    # Download that specific shard
     shard_path = hf_hub_download(
         repo_id=model_name,
         filename=lm_head_file,
@@ -408,13 +442,39 @@ def load_lm_head_weight(model_name: str) -> torch.Tensor:
     )
 
     print(f"  Loading lm_head weight to {DEVICE}...")
-
-    # Load just the lm_head weight directly to GPU
     with safe_open(shard_path, framework="pt", device=DEVICE) as f:
-        weight = f.get_tensor("lm_head.weight")
+        lm_head_weight = f.get_tensor("lm_head.weight")
 
-    print(f"  Loaded lm_head weight: {weight.shape}, dtype: {weight.dtype}, device: {weight.device}")
-    return weight
+    print(f"  Loaded lm_head weight: {lm_head_weight.shape}, dtype: {lm_head_weight.dtype}")
+
+    # Download and load norm weight (may be in same or different shard)
+    norm_weight = None
+    if norm_file:
+        if norm_file != lm_head_file:
+            print(f"  Downloading {norm_file}...")
+            norm_shard_path = hf_hub_download(
+                repo_id=model_name,
+                filename=norm_file,
+                token=os.environ.get("HF_TOKEN")
+            )
+        else:
+            norm_shard_path = shard_path
+
+        print(f"  Loading norm weight...")
+        with safe_open(norm_shard_path, framework="pt", device=DEVICE) as f:
+            norm_weight = f.get_tensor("model.norm.weight")
+        print(f"  Loaded norm weight: {norm_weight.shape}")
+    else:
+        print(f"  Warning: Could not find model.norm.weight, skipping normalization")
+
+    return lm_head_weight, norm_weight
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Apply RMSNorm to a vector."""
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return weight * x_normed
 
 
 def clean_token_str(s: str) -> str:
@@ -435,10 +495,18 @@ def logit_lens_for_layer(
     direction: np.ndarray,
     lm_head_weight: torch.Tensor,
     tokenizer,
-    top_k: int = 12
+    top_k: int = 12,
+    norm_weight: Optional[torch.Tensor] = None
 ) -> Tuple[List[str], List[float]]:
     """
     Project a direction through the unembedding matrix.
+
+    Args:
+        direction: The direction vector to project
+        lm_head_weight: The unembedding matrix
+        tokenizer: Tokenizer for decoding
+        top_k: Number of top tokens to return
+        norm_weight: If provided, apply RMSNorm before unembedding (recommended)
 
     Returns:
         Tuple of (top_tokens, top_probs) - tokens and their softmax probabilities
@@ -449,6 +517,11 @@ def logit_lens_for_layer(
         dtype=lm_head_weight.dtype,
         device=lm_head_weight.device
     )
+
+    # Apply RMSNorm if weights provided (matches model's forward pass)
+    if norm_weight is not None:
+        direction_tensor = rms_norm(direction_tensor, norm_weight)
+
     logits = direction_tensor @ lm_head_weight.T  # (vocab_size,)
 
     # Softmax to get probabilities
@@ -469,7 +542,8 @@ def analyze_layer(
     layer_idx: int,
     lm_head_weight: Optional[torch.Tensor],
     tokenizer,
-    top_k: int = 12
+    top_k: int = 12,
+    norm_weight: Optional[torch.Tensor] = None
 ) -> Dict:
     """
     Run full analysis on a single layer.
@@ -492,7 +566,7 @@ def analyze_layer(
             if layer_idx in layers:
                 for name, direction in layers[layer_idx].items():
                     full_name = f"{source}/{name}"
-                    tokens, probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k)
+                    tokens, probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k, norm_weight)
                     results["logit_lens"][full_name] = {
                         "tokens": tokens,
                         "probs": probs,
@@ -509,7 +583,8 @@ def plot_logit_lens_heatmap(
     lm_head_weight: torch.Tensor,
     tokenizer,
     output_path: Path,
-    top_k: int = 12
+    top_k: int = 12,
+    norm_weight: Optional[torch.Tensor] = None
 ):
     """
     Plot heatmap showing top-k tokens for each layer.
@@ -523,7 +598,7 @@ def plot_logit_lens_heatmap(
         if direction_source in all_directions and layer_idx in all_directions[direction_source]:
             if direction_name in all_directions[direction_source][layer_idx]:
                 direction = all_directions[direction_source][layer_idx][direction_name]
-                tokens, probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k)
+                tokens, probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k, norm_weight)
                 token_data.append(tokens)
                 probs_data.append(probs)
             else:
@@ -692,6 +767,7 @@ def main():
     # Load tokenizer and lm_head weight for logit lens (unless skipped)
     tokenizer = None
     lm_head_weight = None
+    norm_weight = None
 
     if not args.skip_logit_lens:
         from transformers import AutoTokenizer
@@ -709,9 +785,9 @@ def main():
             print("Tokenizer loaded. Exiting (--model-only specified)")
             return
 
-        # Load just the lm_head weight directly (much faster than loading full model)
-        print(f"\nLoading lm_head weight for logit lens...")
-        lm_head_weight = load_lm_head_weight(BASE_MODEL_NAME)
+        # Load lm_head weight and norm weight directly (much faster than loading full model)
+        print(f"\nLoading lm_head and norm weights for logit lens...")
+        lm_head_weight, norm_weight = load_lm_head_and_norm(BASE_MODEL_NAME)
     else:
         print("\nSkipping logit lens analysis (--skip-logit-lens)")
 
@@ -720,7 +796,7 @@ def main():
     all_results = {}
 
     for layer_idx in tqdm(layers_to_analyze, desc="Analyzing layers"):
-        results = analyze_layer(all_directions, layer_idx, lm_head_weight, tokenizer, TOP_K_TOKENS)
+        results = analyze_layer(all_directions, layer_idx, lm_head_weight, tokenizer, TOP_K_TOKENS, norm_weight)
         all_results[layer_idx] = results
 
     # Save results
@@ -780,7 +856,8 @@ def main():
                         all_directions, all_layers, source, direction_name,
                         lm_head_weight, tokenizer,
                         Path(filename),
-                        top_k=TOP_K_TOKENS
+                        top_k=TOP_K_TOKENS,
+                        norm_weight=norm_weight
                     )
 
     print("\n" + "="*80)

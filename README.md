@@ -309,6 +309,25 @@ python run_contrastive_direction.py --metric logit_gap
 - `*_direction_comparison.png` - Heatmap visualization
 - `*_direction_steering_comparison.json` - Causal effect of each direction type
 
+### 10. MC Answer Position Bias Analysis
+
+**Script:** `analyze_mc_answer_bias.py`
+
+Checks whether answer letter positions (A/B/C/D) correlate with uncertainty metrics. This helps interpret logit lens results—if the MC probe direction projects onto B/C-like tokens, is that because B/C answers actually correlate with uncertainty in the data?
+
+```bash
+# Configure at top of script:
+BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+
+python analyze_mc_answer_bias.py
+```
+
+**Outputs:**
+- `*_mc_answer_bias.png` - Letter distribution and mean metric by letter
+- `*_mc_answer_bias.json` - Spearman correlations between position and each metric
+
+**Interpretation:** If there's no correlation between answer position and uncertainty metrics, the B/C pattern in logit lens is likely spurious or reflects model biases rather than dataset structure.
+
 ---
 
 ## Centralized Task Logic (`tasks.py`)

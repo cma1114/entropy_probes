@@ -94,6 +94,22 @@ def get_output_prefix() -> str:
     return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}")
 
 
+def get_directions_prefix() -> str:
+    """Generate output filename prefix for direction files (task-independent).
+
+    Direction files are task-independent because they're trained on meta task
+    activations predicting introspection_score - but the introspection_score
+    itself depends on the meta task responses. However, the probe directions
+    should be shared across tasks since they capture the same underlying signal.
+    """
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    # NO task suffix - directions are task-independent
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection")
+
+
 SEED = 42
 
 # Probe training config
@@ -749,7 +765,8 @@ def main():
         json.dump(results_to_save, f, indent=2, default=json_serializer)
     print(f"\nSaved {output_results}")
 
-    # Save directions (metric-specific filename)
+    # Save directions (task-independent filename)
+    # Directions are shared across tasks since they capture the same underlying signal
     directions = {}
     for layer_idx, layer_results in results["layer_results"].items():
         directions[f"layer_{layer_idx}_introspection"] = np.array(layer_results["direction"])
@@ -759,7 +776,8 @@ def main():
     directions["_metadata_dataset"] = np.array(DATASET_NAME)
     directions["_metadata_model"] = np.array(BASE_MODEL_NAME)
 
-    output_directions = f"{output_prefix}_{METRIC}_probe_directions.npz"
+    directions_prefix = get_directions_prefix()
+    output_directions = f"{directions_prefix}_{METRIC}_probe_directions.npz"
     np.savez_compressed(output_directions, **directions)
     print(f"Saved {output_directions}")
 

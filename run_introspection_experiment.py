@@ -138,6 +138,25 @@ def get_output_prefix(metric: str = None) -> str:
     return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}{metric_suffix}")
 
 
+def get_directions_prefix(metric: str = None) -> str:
+    """Generate output filename prefix for direction files (task-independent).
+
+    Direction files are task-independent because they're trained on direct task
+    activations predicting metrics like entropy/top_logit - the meta task
+    (confidence vs delegate) doesn't affect the direction computation.
+
+    Args:
+        metric: If provided, include metric in prefix.
+    """
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    # NO task suffix - directions are task-independent
+    metric_suffix = f"_{metric}" if metric else ""
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection{metric_suffix}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{metric_suffix}")
+
+
 # ============================================================================
 # BACKWARD COMPATIBILITY ALIASES (now imported from tasks.py)
 # ============================================================================
@@ -2067,10 +2086,13 @@ def main():
     # Generate output prefixes
     # Base prefix for shared files (activations, paired data)
     base_prefix = get_output_prefix()
-    # Metric-specific prefix for probe results and directions
+    # Metric-specific prefix for probe results (task-dependent)
     metric_prefix = get_output_prefix(METRIC)
+    # Directions prefix (task-independent - directions are the same for confidence/delegate)
+    directions_prefix = get_directions_prefix(METRIC)
     print(f"Base output prefix: {base_prefix}")
     print(f"Metric output prefix: {metric_prefix}")
+    print(f"Directions prefix: {directions_prefix}")
 
     # Get the selected metric's values
     direct_target = data["direct_metrics"][METRIC]
@@ -2189,7 +2211,8 @@ def main():
         extract_directions=True
     )
 
-    # Save directions for steering/ablation experiments (metric-specific filename)
+    # Save directions for steering/ablation experiments (task-independent filename)
+    # Directions are task-independent because they predict metrics from direct task activations
     if directions is not None:
         directions_data = {
             f"layer_{layer_idx}": direction
@@ -2199,10 +2222,10 @@ def main():
         directions_data["_metadata_dataset"] = np.array(DATASET_NAME)
         directions_data["_metadata_model"] = np.array(BASE_MODEL_NAME)
         np.savez_compressed(
-            f"{metric_prefix}_directions.npz",
+            f"{directions_prefix}_directions.npz",
             **directions_data
         )
-        print(f"Saved {METRIC} directions to {metric_prefix}_directions.npz")
+        print(f"Saved {METRIC} directions to {directions_prefix}_directions.npz")
 
     # Behavioral analysis (uses selected METRIC for correlation with stated confidence)
     behavioral = analyze_behavioral_introspection(

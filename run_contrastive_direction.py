@@ -100,9 +100,40 @@ METRIC_KEY_MAP = {
 # Will be set by CLI argument
 METRIC = "top_logit"
 
+# Direction types to compute
+# Options: "contrastive", "calibration", "caa", "cluster"
+# Set to None or empty list to compute all
+DIRECTION_TYPES = ["calibration"]  # Just calibration direction
+
 # Output directory
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
+
+
+def compute_alignment(metric_z: float, confidence_z: float, metric_name: str) -> float:
+    """
+    Compute alignment score between metric and stated confidence.
+
+    Alignment is positive when confidence matches uncertainty:
+    - High confidence + low uncertainty (confident and should be)
+    - Low confidence + high uncertainty (uncertain and knows it)
+
+    Args:
+        metric_z: Z-scored metric value
+        confidence_z: Z-scored confidence value
+        metric_name: Name of the metric to determine polarity
+
+    Returns:
+        Alignment score (positive = well-calibrated)
+    """
+    # For entropy: high value = uncertain, so negate to get "confidence-like" direction
+    # For other metrics: high value = confident, use as-is
+    if METRIC_HIGHER_IS_CONFIDENT.get(metric_name, False):
+        # High metric = confident, so positive correlation with confidence is good
+        return metric_z * confidence_z
+    else:
+        # High metric = uncertain (entropy), so negative correlation is good
+        return -metric_z * confidence_z
 
 
 def get_model_short_name(model_name: str) -> str:
@@ -116,10 +147,20 @@ def get_model_short_name(model_name: str) -> str:
 def get_output_prefix() -> str:
     """Generate output filename prefix based on config."""
     model_short = get_model_short_name(BASE_MODEL_NAME)
+    task_suffix = "_delegate" if META_TASK == "delegate" else ""
+
+    # Determine direction type suffix
+    if DIRECTION_TYPES is None or len(DIRECTION_TYPES) == 0:
+        dir_suffix = "all_directions"
+    elif len(DIRECTION_TYPES) == 1:
+        dir_suffix = DIRECTION_TYPES[0]
+    else:
+        dir_suffix = "multi_directions"
+
     if MODEL_NAME != BASE_MODEL_NAME:
         adapter_short = get_model_short_name(MODEL_NAME)
-        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_{METRIC}_contrastive")
-    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_{METRIC}_contrastive")
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_{METRIC}{task_suffix}_{dir_suffix}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_{METRIC}{task_suffix}_{dir_suffix}")
 
 # Contrastive selection thresholds
 # Use top/bottom quantiles of introspection score
@@ -144,7 +185,12 @@ NUM_CONTROL_DIRECTIONS = None  # None = dynamic based on num_layers, or set expl
 FDR_ALPHA = 0.05              # Target FDR significance level
 FDR_SAFETY_FACTOR = 25        # Multiplier: pooled_samples = FDR_SAFETY_FACTOR * num_layers
 MIN_CONTROLS_PER_LAYER = 10   # Minimum controls even for few layers
-MIN_PROJECTION_CORR = 0.5 # Minimum projection correlation for layer selection
+# Layer selection for steering: use principled criteria
+# - Require statistical significance (p < MIN_PROJECTION_PVAL)
+# - Require minimum effect size (R² > MIN_PROJECTION_R2, i.e., |r| > sqrt(MIN_PROJECTION_R2))
+MIN_PROJECTION_PVAL = 0.001  # Require p < 0.001 for layer to be included
+MIN_PROJECTION_R2 = 0.05     # Require R² > 0.05 (|r| > 0.224) - direction explains 5%+ of variance
+MAX_STEERING_LAYERS = 10     # Maximum number of layers to steer (selects top N by correlation)
 STEERING_BATCH_SIZE = 8  # Batch size for steering/ablation (matches run_introspection_steering.py)
 
 # Quantization options for large models (70B+)
@@ -443,10 +489,11 @@ def precompute_direction_tensors(
 def get_introspection_prefix() -> str:
     """Get prefix for introspection data files (from run_introspection_experiment.py)."""
     model_short = get_model_short_name(BASE_MODEL_NAME)
+    task_suffix = "_delegate" if META_TASK == "delegate" else ""
     if MODEL_NAME != BASE_MODEL_NAME:
         adapter_short = get_model_short_name(MODEL_NAME)
-        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection")
-    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection")
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection{task_suffix}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}")
 
 
 def load_introspection_data(run_name: str = None, metric: str = "entropy") -> dict:
@@ -535,14 +582,29 @@ def load_introspection_data(run_name: str = None, metric: str = "entropy") -> di
                     stated_confidences.append(1.0 if response == "1" else 0.0)
             stated_confidences = np.array(stated_confidences)
         else:
-            # For confidence task, use midpoint of chosen range
+            # For confidence task, use logprob-weighted expected value
+            # This computes E[confidence] = sum(P(option) * midpoint)
             META_RANGE_MIDPOINTS = {
                 "S": 0.025, "T": 0.075, "U": 0.15, "V": 0.3,
                 "W": 0.5, "X": 0.7, "Y": 0.85, "Z": 0.95
             }
-            stated_confidences = np.array([
-                META_RANGE_MIDPOINTS.get(r, 0.5) for r in meta_responses
-            ])
+            options = list(META_RANGE_MIDPOINTS.keys())
+            midpoints = np.array([META_RANGE_MIDPOINTS[opt] for opt in options])
+
+            stated_confidences = []
+            for i, (response, probs) in enumerate(zip(
+                meta_responses,
+                meta_probs or [None] * len(meta_responses)
+            )):
+                if probs is not None and len(probs) == len(midpoints):
+                    # Logprob-weighted expected value: sum(P(option) * midpoint)
+                    probs_arr = np.array(probs)
+                    expected_conf = float(np.dot(probs_arr, midpoints))
+                    stated_confidences.append(expected_conf)
+                else:
+                    # Fallback to argmax response midpoint if probs unavailable
+                    stated_confidences.append(META_RANGE_MIDPOINTS.get(response, 0.5))
+            stated_confidences = np.array(stated_confidences)
 
     # Load meta activations
     print(f"Loading meta activations from {acts_path}...")
@@ -1007,7 +1069,7 @@ def run_steering_experiment(
             resp = options[np.argmax(p)]
             conf = response_to_confidence(resp, p, mappings[q_idx])
             m_val = direct_metric_values[q_idx]
-            align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+            align = compute_alignment((m_val - metric_mean)/metric_std, (conf - 0.5)/0.25, METRIC)
             shared_baseline[q_idx] = {
                 "question_idx": q_idx, "response": resp, "confidence": conf,
                 "metric": float(m_val), "alignment": float(align)
@@ -1034,61 +1096,61 @@ def run_steering_experiment(
             hook = BatchSteeringHook()
             hook.register(layer_module)
 
+            def run_batched_mult_sweep(direction_vector, result_dict):
+                # 1. Create FRESH cache expanded for this pass
+                pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=k_mult)
+
+                # 2. Attach cache to inputs
+                current_inputs = {
+                    "input_ids": expanded_input_ids,
+                    "attention_mask": expanded_attention_mask,
+                    "past_key_values": pass_cache,
+                    "use_cache": True
+                }
+                if expanded_position_ids is not None:
+                    current_inputs["position_ids"] = expanded_position_ids
+
+                # 3. Set Deltas
+                deltas = []
+                for _ in range(B):
+                    for mult in nonzero_multipliers:
+                        deltas.append(direction_vector * mult)
+                delta_bh = torch.stack(deltas, dim=0)
+                hook.set_delta(delta_bh)
+
+                # 4. Run Model
+                with torch.inference_mode():
+                    out = model(**current_inputs)
+                    logits = out.logits[:, -1, :][:, option_token_ids]
+                    probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+
+                # 5. Store Results
+                for i, q_idx in enumerate(batch_indices):
+                    for j, mult in enumerate(nonzero_multipliers):
+                        idx = i * k_mult + j
+                        p = probs[idx]
+                        resp = options[np.argmax(p)]
+                        conf = response_to_confidence(resp, p, mappings[q_idx])
+                        m_val = direct_metric_values[q_idx]
+                        align = compute_alignment((m_val - metric_mean)/metric_std, (conf - 0.5)/0.25, METRIC)
+
+                        result_dict[mult][q_idx] = {
+                            "question_idx": q_idx, "response": resp, "confidence": conf,
+                            "metric": float(m_val), "alignment": float(align)
+                        }
+
             try:
-                # Process each direction separately (batch only multipliers, like introspection script)
-                for dir_idx, dir_tensor in enumerate(all_directions):
-                    # Create fresh cache for this direction pass
-                    pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=k_mult)
-
-                    current_inputs = {
-                        "input_ids": expanded_input_ids,
-                        "attention_mask": expanded_attention_mask,
-                        "past_key_values": pass_cache,
-                        "use_cache": True
-                    }
-                    if expanded_position_ids is not None:
-                        current_inputs["position_ids"] = expanded_position_ids
-
-                    # Build deltas for all multipliers × batch items
-                    # Layout: [B * k_mult, hidden] - same as run_introspection_steering
-                    deltas = []
-                    for _ in range(B):
-                        for mult in nonzero_multipliers:
-                            deltas.append(dir_tensor * mult)
-                    delta_bh = torch.stack(deltas, dim=0)
-                    hook.set_delta(delta_bh)
-
-                    # Forward pass for this direction
-                    with torch.inference_mode():
-                        out = model(**current_inputs)
-                        logits = out.logits[:, -1, :][:, option_token_ids]
-                        probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-
-                    # Unpack results: probs shape = [B * k_mult, n_options]
-                    for i, q_idx in enumerate(batch_indices):
-                        for j, mult in enumerate(nonzero_multipliers):
-                            idx = i * k_mult + j
-                            p = probs[idx]
-                            resp = options[np.argmax(p)]
-                            conf = response_to_confidence(resp, p, mappings[q_idx])
-                            m_val = direct_metric_values[q_idx]
-                            align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
-
-                            result = {
-                                "question_idx": q_idx, "response": resp, "confidence": conf,
-                                "metric": float(m_val), "alignment": float(align)
-                            }
-
-                            # Store in appropriate result dict
-                            if dir_idx == 0:
-                                # Primary (contrastive) direction
-                                final_layer_results[layer_idx]["contrastive"][mult][q_idx] = result
-                            else:
-                                # Control direction
-                                ctrl_key = f"control_{dir_idx - 1}"
-                                final_layer_results[layer_idx]["controls"][ctrl_key][mult][q_idx] = result
+                # Contrastive direction
+                run_batched_mult_sweep(direction_tensor, final_layer_results[layer_idx]["contrastive"])
+                # Control directions
+                for i_c, ctrl_dir in enumerate(control_tensors):
+                    run_batched_mult_sweep(ctrl_dir, final_layer_results[layer_idx]["controls"][f"control_{i_c}"])
             finally:
                 hook.remove()
+
+            # Clear cache after each layer to prevent memory accumulation on large models
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
@@ -1213,7 +1275,7 @@ def run_ablation_experiment(
                 resp = options[np.argmax(p)]
                 conf = response_to_confidence(resp, p, mappings[q_idx])
                 m_val = direct_metric_values[q_idx]
-                align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
+                align = compute_alignment((m_val - metric_mean)/metric_std, (conf - 0.5)/0.25, METRIC)
                 baseline_results[q_idx] = {
                     "question_idx": q_idx, "response": resp, "confidence": conf,
                     "metric": float(m_val), "alignment": float(align)
@@ -1228,60 +1290,58 @@ def run_ablation_experiment(
 
             direction_tensor = cached_directions[layer_idx]["direction"]
             control_tensors = cached_directions[layer_idx]["controls"]
-            all_directions = [direction_tensor] + control_tensors  # primary + controls
 
             hook = BatchAblationHook()
             hook.register(layer_module)
 
-            try:
-                # Process each direction separately (no batching - same as introspection script)
-                for dir_idx, dir_tensor in enumerate(all_directions):
-                    # Create fresh cache for this direction
-                    pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
+            def run_ablation_for_direction(dir_tensor, result_list):
+                # Create fresh cache for this direction
+                pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
 
-                    current_inputs = {
-                        "input_ids": base_step_data["input_ids"],
-                        "attention_mask": base_step_data["attention_mask"],
-                        "past_key_values": pass_cache,
-                        "use_cache": True
+                current_inputs = {
+                    "input_ids": base_step_data["input_ids"],
+                    "attention_mask": base_step_data["attention_mask"],
+                    "past_key_values": pass_cache,
+                    "use_cache": True
+                }
+                if "position_ids" in base_step_data:
+                    current_inputs["position_ids"] = base_step_data["position_ids"]
+
+                # Build direction tensor for batch items
+                dirs_batch = dir_tensor.unsqueeze(0).expand(B, -1)
+                hook.set_directions(dirs_batch)
+
+                # Forward pass for this direction
+                with torch.inference_mode():
+                    out = model(**current_inputs)
+                    logits = out.logits[:, -1, :][:, option_token_ids]
+                    probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+
+                # Unpack results
+                for i, q_idx in enumerate(batch_indices):
+                    p = probs[i]
+                    resp = options[np.argmax(p)]
+                    conf = response_to_confidence(resp, p, mappings[q_idx])
+                    m_val = direct_metric_values[q_idx]
+                    align = compute_alignment((m_val - metric_mean)/metric_std, (conf - 0.5)/0.25, METRIC)
+
+                    result_list[q_idx] = {
+                        "question_idx": q_idx, "response": resp, "confidence": conf,
+                        "metric": float(m_val), "alignment": float(align)
                     }
-                    if "position_ids" in base_step_data:
-                        current_inputs["position_ids"] = base_step_data["position_ids"]
 
-                    # Build direction tensor for batch items
-                    # Layout: [B, hidden]
-                    dirs_batch = dir_tensor.unsqueeze(0).expand(B, -1)
-                    hook.set_directions(dirs_batch)
-
-                    # Forward pass for this direction
-                    with torch.inference_mode():
-                        out = model(**current_inputs)
-                        logits = out.logits[:, -1, :][:, option_token_ids]
-                        probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-
-                    # Unpack results: probs shape = [B, n_options]
-                    for i, q_idx in enumerate(batch_indices):
-                        p = probs[i]
-                        resp = options[np.argmax(p)]
-                        conf = response_to_confidence(resp, p, mappings[q_idx])
-                        m_val = direct_metric_values[q_idx]
-                        align = -((m_val - metric_mean)/metric_std) * ((conf - 0.5)/0.25)
-
-                        result = {
-                            "question_idx": q_idx, "response": resp, "confidence": conf,
-                            "metric": float(m_val), "alignment": float(align)
-                        }
-
-                        # Store in appropriate result dict
-                        if dir_idx == 0:
-                            # Primary (contrastive) direction ablation
-                            final_layer_results[layer_idx]["contrastive_ablated"][q_idx] = result
-                        else:
-                            # Control direction ablation
-                            ctrl_key = f"control_{dir_idx - 1}"
-                            final_layer_results[layer_idx]["controls_ablated"][ctrl_key][q_idx] = result
+            try:
+                # Contrastive direction ablation
+                run_ablation_for_direction(direction_tensor, final_layer_results[layer_idx]["contrastive_ablated"])
+                # Control direction ablations
+                for i_c, ctrl_dir in enumerate(control_tensors):
+                    run_ablation_for_direction(ctrl_dir, final_layer_results[layer_idx]["controls_ablated"][f"control_{i_c}"])
             finally:
                 hook.remove()
+
+            # Clear cache after each layer to prevent memory accumulation on large models
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
@@ -1298,6 +1358,79 @@ def run_ablation_experiment(
 # ============================================================================
 # CONTRASTIVE DIRECTION ANALYSIS
 # ============================================================================
+
+def compute_calibration_direction_with_details(
+    meta_activations: np.ndarray,
+    metric_values: np.ndarray,
+    stated_confidences: np.ndarray,
+    metric_higher_is_confident: bool = False,
+) -> dict:
+    """
+    Compute calibration direction: calibrated vs uncalibrated examples.
+
+    This is a "pure calibration" direction that captures the difference between
+    examples where the model's stated confidence matches its actual uncertainty
+    vs examples where they disagree.
+
+    - Calibrated: introspection_score > 0 (stated confidence tracks model confidence)
+    - Uncalibrated: introspection_score < 0 (stated confidence inversely tracks model confidence)
+
+    Unlike the contrastive direction (which varies confidence within calibrated samples),
+    this direction captures the calibration axis itself.
+
+    Args:
+        meta_activations: Activation vectors for each example
+        metric_values: The uncertainty metric values (e.g., entropy, top_prob)
+        stated_confidences: Model's stated confidence values
+        metric_higher_is_confident: If True, higher metric = more confident (e.g., top_prob).
+                                   If False, lower metric = more confident (e.g., entropy).
+
+    Returns direction and detailed info about selected examples.
+    """
+    # Z-score normalize
+    metric_z = stats.zscore(metric_values)
+    confidence_z = stats.zscore(stated_confidences)
+
+    # Normalize metric direction so positive = more confident
+    if not metric_higher_is_confident:
+        metric_z_conf = -metric_z  # Invert so positive = more confident
+    else:
+        metric_z_conf = metric_z
+
+    # Introspection score: positive when calibrated (stated confidence tracks model confidence)
+    introspection_scores = metric_z_conf * confidence_z
+
+    # Split by calibration status
+    calibrated_mask = introspection_scores > 0
+    uncalibrated_mask = introspection_scores < 0
+
+    calibrated_acts = meta_activations[calibrated_mask]
+    uncalibrated_acts = meta_activations[uncalibrated_mask]
+
+    if len(calibrated_acts) == 0 or len(uncalibrated_acts) == 0:
+        raise ValueError(f"Not enough examples: calibrated={len(calibrated_acts)}, uncalibrated={len(uncalibrated_acts)}")
+
+    # Compute direction: calibrated - uncalibrated
+    calibrated_mean = calibrated_acts.mean(axis=0)
+    uncalibrated_mean = uncalibrated_acts.mean(axis=0)
+
+    direction = calibrated_mean - uncalibrated_mean
+    direction_norm = np.linalg.norm(direction)
+    direction_normalized = direction / direction_norm
+
+    return {
+        "direction": direction_normalized,
+        "direction_magnitude": direction_norm,
+        "n_calibrated": int(calibrated_mask.sum()),
+        "n_uncalibrated": int(uncalibrated_mask.sum()),
+        "calibrated_metric_mean": float(metric_values[calibrated_mask].mean()),
+        "calibrated_confidence_mean": float(stated_confidences[calibrated_mask].mean()),
+        "uncalibrated_metric_mean": float(metric_values[uncalibrated_mask].mean()),
+        "uncalibrated_confidence_mean": float(stated_confidences[uncalibrated_mask].mean()),
+        "calibrated_introspection_mean": float(introspection_scores[calibrated_mask].mean()),
+        "uncalibrated_introspection_mean": float(introspection_scores[uncalibrated_mask].mean()),
+    }
+
 
 def compute_contrastive_direction_with_details(
     meta_activations: np.ndarray,
@@ -1443,22 +1576,90 @@ def analyze_selected_examples(
     }
 
 
+def analyze_calibration_selection(
+    metric_values: np.ndarray,
+    stated_confidences: np.ndarray,
+    metric_name: str = "entropy",
+    metric_higher_is_confident: bool = False
+) -> dict:
+    """
+    Analyze the characteristics of calibrated vs uncalibrated examples.
+
+    - Calibrated: stated confidence tracks model confidence (introspection_score > 0)
+    - Uncalibrated: stated confidence inversely tracks model confidence (introspection_score < 0)
+    """
+    # Z-scores for interpretation
+    metric_z = stats.zscore(metric_values)
+    conf_z = stats.zscore(stated_confidences)
+
+    # Normalize so positive = more confident
+    if not metric_higher_is_confident:
+        metric_z_conf = -metric_z
+    else:
+        metric_z_conf = metric_z
+
+    # Introspection score: positive when calibrated
+    introspection_scores = metric_z_conf * conf_z
+    calibrated_mask = introspection_scores > 0
+    uncalibrated_mask = introspection_scores < 0
+
+    print("\n" + "="*60)
+    print("CALIBRATION DIRECTION SELECTION ANALYSIS")
+    print("="*60)
+
+    print(f"\nTotal examples: {len(metric_values)}")
+    print(f"Calibrated (introspection > 0): n={calibrated_mask.sum()} ({100*calibrated_mask.mean():.1f}%)")
+    print(f"Uncalibrated (introspection < 0): n={uncalibrated_mask.sum()} ({100*uncalibrated_mask.mean():.1f}%)")
+
+    print(f"\nCalibrated examples (n={calibrated_mask.sum()}):")
+    if calibrated_mask.sum() > 0:
+        print(f"  Mean {metric_name}: {metric_values[calibrated_mask].mean():.3f}")
+        print(f"  Mean confidence: {stated_confidences[calibrated_mask].mean():.3f}")
+        print(f"  Mean introspection score: {introspection_scores[calibrated_mask].mean():.3f}")
+
+    print(f"\nUncalibrated examples (n={uncalibrated_mask.sum()}):")
+    if uncalibrated_mask.sum() > 0:
+        print(f"  Mean {metric_name}: {metric_values[uncalibrated_mask].mean():.3f}")
+        print(f"  Mean confidence: {stated_confidences[uncalibrated_mask].mean():.3f}")
+        print(f"  Mean introspection score: {introspection_scores[uncalibrated_mask].mean():.3f}")
+
+    return {
+        "n_total": len(metric_values),
+        "calibrated": {
+            "n": int(calibrated_mask.sum()),
+            "pct": float(100 * calibrated_mask.mean()),
+            "metric_mean": float(metric_values[calibrated_mask].mean()) if calibrated_mask.sum() > 0 else None,
+            "confidence_mean": float(stated_confidences[calibrated_mask].mean()) if calibrated_mask.sum() > 0 else None,
+            "introspection_mean": float(introspection_scores[calibrated_mask].mean()) if calibrated_mask.sum() > 0 else None,
+        },
+        "uncalibrated": {
+            "n": int(uncalibrated_mask.sum()),
+            "pct": float(100 * uncalibrated_mask.mean()),
+            "metric_mean": float(metric_values[uncalibrated_mask].mean()) if uncalibrated_mask.sum() > 0 else None,
+            "confidence_mean": float(stated_confidences[uncalibrated_mask].mean()) if uncalibrated_mask.sum() > 0 else None,
+            "introspection_mean": float(introspection_scores[uncalibrated_mask].mean()) if uncalibrated_mask.sum() > 0 else None,
+        },
+    }
+
+
 def run_layer_analysis(
     meta_activations: dict,
     metric_values: np.ndarray,
     stated_confidences: np.ndarray,
     metric_higher_is_confident: bool = False,
     top_quantile: float = 0.25,
-    bottom_quantile: float = 0.25
+    bottom_quantile: float = 0.25,
+    direction_type: str = "contrastive"
 ) -> dict:
     """
-    Compute contrastive direction for each layer and analyze.
+    Compute direction for each layer and analyze.
 
-    The contrastive direction is: high-confidence - low-confidence
-    (i.e., correctly confident minus correctly uncertain)
+    Args:
+        direction_type: "contrastive" (high_conf vs low_conf within calibrated)
+                       or "calibration" (calibrated vs uncalibrated)
     """
     print("\n" + "="*60)
-    print("LAYER-BY-LAYER ANALYSIS")
+    print(f"LAYER-BY-LAYER ANALYSIS ({direction_type.upper()} direction)")
     print("="*60)
 
     # Compute z-scores for correlation analysis
@@ -1472,15 +1673,20 @@ def run_layer_analysis(
         # Compute mean activation norm for normalization
         mean_activation_norm = float(np.linalg.norm(acts, axis=1).mean())
 
-        # Compute contrastive direction
-        dir_info = compute_contrastive_direction_with_details(
-            acts, metric_values, stated_confidences,
-            metric_higher_is_confident=metric_higher_is_confident,
-            top_quantile=top_quantile, bottom_quantile=bottom_quantile
-        )
+        # Compute direction based on type
+        if direction_type == "calibration":
+            dir_info = compute_calibration_direction_with_details(
+                acts, metric_values, stated_confidences,
+                metric_higher_is_confident=metric_higher_is_confident
+            )
+        else:  # contrastive (default)
+            dir_info = compute_contrastive_direction_with_details(
+                acts, metric_values, stated_confidences,
+                metric_higher_is_confident=metric_higher_is_confident,
+                top_quantile=top_quantile, bottom_quantile=bottom_quantile
+            )
 
         # Test how well projection correlates with stated confidence
-        # (since direction is high_conf - low_conf, projection should predict confidence)
         proj = acts @ dir_info["direction"]
         corr, pval = stats.pearsonr(proj, confidence_z)
 
@@ -1491,14 +1697,27 @@ def run_layer_analysis(
             "mean_activation_norm": mean_activation_norm,
         }
 
-    # Print summary
-    print(f"\n{'Layer':<8} {'Dir Mag':<12} {'Proj Corr':<12} {'p-value':<12} {'N high':<8} {'N low':<8}")
-    print("-" * 60)
-    for layer_idx in sorted(results.keys()):
-        r = results[layer_idx]
-        print(f"{layer_idx:<8} {r['direction_magnitude']:<12.4f} "
-              f"{r['projection_correlation']:<12.4f} {r['projection_pvalue']:<12.2e} "
-              f"{r['n_high_conf']:<8} {r['n_low_conf']:<8}")
+    # Print summary with appropriate headers
+    if direction_type == "calibration":
+        print(f"\n{'Layer':<8} {'Dir Mag':<12} {'Proj Corr':<12} {'R²':<12} {'p-value':<12} {'N calib':<8} {'N uncalib':<8}")
+        print("-" * 76)
+        for layer_idx in sorted(results.keys()):
+            r = results[layer_idx]
+            corr = r['projection_correlation']
+            r2 = corr ** 2
+            print(f"{layer_idx:<8} {r['direction_magnitude']:<12.4f} "
+                  f"{corr:<12.4f} {r2:<12.4f} {r['projection_pvalue']:<12.2e} "
+                  f"{r['n_calibrated']:<8} {r['n_uncalibrated']:<8}")
+    else:  # contrastive
+        print(f"\n{'Layer':<8} {'Dir Mag':<12} {'Proj Corr':<12} {'R²':<12} {'p-value':<12} {'N high':<8} {'N low':<8}")
+        print("-" * 72)
+        for layer_idx in sorted(results.keys()):
+            r = results[layer_idx]
+            corr = r['projection_correlation']
+            r2 = corr ** 2
+            print(f"{layer_idx:<8} {r['direction_magnitude']:<12.4f} "
+                  f"{corr:<12.4f} {r2:<12.4f} {r['projection_pvalue']:<12.2e} "
+                  f"{r['n_high_conf']:<8} {r['n_low_conf']:<8}")
 
     # Find best layer
     best_layer = max(results.keys(), key=lambda l: abs(results[l]["projection_correlation"]))
@@ -1602,17 +1821,17 @@ def compute_all_direction_types(
     stated_confidences: np.ndarray,
     metric_higher_is_confident: bool = False,
     n_clusters: int = 3,
-    cluster_method: str = "quantile"
+    cluster_method: str = "quantile",
+    direction_types: List[str] = None
 ) -> Dict[int, Dict[str, np.ndarray]]:
     """
     Compute multiple direction types for each layer.
 
     Direction types:
-    - contrastive: High conf/low metric - Low conf/high metric (calibrated examples)
+    - contrastive: High conf/low metric - Low conf/high metric (calibrated examples only)
+    - calibration: Calibrated - Uncalibrated (pure calibration axis)
     - caa: Simple mean(high_metric) - mean(low_metric)
-    - cluster_low_to_high: Direction from low to high cluster centroid
-    - cluster_low_to_mid: Direction from low to mid cluster centroid
-    - cluster_mid_to_high: Direction from mid to high cluster centroid
+    - cluster: Cluster-based directions (low_to_high, low_to_mid, mid_to_high)
 
     Args:
         meta_activations: Dict mapping layer_idx to activations (n_samples, hidden_dim)
@@ -1622,13 +1841,20 @@ def compute_all_direction_types(
         metric_higher_is_confident: Whether higher metric value = more confident
         n_clusters: Number of clusters for cluster-based directions
         cluster_method: "quantile" or "kmeans"
+        direction_types: List of direction types to compute. If None, compute all.
+                        Options: "contrastive", "calibration", "caa", "cluster"
 
     Returns:
         Dict mapping layer_idx to Dict of direction_name -> direction_vector
     """
+    # Default to all direction types
+    if direction_types is None or len(direction_types) == 0:
+        direction_types = ["contrastive", "calibration", "caa", "cluster"]
+
     print("\n" + "=" * 60)
-    print("COMPUTING ALL DIRECTION TYPES")
+    print("COMPUTING DIRECTION TYPES")
     print("=" * 60)
+    print(f"Selected types: {direction_types}")
 
     all_directions = {}
 
@@ -1637,37 +1863,51 @@ def compute_all_direction_types(
         layer_directions = {}
 
         # 1. Contrastive direction (calibrated high conf vs low conf)
-        try:
-            contrastive_info = compute_contrastive_direction_with_details(
-                acts, direct_entropies, stated_confidences,
-                metric_higher_is_confident=metric_higher_is_confident
-            )
-            layer_directions["contrastive"] = contrastive_info["direction"]
-        except ValueError as e:
-            print(f"  Layer {layer_idx}: Could not compute contrastive direction: {e}")
+        if "contrastive" in direction_types:
+            try:
+                contrastive_info = compute_contrastive_direction_with_details(
+                    acts, direct_entropies, stated_confidences,
+                    metric_higher_is_confident=metric_higher_is_confident
+                )
+                layer_directions["contrastive"] = contrastive_info["direction"]
+            except ValueError as e:
+                print(f"  Layer {layer_idx}: Could not compute contrastive direction: {e}")
 
-        # 2. CAA direction (simple mean difference)
-        try:
-            caa_direction, caa_info = compute_caa_direction(
-                acts, metric_values, high_quantile=0.25, low_quantile=0.25
-            )
-            layer_directions["caa"] = caa_direction
-        except ValueError as e:
-            print(f"  Layer {layer_idx}: Could not compute CAA direction: {e}")
+        # 2. Calibration direction (calibrated vs uncalibrated)
+        if "calibration" in direction_types:
+            try:
+                calibration_info = compute_calibration_direction_with_details(
+                    acts, direct_entropies, stated_confidences,
+                    metric_higher_is_confident=metric_higher_is_confident
+                )
+                layer_directions["calibration"] = calibration_info["direction"]
+            except ValueError as e:
+                print(f"  Layer {layer_idx}: Could not compute calibration direction: {e}")
 
-        # 3. Cluster-based directions
-        try:
-            cluster_info = compute_cluster_centroids(
-                acts, metric_values, n_clusters=n_clusters, method=cluster_method
-            )
-            cluster_dirs = compute_cluster_directions(
-                cluster_info["centroids"], normalize=True
-            )
-            # Add relevant cluster directions
-            for dir_name, direction in cluster_dirs.items():
-                layer_directions[f"cluster_{dir_name}"] = direction
-        except Exception as e:
-            print(f"  Layer {layer_idx}: Could not compute cluster directions: {e}")
+        # 3. CAA direction (simple mean difference)
+        if "caa" in direction_types:
+            try:
+                caa_direction, caa_info = compute_caa_direction(
+                    acts, metric_values, high_quantile=0.25, low_quantile=0.25
+                )
+                layer_directions["caa"] = caa_direction
+            except ValueError as e:
+                print(f"  Layer {layer_idx}: Could not compute CAA direction: {e}")
+
+        # 4. Cluster-based directions
+        if "cluster" in direction_types:
+            try:
+                cluster_info = compute_cluster_centroids(
+                    acts, metric_values, n_clusters=n_clusters, method=cluster_method
+                )
+                cluster_dirs = compute_cluster_directions(
+                    cluster_info["centroids"], normalize=True
+                )
+                # Add relevant cluster directions
+                for dir_name, direction in cluster_dirs.items():
+                    layer_directions[f"cluster_{dir_name}"] = direction
+            except Exception as e:
+                print(f"  Layer {layer_idx}: Could not compute cluster directions: {e}")
 
         all_directions[layer_idx] = layer_directions
 
@@ -1855,16 +2095,16 @@ def run_direction_comparison_experiment(
         """Convert batch results to per-question result dicts."""
         out = []
         for q_idx, (response, confidence, probs, mapping) in enumerate(batch_results):
-            entropy = direct_entropies[q_idx]
-            entropy_z = (entropy - entropy_mean) / entropy_std
+            metric_val = direct_entropies[q_idx]
+            metric_z = (metric_val - entropy_mean) / entropy_std
             confidence_z = (confidence - 0.5) / 0.25
-            alignment = -entropy_z * confidence_z
+            alignment = compute_alignment(metric_z, confidence_z, METRIC)
 
             out.append({
                 "question_idx": q_idx,
                 "response": response,
                 "confidence": confidence,
-                "entropy": float(entropy),
+                "metric": float(metric_val),
                 "alignment": float(alignment),
             })
         return out
@@ -2175,7 +2415,16 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Metric: {METRIC} (higher = {'more' if metric_higher_is_confident else 'less'} confident)")
-    print(f"Contrastive selection: top {TOP_QUANTILE*100:.0f}% vs bottom {BOTTOM_QUANTILE*100:.0f}%")
+
+    # Print direction type info
+    if DIRECTION_TYPES and len(DIRECTION_TYPES) == 1:
+        dir_type = DIRECTION_TYPES[0]
+        if dir_type == "calibration":
+            print(f"Direction type: CALIBRATION (calibrated vs uncalibrated)")
+        else:
+            print(f"Direction type: CONTRASTIVE (top {TOP_QUANTILE*100:.0f}% vs bottom {BOTTOM_QUANTILE*100:.0f}%)")
+    else:
+        print(f"Direction types: {DIRECTION_TYPES or 'all'}")
 
     # Generate output prefix
     output_prefix = get_output_prefix()
@@ -2203,11 +2452,18 @@ def main():
     print(f"Introspection score range: [{introspection_scores.min():.3f}, {introspection_scores.max():.3f}]")
     print(f"Mean: {introspection_scores.mean():.3f}, Std: {introspection_scores.std():.3f}")
 
+    # Determine which direction type to use for layer analysis
+    if DIRECTION_TYPES and len(DIRECTION_TYPES) == 1:
+        analysis_direction_type = DIRECTION_TYPES[0]
+    else:
+        analysis_direction_type = "contrastive"  # default
+
     # Run layer-by-layer analysis
     layer_results = run_layer_analysis(
         meta_activations, metric_values, stated_confidences,
         metric_higher_is_confident=metric_higher_is_confident,
-        top_quantile=TOP_QUANTILE, bottom_quantile=BOTTOM_QUANTILE
+        top_quantile=TOP_QUANTILE, bottom_quantile=BOTTOM_QUANTILE,
+        direction_type=analysis_direction_type
     )
 
     # Get best layer for detailed analysis
@@ -2221,26 +2477,37 @@ def main():
     best_acts = meta_activations[best_layer]
     best_result = layer_results[best_layer]
 
-    # Analyze selected examples
-    example_analysis = analyze_selected_examples(
-        metric_values,
-        stated_confidences,
-        metric_name=METRIC,
-        metric_higher_is_confident=metric_higher_is_confident
-    )
+    # Show layer-specific statistics
+    print(f"\nDirection properties:")
+    print(f"  Magnitude: {best_result['direction_magnitude']:.4f}")
+    print(f"  Projection correlation: {best_result['projection_correlation']:.4f}")
+    print(f"  Projection p-value: {best_result['projection_pvalue']:.2e}")
+    print(f"  R²: {best_result['projection_correlation']**2:.4f}")
 
-    # Print direction quality summary
-    print(f"\n{'='*60}")
-    print("DIRECTION QUALITY SUMMARY")
-    print(f"{'='*60}")
-    print(f"\n{'Layer':<8} {'Proj Corr':<12} {'R²':<12} {'p-value':<12}")
-    print("-" * 44)
-    for layer_idx in sorted(layer_results.keys()):
-        r = layer_results[layer_idx]
-        corr = r["projection_correlation"]
-        r2 = corr ** 2  # R² = correlation² for single predictor
-        pval = r["projection_pvalue"]
-        print(f"{layer_idx:<8} {corr:<12.4f} {r2:<12.4f} {pval:<12.2e}")
+    # Projection distribution
+    proj = best_acts @ best_result["direction"]
+    print(f"\nProjection distribution:")
+    print(f"  Mean: {proj.mean():.4f}")
+    print(f"  Std: {proj.std():.4f}")
+    print(f"  Range: [{proj.min():.4f}, {proj.max():.4f}]")
+
+    # Analyze selected examples based on direction type
+    example_analysis = None
+    if analysis_direction_type == "calibration":
+        # Show calibration selection diagnostics
+        analyze_calibration_selection(
+            metric_values,
+            stated_confidences,
+            metric_name=METRIC,
+            metric_higher_is_confident=metric_higher_is_confident
+        )
+    elif DIRECTION_TYPES is None or "contrastive" in DIRECTION_TYPES:
+        example_analysis = analyze_selected_examples(
+            metric_values,
+            stated_confidences,
+            metric_name=METRIC,
+            metric_higher_is_confident=metric_higher_is_confident
+        )
 
     # Plot results
     plot_results(
@@ -2303,6 +2570,24 @@ def main():
         print("DIRECTION COMPARISON MODE")
         print("=" * 70)
 
+        # Print diagnostics for calibration direction if requested
+        if DIRECTION_TYPES is None or "calibration" in DIRECTION_TYPES:
+            analyze_calibration_selection(
+                metric_values,
+                stated_confidences,
+                metric_name=METRIC,
+                metric_higher_is_confident=metric_higher_is_confident
+            )
+
+        # Print diagnostics for contrastive direction if requested
+        if DIRECTION_TYPES is None or "contrastive" in DIRECTION_TYPES:
+            analyze_selected_examples(
+                metric_values,
+                stated_confidences,
+                metric_name=METRIC,
+                metric_higher_is_confident=metric_higher_is_confident
+            )
+
         # Compute all direction types for each layer
         all_directions = compute_all_direction_types(
             meta_activations,
@@ -2311,7 +2596,8 @@ def main():
             stated_confidences=stated_confidences,
             metric_higher_is_confident=metric_higher_is_confident,
             n_clusters=N_CLUSTERS,
-            cluster_method=CLUSTER_METHOD
+            cluster_method=CLUSTER_METHOD,
+            direction_types=DIRECTION_TYPES
         )
 
         # Evaluate quality of each direction type
@@ -2384,16 +2670,25 @@ def main():
         if STEERING_LAYERS is not None:
             steering_layers = STEERING_LAYERS
         else:
-            # Select layers with projection correlation above threshold
-            steering_layers = [
-                layer_idx for layer_idx, r in layer_results.items()
-                if abs(r["projection_correlation"]) > MIN_PROJECTION_CORR
+            # Select layers using principled criteria:
+            # 1. Statistical significance: p < MIN_PROJECTION_PVAL
+            # 2. Effect size: R² > MIN_PROJECTION_R2 (i.e., |r| > sqrt(MIN_PROJECTION_R2))
+            min_corr = MIN_PROJECTION_R2 ** 0.5  # Convert R² threshold to |r| threshold
+            candidate_layers = [
+                (layer_idx, abs(r["projection_correlation"]))
+                for layer_idx, r in layer_results.items()
+                if (r["projection_pvalue"] < MIN_PROJECTION_PVAL and
+                    r["projection_correlation"] ** 2 > MIN_PROJECTION_R2)
             ]
+            # Sort by correlation (descending) and take top N
+            candidate_layers.sort(key=lambda x: x[1], reverse=True)
+            steering_layers = [layer_idx for layer_idx, _ in candidate_layers[:MAX_STEERING_LAYERS]]
             # Sort numerically for consistent presentation
             steering_layers.sort()
 
         if not steering_layers:
-            print(f"No layers with projection correlation > {MIN_PROJECTION_CORR}. Skipping steering.")
+            min_corr = MIN_PROJECTION_R2 ** 0.5
+            print(f"No layers meet criteria (p < {MIN_PROJECTION_PVAL}, R² > {MIN_PROJECTION_R2}, i.e., |r| > {min_corr:.3f}). Skipping steering.")
         else:
             print(f"Selected layers for steering: {steering_layers}")
 

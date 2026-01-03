@@ -19,10 +19,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Configuration - match the model/dataset from run_contrastive_direction.py
+# Configuration - match the model/dataset/metric from run_contrastive_direction.py
 BASE_MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 MODEL_NAME = BASE_MODEL_NAME
-DATASET_NAME = "SimpleMC"
+DATASET_NAME = "TriviaMC"
+METRIC = "top_logit"
 OUTPUTS_DIR = Path("outputs")
 
 
@@ -32,12 +33,25 @@ def get_model_short_name(model_name: str) -> str:
     return model_name
 
 
-def get_output_prefix() -> str:
+def get_output_prefix(task: str = "confidence") -> str:
+    """Generate output prefix for a specific task."""
     model_short = get_model_short_name(BASE_MODEL_NAME)
+    task_suffix = "_delegate" if task == "delegate" else ""
     if MODEL_NAME != BASE_MODEL_NAME:
         adapter_short = get_model_short_name(MODEL_NAME)
-        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_contrastive")
-    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_contrastive")
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_{METRIC}{task_suffix}_contrastive")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_{METRIC}{task_suffix}_contrastive")
+
+
+def find_available_tasks() -> list:
+    """Find which tasks have results available."""
+    available = []
+    for task in ["confidence", "delegate"]:
+        prefix = get_output_prefix(task)
+        # Check if either steering or ablation results exist
+        if Path(f"{prefix}_steering_results.json").exists() or Path(f"{prefix}_ablation_analysis.json").exists():
+            available.append(task)
+    return available
 
 
 def analyze_steering_results(steering_data: dict) -> dict:
@@ -110,10 +124,11 @@ def analyze_steering_results(steering_data: dict) -> dict:
     return analysis
 
 
-def plot_steering_results(steering_analysis: dict, output_path: str):
+def plot_steering_results(steering_analysis: dict, output_path: str, task: str = "confidence"):
     """Create steering visualization."""
     layers = steering_analysis["layers"]
     multipliers = steering_analysis["multipliers"]
+    task_label = "Delegate" if task == "delegate" else "Confidence"
 
     # First, compute slopes for all layers to find the best one
     pos_mults = [m for m in multipliers if m > 0]
@@ -224,8 +239,9 @@ def plot_steering_results(steering_analysis: dict, output_path: str):
 
     mean_contr_slope = np.mean(slopes_contr)
     mean_ctrl_slope = np.mean(slopes_ctrl)
-    max_contr_slope = np.max(np.abs(slopes_contr))
-    # best_layer already computed above
+    best_layer_idx = layers.index(best_layer)
+    best_contr_slope = slopes_contr[best_layer_idx]
+    best_ctrl_slope = slopes_ctrl[best_layer_idx]
 
     summary = f"""
 STEERING EXPERIMENT SUMMARY
@@ -237,34 +253,49 @@ Mean confidence slope:
   Contrastive: {mean_contr_slope:.4f}
   Control:     {mean_ctrl_slope:.4f}
 
-Strongest effect: Layer {best_layer}
-  Slope: {slopes_contr[layers.index(best_layer)]:.4f}
+Best layer: {best_layer}
+  Contrastive slope: {best_contr_slope:.4f}
+  Control slope:     {best_ctrl_slope:.4f}
+  Ratio: {abs(best_contr_slope) / max(abs(best_ctrl_slope), 1e-6):.1f}x
 
 Interpretation:
 """
-    if abs(mean_contr_slope) > abs(mean_ctrl_slope) + 0.01:
-        summary += f"""  Contrastive direction has STRONGER
-  steering effect than random directions.
-  Direction captures meaningful signal."""
+    # Compare best layer's contrastive vs control slope
+    slope_ratio = abs(best_contr_slope) / max(abs(best_ctrl_slope), 1e-6)
+    if slope_ratio > 2.0 and abs(best_contr_slope) > 0.002:
+        summary += f"""  STEERING WORKS: Contrastive direction
+  has {slope_ratio:.1f}x stronger effect than
+  random directions at layer {best_layer}."""
+    elif abs(best_contr_slope) > 0.002:
+        summary += f"""  WEAK EFFECT: Contrastive direction
+  shows some steering effect but not much
+  stronger than random directions."""
     else:
-        summary += f"""  Contrastive direction has similar
-  steering effect to random directions.
-  No clear directional signal detected."""
+        summary += f"""  NO EFFECT: Steering has minimal
+  effect on confidence."""
 
     ax.text(0.1, 0.9, summary, transform=ax.transAxes, fontsize=11,
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
 
-    plt.suptitle(f'Contrastive Direction Steering Results\n{get_model_short_name(BASE_MODEL_NAME)} - {DATASET_NAME}',
+    plt.suptitle(f'Contrastive Direction Steering Results ({task_label} Task)\n{get_model_short_name(BASE_MODEL_NAME)} - {DATASET_NAME}',
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Steering visualization saved to: {output_path}")
 
 
-def plot_ablation_results(ablation_data: dict, output_path: str):
+def plot_ablation_results(ablation_data: dict, output_path: str, task: str = "confidence"):
     """Create ablation visualization."""
-    layers = sorted([int(k) for k in ablation_data.keys()])
+    task_label = "Delegate" if task == "delegate" else "Confidence"
+
+    # Handle both old flat format and new nested format with "effects" key
+    if "effects" in ablation_data:
+        effects = ablation_data["effects"]
+    else:
+        effects = ablation_data
+
+    layers = sorted([int(k) for k in effects.keys() if k.isdigit()])
 
     baseline_alignments = []
     contrastive_alignment_changes = []
@@ -272,13 +303,19 @@ def plot_ablation_results(ablation_data: dict, output_path: str):
     contrastive_confidence_changes = []
 
     for layer in layers:
-        data = ablation_data[str(layer)]
-        baseline_alignments.append(data["baseline_mean_alignment"])
-        contrastive_alignment_changes.append(data["contrastive_alignment_change"])
-        control_alignment_changes.append(data["controls_alignment_change"])
-        contrastive_confidence_changes.append(
-            data["contrastive_ablated_mean_confidence"] - data["baseline_mean_confidence"]
-        )
+        data = effects[str(layer)]
+        # Handle nested structure: baseline, contrastive_ablated, control_ablated
+        baseline = data.get("baseline", data)
+        contrastive = data.get("contrastive_ablated", data)
+        control = data.get("control_ablated", data)
+
+        baseline_alignments.append(baseline.get("mean_alignment", baseline.get("baseline_mean_alignment", 0)))
+        contrastive_alignment_changes.append(contrastive.get("alignment_change", data.get("contrastive_alignment_change", 0)))
+        control_alignment_changes.append(control.get("alignment_change", data.get("controls_alignment_change", 0)))
+
+        baseline_conf = baseline.get("mean_confidence", data.get("baseline_mean_confidence", 0))
+        contrastive_conf = contrastive.get("mean_confidence", data.get("contrastive_ablated_mean_confidence", 0))
+        contrastive_confidence_changes.append(contrastive_conf - baseline_conf)
 
     baseline_alignments = np.array(baseline_alignments)
     contrastive_alignment_changes = np.array(contrastive_alignment_changes)
@@ -370,7 +407,7 @@ Interpretation:
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-    plt.suptitle(f'Contrastive Direction Ablation Results\n{get_model_short_name(BASE_MODEL_NAME)} - {DATASET_NAME}',
+    plt.suptitle(f'Contrastive Direction Ablation Results ({task_label} Task)\n{get_model_short_name(BASE_MODEL_NAME)} - {DATASET_NAME}',
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -385,15 +422,17 @@ Interpretation:
     }
 
 
-def main():
-    output_prefix = get_output_prefix()
+def process_task(task: str):
+    """Process steering and ablation results for a single task."""
+    output_prefix = get_output_prefix(task)
+    task_label = "Delegate" if task == "delegate" else "Confidence"
 
     print(f"\n{'='*70}")
-    print("CONTRASTIVE DIRECTION VISUALIZATION")
+    print(f"PROCESSING: {task_label} Task")
     print(f"{'='*70}")
-    print(f"Model: {get_model_short_name(BASE_MODEL_NAME)}")
-    print(f"Dataset: {DATASET_NAME}")
     print(f"Output prefix: {output_prefix}")
+
+    ablation_summary = None
 
     # Try to load steering results
     steering_path = f"{output_prefix}_steering_results.json"
@@ -407,10 +446,9 @@ def main():
         steering_analysis = analyze_steering_results(steering_data)
 
         steering_output = f"{output_prefix}_steering_visualization.png"
-        plot_steering_results(steering_analysis, steering_output)
+        plot_steering_results(steering_analysis, steering_output, task)
     else:
         print(f"\nSteering results not found: {steering_path}")
-        steering_analysis = None
 
     # Load ablation analysis
     ablation_path = f"{output_prefix}_ablation_analysis.json"
@@ -420,13 +458,10 @@ def main():
             ablation_data = json.load(f)
 
         ablation_output = f"{output_prefix}_ablation_visualization.png"
-        ablation_summary = plot_ablation_results(ablation_data, ablation_output)
+        ablation_summary = plot_ablation_results(ablation_data, ablation_output, task)
 
         # Print summary
-        print(f"\n{'='*70}")
-        print("SUMMARY")
-        print(f"{'='*70}")
-        print(f"\nAblation results:")
+        print(f"\nAblation results ({task_label}):")
         print(f"  Mean alignment change (contrastive): {ablation_summary['mean_effect']:.4f}")
         print(f"  Mean alignment change (control):     {ablation_summary['control_mean']:.4f}")
 
@@ -438,6 +473,32 @@ def main():
             print("\n  --> Ablation has minimal effect")
     else:
         print(f"\nAblation analysis not found: {ablation_path}")
+
+    return ablation_summary
+
+
+def main():
+    print(f"\n{'='*70}")
+    print("CONTRASTIVE DIRECTION VISUALIZATION")
+    print(f"{'='*70}")
+    print(f"Model: {get_model_short_name(BASE_MODEL_NAME)}")
+    print(f"Dataset: {DATASET_NAME}")
+    print(f"Metric: {METRIC}")
+
+    # Find all available tasks
+    available_tasks = find_available_tasks()
+
+    if not available_tasks:
+        print(f"\nNo results found for any task. Expected files like:")
+        print(f"  {get_output_prefix('confidence')}_steering_results.json")
+        print(f"  {get_output_prefix('delegate')}_steering_results.json")
+        return
+
+    print(f"\nFound results for tasks: {available_tasks}")
+
+    # Process each task
+    for task in available_tasks:
+        process_task(task)
 
     print(f"\n{'='*70}")
     print("VISUALIZATION COMPLETE")

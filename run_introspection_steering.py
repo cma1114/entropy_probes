@@ -117,6 +117,20 @@ def get_output_prefix() -> str:
     return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection{task_suffix}")
 
 
+def get_directions_prefix() -> str:
+    """Generate output filename prefix for direction files (task-independent).
+
+    Direction files are task-independent because they predict metrics from
+    direct task activations - the meta task doesn't affect direction computation.
+    """
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    # NO task suffix - directions are task-independent
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_introspection")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_introspection")
+
+
 # Steering config
 STEERING_LAYERS = None  # None = auto-select from probe results
 STEERING_MULTIPLIERS = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
@@ -3090,15 +3104,19 @@ def main():
     elif DIRECTION_TYPE == "entropy":
         # Metric directions from run_introspection_experiment.py
         # Note: output file naming changed to include metric (e.g., *_logit_gap_results.json)
+        # Probe results are task-specific, but directions are task-independent
         probe_results_path = f"{output_prefix}_{METRIC}_results.json"
-        directions_path = f"{output_prefix}_{METRIC}_directions.npz"
+        directions_prefix = get_directions_prefix()
+        directions_path = f"{directions_prefix}_{METRIC}_directions.npz"
         direction_key_template = "layer_{}_{}"  # Will be formatted with metric name
         transfer_results_path = None
     else:
         # Introspection directions from run_introspection_probe.py
         # Note: output file naming changed to include metric (e.g., *_logit_gap_probe_results.json)
+        # Probe results are task-specific, but directions are task-independent
         probe_results_path = f"{output_prefix}_{METRIC}_probe_results.json"
-        directions_path = f"{output_prefix}_{METRIC}_probe_directions.npz"
+        directions_prefix = get_directions_prefix()
+        directions_path = f"{directions_prefix}_{METRIC}_probe_directions.npz"
         direction_key_template = "layer_{}_introspection"
         transfer_results_path = None
 
