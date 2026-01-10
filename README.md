@@ -399,6 +399,49 @@ NUM_PATCHING_SAMPLES = 100       # Samples to patch
 
 **Interpretation:** If patching high→low causes confidence to increase (and low→high causes it to decrease), this provides stronger causal evidence than correlation-based probing.
 
+### 3.4 MC Answer Probe Causality Experiment
+
+**Script:** `run_mc_answer_ablation.py`
+
+Tests whether the MC answer probe direction (which predicts A/B/C/D answer choice) is causally involved in introspection. This addresses the hypothesis that D2M transfer R² and behavioral correlation rise together because both depend on the model's answer representation.
+
+**What it tests:** If we ablate the MC answer direction during the meta task:
+1. Does the entropy probe D2M transfer R² decrease?
+2. Does the behavioral correlation (stated confidence vs actual entropy) decrease?
+
+If ablating the MC answer direction degrades both metrics, it suggests the answer representation is causally upstream of introspection.
+
+```bash
+# Run full ablation experiment
+python run_mc_answer_ablation.py --metric entropy
+
+# Just compute direction similarity (fast, no model loading)
+python run_mc_answer_ablation.py --metric logit_gap --similarity-only
+```
+
+**Prerequisites:** Run `run_introspection_experiment.py` first to generate:
+- MC answer directions (`*_mc_answer_directions.npz`)
+- Entropy/metric directions (`*_{metric}_directions.npz`)
+- Paired data with direct metrics (`*_paired_data.json`)
+
+**Direction extraction:** The MC answer probe is a 4-class LogisticRegression. To get a single direction, we take the first principal component of the 4 class coefficient vectors, then project back to original activation space.
+
+**Outputs:**
+- `*_mc_answer_ablation_results.json` - Full results including:
+  - Direction similarity (MC answer vs entropy probe at each layer)
+  - Behavioral ablation effects (correlation change, p-values, z-scores)
+- `*_mc_answer_ablation.png` - Two-panel visualization:
+  - Panel 1: Correlation change per layer (MC ablation vs controls)
+  - Panel 2: Direction similarity curve across layers
+
+**Statistical approach:** Same as `run_introspection_steering.py`:
+- 25 control directions per layer (random orthogonal)
+- Pooled p-values across all layers
+- FDR correction (Benjamini-Hochberg)
+- Z-scores vs control distribution
+
+**Note on logit lens:** To analyze what the MC answer direction represents, use `analyze_directions.py` which will automatically discover and process the saved `*_mc_answer_directions.npz` files.
+
 ---
 
 ## Miscellaneous Analysis Scripts

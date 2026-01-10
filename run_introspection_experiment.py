@@ -1133,6 +1133,38 @@ def extract_direction(
     return direction_original
 
 
+def extract_mc_answer_direction(
+    scaler: StandardScaler,
+    pca: PCA,
+    clf: LogisticRegression
+) -> np.ndarray:
+    """
+    Extract a single normalized direction from a multiclass LogisticRegression classifier.
+
+    For a 4-class classifier (A/B/C/D), clf.coef_ has shape (4, n_pca_components).
+    We extract the first principal component of these 4 class vectors to get
+    the dominant axis of variation that distinguishes different MC answer classes.
+
+    Maps the direction back through PCA and standardization to original activation space.
+    """
+    # clf.coef_ is (n_classes, n_pca_components) - one row per class
+    # Take first principal component of the class coefficient vectors
+    coef_pca = PCA(n_components=1)
+    coef_pca.fit(clf.coef_)
+    pc1 = coef_pca.components_[0]  # (n_pca_components,)
+
+    # Project back to scaled space
+    direction_scaled = pca.components_.T @ pc1  # (hidden_dim,)
+
+    # Undo standardization scaling
+    direction_original = direction_scaled / scaler.scale_
+
+    # Normalize to unit length
+    direction_original = direction_original / np.linalg.norm(direction_original)
+
+    return direction_original
+
+
 def train_probe(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -1478,15 +1510,21 @@ def run_mc_answer_analysis(
     model_predicted_answer: np.ndarray,
     train_idx: np.ndarray,
     test_idx: np.ndarray,
-) -> Dict:
+) -> Tuple[Dict, Dict, Dict[int, np.ndarray]]:
     """
     Train logistic regression probe to predict model's MC answer choice (A/B/C/D).
     Computes BOTH Separate (Upper Bound) and Centered (Rigorous) transfer metrics.
+
+    Returns:
+        results: Dict of accuracy metrics per layer
+        mc_probe_components: Dict of {scaler, pca, clf} per layer for reuse
+        mc_directions: Dict of normalized direction vectors per layer (for ablation)
     """
     print(f"\nRunning MC answer probe analysis across {len(direct_activations)} layers...")
 
     results = {}
     mc_probe_components = {}  # Store trained probe components for reuse
+    mc_directions = {}  # Store extracted directions for ablation experiments
 
     for layer_idx in tqdm(sorted(direct_activations.keys()), desc="Training MC answer probes"):
         X_direct = direct_activations[layer_idx]
@@ -1557,7 +1595,10 @@ def run_mc_answer_analysis(
             "clf": clf,
         }
 
-    return results, mc_probe_components
+        # Extract direction for ablation experiments
+        mc_directions[layer_idx] = extract_mc_answer_direction(scaler, pca, clf)
+
+    return results, mc_probe_components, mc_directions
 
 
 def apply_probes_to_other(
@@ -2749,7 +2790,7 @@ def run_single_experiment(
     train_idx, _ = train_test_split(indices, train_size=TRAIN_SPLIT, random_state=SEED)
 
     # Run MC answer probe analysis
-    mc_answer_results, mc_probe_components = run_mc_answer_analysis(
+    mc_answer_results, mc_probe_components, mc_directions = run_mc_answer_analysis(
         data["direct_activations"],
         data["meta_activations"],
         model_predicted_answer,
@@ -2764,6 +2805,20 @@ def run_single_experiment(
     print(f"  Best D→D: Layer {best_mc_d2d_layer} (acc={mc_answer_results[best_mc_d2d_layer]['d2d_accuracy']:.3f})")
     print(f"  Best D→M: Layer {best_mc_d2m_layer} (acc={mc_answer_results[best_mc_d2m_layer]['d2m_accuracy']:.3f})")
     print(f"  Chance: 0.250 (4-class)")
+
+    # Save MC answer directions for ablation experiments
+    # Use metric-independent prefix since MC answer directions don't depend on which metric we're analyzing
+    mc_directions_prefix = get_directions_prefix(metric=None)
+    mc_directions_data = {
+        f"layer_{layer_idx}": direction
+        for layer_idx, direction in mc_directions.items()
+    }
+    mc_directions_data["_metadata_metric"] = np.array("mc_answer")
+    mc_directions_data["_metadata_dataset"] = np.array(DATASET_NAME)
+    mc_directions_data["_metadata_model"] = np.array(BASE_MODEL_NAME)
+    mc_directions_path = f"{mc_directions_prefix}_mc_answer_directions.npz"
+    np.savez_compressed(mc_directions_path, **mc_directions_data)
+    print(f"Saved MC answer directions to {mc_directions_path}")
 
     # Behavioral analysis (uses selected METRIC for correlation with stated confidence)
     behavioral = analyze_behavioral_introspection(
