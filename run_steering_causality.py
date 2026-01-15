@@ -1,18 +1,22 @@
 """
-Ablation causality test for uncertainty directions.
+Steering causality test for uncertainty directions.
 
-Tests whether directions from identify_mc_correlate.py are causally necessary
-for the model's meta-judgments. If ablating a direction degrades the correlation
-between stated confidence and actual uncertainty, that's evidence the direction
-is causally involved in introspection.
+Tests whether directions from identify_mc_correlate.py are causally SUFFICIENT
+for the model's meta-judgments. If steering along the direction shifts stated
+confidence in the expected direction, that's evidence the direction captures
+information the model uses for introspection.
+
+Complements ablation (run_ablation_causality.py) which tests NECESSITY.
 
 Key features:
 - Tests ALL layers by default (no pre-filtering by transfer R²)
 - Tests BOTH probe and mean_diff methods in a single run for comparison
 - Uses pooled null distribution + FDR correction for robust statistics
+- KV cache optimization for efficiency
+- Batched multiplier sweeps
 
 Usage:
-    python run_ablation_causality.py
+    python run_steering_causality.py
 
 Expects outputs from identify_mc_correlate.py:
     outputs/{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz
@@ -28,7 +32,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
-from scipy.stats import pearsonr, spearmanr
 
 from core.model_utils import (
     load_model_and_tokenizer,
@@ -39,14 +42,13 @@ from core.model_utils import (
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
     SteeringExperimentConfig,
-    BatchAblationHook,
+    BatchSteeringHook,
     pretokenize_prompts,
     build_padded_gpu_batches,
     get_kv_cache,
     create_fresh_cache,
-    precompute_direction_tensors,
 )
-from core.metrics import metric_sign_for_confidence
+# Note: metric_sign_for_confidence exists in core.metrics but we use get_expected_slope_sign locally
 from tasks import (
     format_stated_confidence_prompt,
     get_stated_confidence_signal,
@@ -62,25 +64,26 @@ from tasks import (
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC"
-METRIC = "top_logit"  # Which metric's directions to test
+METRIC = "entropy"  # Which metric's directions to test
 META_TASK = "confidence"  # "confidence" or "delegate"
 
 # Experiment settings
+STEERING_MULTIPLIERS = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
 NUM_QUESTIONS = 100  # How many questions to test
 NUM_CONTROLS = 25    # Random orthogonal directions per layer for null distribution
 BATCH_SIZE = 8
 SEED = 42
 
-# Expanded batch target for batched ablation.
-# When ablating k directions (1 primary + NUM_CONTROLS), we expand each base batch by k.
-# This sets the TARGET total expanded batch size (base_batch * directions_per_pass).
-# Higher values = better GPU utilization but more memory.
-# With NUM_CONTROLS=25 (26 total) and EXPANDED_BATCH_TARGET=52, base batch = 2, we do 26 in one pass.
-# Set to None to disable batched ablation (run each direction separately).
-EXPANDED_BATCH_TARGET = 52
+# Expanded batch target for batched steering.
+# When steering with k multipliers (excluding 0), we expand each base batch by k.
+# This sets the TARGET total expanded batch size.
+EXPANDED_BATCH_TARGET = 48
 
 # Optional: specify layers to test (None = all layers from directions file)
 LAYERS = None  # e.g., [20, 25, 30] for quick testing
+
+# Optional: specify which direction methods to test (None = both probe and mean_diff)
+METHODS = None  # e.g., ["mean_diff"] or ["probe"] to test just one
 
 # Quantization (for large models)
 LOAD_IN_4BIT = False
@@ -190,11 +193,29 @@ def get_options(meta_task: str) -> List[str]:
         raise ValueError(f"Unknown meta_task: {meta_task}")
 
 
+def get_expected_slope_sign(metric: str) -> int:
+    """
+    Get the expected sign of the confidence slope for a given metric.
+
+    The direction points toward *increasing* the metric value.
+    - entropy: HIGH = uncertain -> steering +direction should DECREASE confidence -> slope < 0
+    - logit_gap, top_prob, margin, top_logit: HIGH = confident -> slope > 0
+
+    Returns:
+        +1 if +direction should increase confidence
+        -1 if +direction should decrease confidence
+    """
+    if metric == "entropy":
+        return -1  # +direction = more uncertain = less confident
+    else:
+        return +1  # +direction = more confident
+
+
 # =============================================================================
-# ABLATION EXPERIMENT
+# STEERING EXPERIMENT
 # =============================================================================
 
-def run_ablation_for_method(
+def run_steering_for_method(
     model,
     tokenizer,
     questions: List[Dict],
@@ -202,16 +223,16 @@ def run_ablation_for_method(
     directions: Dict[int, np.ndarray],
     num_controls: int,
     meta_task: str,
+    multipliers: List[float],
     use_chat_template: bool,
     layers: Optional[List[int]] = None,
 ) -> Dict:
     """
-    Run ablation experiment for a single direction method.
+    Run steering experiment for a single direction method.
 
-    Uses batched ablation when EXPANDED_BATCH_TARGET is set: multiple directions
-    are ablated in a single forward pass by expanding the batch.
+    Uses KV cache and batched multipliers for efficiency.
 
-    Returns dict with per-layer results including baseline, ablated, and controls.
+    Returns dict with per-layer results for each multiplier.
     """
     if layers is None:
         layers = sorted(directions.keys())
@@ -220,11 +241,6 @@ def run_ablation_for_method(
 
     if not layers:
         return {"error": "No layers to test"}
-
-    metric_mean = float(np.mean(metric_values))
-    metric_std = float(np.std(metric_values))
-    if metric_std < 1e-10:
-        metric_std = 1.0
 
     # Get formatting functions and options
     format_fn = get_format_fn(meta_task)
@@ -249,7 +265,17 @@ def run_ablation_for_method(
         mappings.append(mapping)
 
     cached_inputs = pretokenize_prompts(prompts, tokenizer, DEVICE)
-    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, BATCH_SIZE)
+
+    # Calculate effective batch size based on multiplier expansion
+    # When batching k multipliers together, each base batch expands by k
+    # So we need to limit base batch size to keep expanded batch within target
+    # BATCH_SIZE acts as a safety cap (max base batch regardless of target)
+    nonzero_multipliers = [m for m in multipliers if m != 0.0]
+    k_mult = len(nonzero_multipliers)
+    effective_batch_size = max(1, min(BATCH_SIZE, EXPANDED_BATCH_TARGET // k_mult)) if k_mult > 0 else BATCH_SIZE
+    print(f"  Batch sizing: k_mult={k_mult}, effective_batch={effective_batch_size} (expanded={effective_batch_size * k_mult})")
+
+    gpu_batches = build_padded_gpu_batches(cached_inputs, tokenizer, DEVICE, effective_batch_size)
 
     # Generate control directions for each layer
     print(f"  Generating {num_controls} control directions per layer...")
@@ -265,47 +291,34 @@ def run_ablation_for_method(
     for layer in layers:
         dir_tensor = torch.tensor(directions[layer], dtype=dtype, device=DEVICE)
         ctrl_tensors = [torch.tensor(c, dtype=dtype, device=DEVICE) for c in controls_by_layer[layer]]
-        # Stack all directions: [primary, control_0, control_1, ..., control_N-1]
-        all_dirs = torch.stack([dir_tensor] + ctrl_tensors, dim=0)  # (1 + num_controls, hidden_dim)
         cached_directions[layer] = {
             "direction": dir_tensor,
             "controls": ctrl_tensors,
-            "all_stacked": all_dirs,
         }
 
-    # Initialize results
+    # Initialize results storage
+    # Structure: layer -> {"baseline": [...], "steered": {mult: [...]}, "controls": {ctrl_i: {mult: [...]}}}
     baseline_results = [None] * len(questions)
     layer_results = {}
     for layer in layers:
         layer_results[layer] = {
-            "baseline": baseline_results,
-            "ablated": [None] * len(questions),
-            "controls_ablated": {f"control_{i}": [None] * len(questions) for i in range(num_controls)}
+            "baseline": baseline_results,  # Shared across layers
+            "steered": {m: [None] * len(questions) for m in multipliers},
+            "controls": {
+                f"control_{i}": {m: [None] * len(questions) for m in multipliers}
+                for i in range(num_controls)
+            },
         }
+        # Link multiplier 0 to baseline
+        layer_results[layer]["steered"][0.0] = baseline_results
+        for ctrl_key in layer_results[layer]["controls"]:
+            layer_results[layer]["controls"][ctrl_key][0.0] = baseline_results
 
-    # Determine batching strategy
-    total_directions = 1 + num_controls  # primary + controls
-    if EXPANDED_BATCH_TARGET is not None and EXPANDED_BATCH_TARGET > 0:
-        # Batch multiple directions together
-        # directions_per_pass = how many directions we can fit given EXPANDED_BATCH_TARGET
-        # We want: base_batch_size * directions_per_pass <= EXPANDED_BATCH_TARGET
-        directions_per_pass = max(1, EXPANDED_BATCH_TARGET // BATCH_SIZE)
-        # Don't exceed total directions
-        directions_per_pass = min(directions_per_pass, total_directions)
-        use_batched = directions_per_pass > 1
-    else:
-        directions_per_pass = 1
-        use_batched = False
-
-    if use_batched:
-        num_passes = (total_directions + directions_per_pass - 1) // directions_per_pass
-        print(f"  Batched ablation: {directions_per_pass} directions per pass, {num_passes} passes per layer")
-        total_forward_passes = len(gpu_batches) * len(layers) * num_passes
-    else:
-        print(f"  Sequential ablation: 1 direction per pass")
-        total_forward_passes = len(gpu_batches) * len(layers) * total_directions
-
+    # Calculate total forward passes for progress tracking
+    # Per batch: 1 baseline + layers * (1 introspection + num_controls) for all multipliers batched
+    total_forward_passes = len(gpu_batches) * (1 + len(layers) * (1 + num_controls))
     print(f"  Total forward passes: {total_forward_passes}")
+    print(f"  Processing {len(gpu_batches)} batches, {k_mult} multipliers batched per pass...")
 
     pbar = tqdm(total=total_forward_passes, desc="  Forward passes")
 
@@ -324,7 +337,7 @@ def run_ablation_for_method(
         if "position_ids" in base_step_data:
             inputs_template["position_ids"] = base_step_data["position_ids"]
 
-        # Compute baseline (no ablation)
+        # Compute baseline (no steering) - shared across all layers
         if baseline_results[batch_indices[0]] is None:
             fresh_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
             baseline_inputs = inputs_template.copy()
@@ -347,116 +360,80 @@ def run_ablation_for_method(
                     "metric": float(m_val),
                 }
 
-        # Run ablation for each layer
+        pbar.update(1)
+
+        # Prepare expanded inputs for batched multiplier sweep
+        expanded_input_ids = inputs_template["input_ids"].repeat_interleave(k_mult, dim=0)
+        expanded_attention_mask = inputs_template["attention_mask"].repeat_interleave(k_mult, dim=0)
+        expanded_inputs_template = {
+            "input_ids": expanded_input_ids,
+            "attention_mask": expanded_attention_mask,
+            "use_cache": True
+        }
+        if "position_ids" in inputs_template:
+            expanded_inputs_template["position_ids"] = inputs_template["position_ids"].repeat_interleave(k_mult, dim=0)
+
+        # Run steering for each layer
         for layer in layers:
             if hasattr(model, 'get_base_model'):
                 layer_module = model.get_base_model().model.layers[layer]
             else:
                 layer_module = model.model.layers[layer]
 
-            all_dirs = cached_directions[layer]["all_stacked"]  # (total_directions, hidden_dim)
+            direction_tensor = cached_directions[layer]["direction"]
+            control_tensors = cached_directions[layer]["controls"]
 
-            hook = BatchAblationHook()
+            hook = BatchSteeringHook()
             hook.register(layer_module)
 
-            try:
-                if use_batched:
-                    # Process directions in batched passes
-                    for pass_start in range(0, total_directions, directions_per_pass):
-                        pass_end = min(pass_start + directions_per_pass, total_directions)
-                        k_dirs = pass_end - pass_start  # directions in this pass
+            def run_batched_sweep(dir_vec, result_dict):
+                """Run all multipliers for a direction in one pass."""
+                # Create fresh cache expanded for this pass
+                pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=k_mult)
 
-                        # Expand inputs for this pass
-                        expanded_input_ids = inputs_template["input_ids"].repeat_interleave(k_dirs, dim=0)
-                        expanded_attention_mask = inputs_template["attention_mask"].repeat_interleave(k_dirs, dim=0)
-                        expanded_inputs = {
-                            "input_ids": expanded_input_ids,
-                            "attention_mask": expanded_attention_mask,
-                            "use_cache": True
+                # Attach cache to inputs
+                current_inputs = expanded_inputs_template.copy()
+                current_inputs["past_key_values"] = pass_cache
+
+                # Build delta tensor: for each question in batch, apply each multiplier
+                # Shape: (B * k_mult, hidden_dim)
+                deltas = []
+                for _ in range(B):
+                    for mult in nonzero_multipliers:
+                        deltas.append(dir_vec * mult)
+                delta_bh = torch.stack(deltas, dim=0)
+                hook.set_delta(delta_bh)
+
+                # Run model
+                with torch.inference_mode():
+                    out = model(**current_inputs)
+                    logits = out.logits[:, -1, :][:, option_token_ids]
+                    probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+
+                # Store results
+                for i, q_idx in enumerate(batch_indices):
+                    for j, mult in enumerate(nonzero_multipliers):
+                        idx = i * k_mult + j
+                        p = probs[idx]
+                        resp = options[np.argmax(p)]
+                        conf = signal_fn(p, mappings[q_idx])
+                        m_val = metric_values[q_idx]
+                        result_dict[mult][q_idx] = {
+                            "question_idx": q_idx,
+                            "response": resp,
+                            "confidence": float(conf),
+                            "metric": float(m_val),
                         }
-                        if "position_ids" in inputs_template:
-                            expanded_inputs["position_ids"] = inputs_template["position_ids"].repeat_interleave(k_dirs, dim=0)
 
-                        # Create expanded cache
-                        pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=k_dirs)
-                        expanded_inputs["past_key_values"] = pass_cache
+            try:
+                # Introspection direction
+                run_batched_sweep(direction_tensor, layer_results[layer]["steered"])
+                pbar.update(1)
 
-                        # Build directions tensor: for each question, apply each direction in pass
-                        # Shape: (B * k_dirs, hidden_dim)
-                        dirs_for_pass = all_dirs[pass_start:pass_end]  # (k_dirs, hidden_dim)
-                        # Tile: for each of B questions, repeat the k_dirs directions
-                        dirs_batch = dirs_for_pass.unsqueeze(0).expand(B, -1, -1).reshape(B * k_dirs, -1)
-                        hook.set_directions(dirs_batch)
-
-                        # Run model
-                        with torch.inference_mode():
-                            out = model(**expanded_inputs)
-                            logits = out.logits[:, -1, :][:, option_token_ids]
-                            probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-
-                        # Store results
-                        for i, q_idx in enumerate(batch_indices):
-                            for j in range(k_dirs):
-                                dir_idx = pass_start + j  # global direction index
-                                prob_idx = i * k_dirs + j
-                                p = probs[prob_idx]
-                                resp = options[np.argmax(p)]
-                                conf = signal_fn(p, mappings[q_idx])
-                                m_val = metric_values[q_idx]
-                                data = {
-                                    "question_idx": q_idx,
-                                    "response": resp,
-                                    "confidence": float(conf),
-                                    "metric": float(m_val),
-                                }
-
-                                if dir_idx == 0:
-                                    # Primary direction
-                                    layer_results[layer]["ablated"][q_idx] = data
-                                else:
-                                    # Control direction
-                                    ctrl_key = f"control_{dir_idx - 1}"
-                                    layer_results[layer]["controls_ablated"][ctrl_key][q_idx] = data
-
-                        pbar.update(1)
-
-                else:
-                    # Sequential: one direction per forward pass
-                    def run_single_ablation(direction_tensor, result_list, key=None):
-                        pass_cache = create_fresh_cache(keys_snapshot, values_snapshot, expand_size=1)
-                        current_inputs = inputs_template.copy()
-                        current_inputs["past_key_values"] = pass_cache
-
-                        dirs_batch = direction_tensor.unsqueeze(0).expand(B, -1)
-                        hook.set_directions(dirs_batch)
-
-                        with torch.inference_mode():
-                            out = model(**current_inputs)
-                            logits = out.logits[:, -1, :][:, option_token_ids]
-                            probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-
-                        for i, q_idx in enumerate(batch_indices):
-                            p = probs[i]
-                            resp = options[np.argmax(p)]
-                            conf = signal_fn(p, mappings[q_idx])
-                            m_val = metric_values[q_idx]
-                            data = {
-                                "question_idx": q_idx,
-                                "response": resp,
-                                "confidence": float(conf),
-                                "metric": float(m_val),
-                            }
-                            if key:
-                                result_list[key][q_idx] = data
-                            else:
-                                result_list[q_idx] = data
-                        pbar.update(1)
-
-                    # Ablate primary direction
-                    run_single_ablation(cached_directions[layer]["direction"], layer_results[layer]["ablated"])
-                    # Ablate each control direction
-                    for i_c, ctrl_dir in enumerate(cached_directions[layer]["controls"]):
-                        run_single_ablation(ctrl_dir, layer_results[layer]["controls_ablated"], key=f"control_{i_c}")
+                # Control directions
+                for i_c, ctrl_dir in enumerate(control_tensors):
+                    run_batched_sweep(ctrl_dir, layer_results[layer]["controls"][f"control_{i_c}"])
+                    pbar.update(1)
 
             finally:
                 hook.remove()
@@ -467,6 +444,7 @@ def run_ablation_for_method(
     pbar.close()
     return {
         "layers": layers,
+        "multipliers": multipliers,
         "num_questions": len(questions),
         "num_controls": num_controls,
         "layer_results": layer_results,
@@ -484,68 +462,89 @@ def compute_correlation(confidences: np.ndarray, metric_values: np.ndarray) -> f
     return float(np.corrcoef(confidences, metric_values)[0, 1])
 
 
-def analyze_ablation_results(results: Dict, metric: str) -> Dict:
+def compute_slope(confidences_by_mult: Dict[float, List[Dict]], multipliers: List[float]) -> float:
+    """Compute confidence slope across multipliers."""
+    mean_confs = []
+    for mult in multipliers:
+        confs = [r["confidence"] for r in confidences_by_mult[mult]]
+        mean_confs.append(np.mean(confs))
+
+    # Linear fit: conf = slope * mult + intercept
+    slope, _ = np.polyfit(multipliers, mean_confs, 1)
+    return float(slope)
+
+
+def analyze_steering_results(results: Dict, metric: str) -> Dict:
     """
-    Compute ablation effect statistics with pooled null + FDR correction.
+    Compute steering effect statistics with pooled null + FDR correction.
 
     Returns analysis dict with per-layer stats and summary.
     """
     layers = results["layers"]
+    multipliers = results["multipliers"]
     num_controls = results["num_controls"]
 
-    # Get metric sign (for interpretation)
-    metric_sign = metric_sign_for_confidence(metric)
+    # Get expected slope sign for interpretation
+    expected_sign = get_expected_slope_sign(metric)
 
     analysis = {
         "layers": layers,
+        "multipliers": multipliers,
         "num_questions": results["num_questions"],
         "num_controls": num_controls,
         "metric": metric,
-        "metric_sign": metric_sign,
+        "expected_slope_sign": expected_sign,
         "per_layer": {},
     }
 
-    # First pass: collect all control effects for pooled null
-    all_control_corr_changes = []
+    # First pass: collect all control slopes for pooled null
+    all_control_slopes = []
     layer_data = {}
 
     for layer in layers:
         lr = results["layer_results"][layer]
 
-        # Extract data
+        # Compute baseline correlation
         baseline_conf = np.array([r["confidence"] for r in lr["baseline"]])
         baseline_metric = np.array([r["metric"] for r in lr["baseline"]])
-        ablated_conf = np.array([r["confidence"] for r in lr["ablated"]])
-        ablated_metric = np.array([r["metric"] for r in lr["ablated"]])
-
-        # Compute correlations
         baseline_corr = compute_correlation(baseline_conf, baseline_metric)
-        ablated_corr = compute_correlation(ablated_conf, ablated_metric)
 
-        # Control ablations
-        control_corrs = []
-        for ctrl_key in lr["controls_ablated"]:
-            ctrl_conf = np.array([r["confidence"] for r in lr["controls_ablated"][ctrl_key]])
-            ctrl_metric = np.array([r["metric"] for r in lr["controls_ablated"][ctrl_key]])
-            control_corrs.append(compute_correlation(ctrl_conf, ctrl_metric))
+        # Compute introspection slope
+        intro_slope = compute_slope(lr["steered"], multipliers)
 
-        corr_change = ablated_corr - baseline_corr
-        control_corr_changes = [c - baseline_corr for c in control_corrs]
+        # Compute control slopes
+        control_slopes = []
+        for ctrl_key in lr["controls"]:
+            ctrl_slope = compute_slope(lr["controls"][ctrl_key], multipliers)
+            control_slopes.append(ctrl_slope)
 
-        all_control_corr_changes.extend(control_corr_changes)
+        all_control_slopes.extend(control_slopes)
+
+        # Get mean confidence at each multiplier for plotting
+        intro_mean_conf_by_mult = {}
+        ctrl_mean_conf_by_mult = {}
+        for mult in multipliers:
+            intro_confs = [r["confidence"] for r in lr["steered"][mult]]
+            intro_mean_conf_by_mult[mult] = float(np.mean(intro_confs))
+
+            # Average across all controls
+            all_ctrl_confs = []
+            for ctrl_key in lr["controls"]:
+                all_ctrl_confs.extend([r["confidence"] for r in lr["controls"][ctrl_key][mult]])
+            ctrl_mean_conf_by_mult[mult] = float(np.mean(all_ctrl_confs))
 
         layer_data[layer] = {
             "baseline_corr": baseline_corr,
             "baseline_conf_mean": float(np.mean(baseline_conf)),
-            "ablated_corr": ablated_corr,
-            "ablated_conf_mean": float(np.mean(ablated_conf)),
-            "corr_change": corr_change,
-            "control_corrs": control_corrs,
-            "control_corr_changes": control_corr_changes,
+            "intro_slope": intro_slope,
+            "control_slopes": control_slopes,
+            "intro_mean_conf_by_mult": intro_mean_conf_by_mult,
+            "ctrl_mean_conf_by_mult": ctrl_mean_conf_by_mult,
         }
 
     # Convert pooled null to array
-    pooled_null = np.array(all_control_corr_changes)
+    pooled_null = np.array(all_control_slopes)
+    pooled_null_abs = np.abs(pooled_null)
 
     # Second pass: compute p-values
     raw_p_values = []
@@ -553,34 +552,43 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
     for layer in layers:
         ld = layer_data[layer]
 
-        # Per-layer statistics
-        ctrl_mean = float(np.mean(ld["control_corr_changes"]))
-        ctrl_std = float(np.std(ld["control_corr_changes"]))
+        intro_slope = ld["intro_slope"]
+        intro_slope_abs = abs(intro_slope)
+        control_slopes = np.array(ld["control_slopes"])
 
-        # Pooled p-value: two-tailed test (how many controls have |effect| >= |ours|)
-        n_pooled_worse = np.sum(np.abs(pooled_null) >= np.abs(ld["corr_change"]))
-        p_value_pooled = (n_pooled_worse + 1) / (len(pooled_null) + 1)
+        # Per-layer statistics
+        ctrl_mean = float(np.mean(control_slopes))
+        ctrl_std = float(np.std(control_slopes))
+
+        # Pooled p-value: two-tailed test (how many controls have |slope| >= |ours|)
+        n_pooled_larger = np.sum(pooled_null_abs >= intro_slope_abs)
+        p_value_pooled = (n_pooled_larger + 1) / (len(pooled_null) + 1)
 
         # Effect size (Z-score vs controls)
-        if ctrl_std > 1e-10:
-            effect_size_z = (ld["corr_change"] - ctrl_mean) / ctrl_std
+        ctrl_abs_mean = float(np.mean(np.abs(control_slopes)))
+        ctrl_abs_std = float(np.std(np.abs(control_slopes)))
+        if ctrl_abs_std > 1e-10:
+            effect_size_z = (intro_slope_abs - ctrl_abs_mean) / ctrl_abs_std
         else:
             effect_size_z = 0.0
+
+        # Check if sign matches expected
+        actual_sign = 1 if intro_slope > 0 else -1 if intro_slope < 0 else 0
+        sign_matches = (actual_sign == expected_sign)
 
         raw_p_values.append((layer, p_value_pooled))
 
         analysis["per_layer"][layer] = {
             "baseline_correlation": ld["baseline_corr"],
             "baseline_confidence_mean": ld["baseline_conf_mean"],
-            "ablated_correlation": ld["ablated_corr"],
-            "ablated_confidence_mean": ld["ablated_conf_mean"],
-            "correlation_change": ld["corr_change"],
-            "control_correlation_mean": float(np.mean(ld["control_corrs"])),
-            "control_correlation_std": float(np.std(ld["control_corrs"])),
-            "control_correlation_change_mean": ctrl_mean,
-            "control_correlation_change_std": ctrl_std,
+            "introspection_slope": intro_slope,
+            "control_slope_mean": ctrl_mean,
+            "control_slope_std": ctrl_std,
             "p_value_pooled": float(p_value_pooled),
             "effect_size_z": float(effect_size_z),
+            "sign_matches_expected": sign_matches,
+            "intro_mean_conf_by_mult": ld["intro_mean_conf_by_mult"],
+            "ctrl_mean_conf_by_mult": ld["ctrl_mean_conf_by_mult"],
         }
 
     # FDR correction (Benjamini-Hochberg)
@@ -605,8 +613,11 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
     # Summary
     significant_pooled = [l for l in layers if analysis["per_layer"][l]["p_value_pooled"] < 0.05]
     significant_fdr = [l for l in layers if analysis["per_layer"][l]["p_value_fdr"] < 0.05]
+    sign_correct_fdr = [l for l in significant_fdr if analysis["per_layer"][l]["sign_matches_expected"]]
+    sign_correct_pooled = [l for l in significant_pooled if analysis["per_layer"][l]["sign_matches_expected"]]
 
-    # Best layer by effect size magnitude (most extreme effect in either direction)
+    # Best layer by effect size Z (slope relative to control variance)
+    # This matches ablation's approach and avoids noisy early layers
     best_layer = max(layers, key=lambda l: abs(analysis["per_layer"][l]["effect_size_z"]))
 
     analysis["summary"] = {
@@ -615,7 +626,12 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
         "significant_layers_fdr": significant_fdr,
         "n_significant_pooled": len(significant_pooled),
         "n_significant_fdr": len(significant_fdr),
+        "sign_correct_layers_fdr": sign_correct_fdr,
+        "sign_correct_layers_pooled": sign_correct_pooled,
+        "n_sign_correct_fdr": len(sign_correct_fdr),
+        "n_sign_correct_pooled": len(sign_correct_pooled),
         "best_layer": best_layer,
+        "best_slope": analysis["per_layer"][best_layer]["introspection_slope"],
         "best_effect_z": analysis["per_layer"][best_layer]["effect_size_z"],
     }
 
@@ -626,129 +642,153 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
 # VISUALIZATION
 # =============================================================================
 
-def plot_ablation_results(analysis: Dict, method: str, output_path: Path):
+def plot_steering_results(analysis: Dict, method: str, output_path: Path):
     """
-    Create 3-panel ablation visualization for a single method.
+    Create 3-panel steering visualization for a single method.
     """
     layers = analysis["layers"]
+    multipliers = analysis["multipliers"]
 
     if not layers:
         print(f"  Skipping plot for {method} - no layers")
         return
 
     fig, axes = plt.subplots(3, 1, figsize=(20, 14))
-    fig.suptitle(f"Ablation Results: {method.upper()} directions ({analysis['metric']})", fontsize=14)
+    fig.suptitle(f"Steering Results: {method.upper()} directions ({analysis['metric']})", fontsize=14)
 
     x = np.arange(len(layers))
+    expected_sign = analysis["expected_slope_sign"]
+    sign_str = "negative" if expected_sign < 0 else "positive"
 
-    # Panel 1: Absolute correlations
+    # Panel 1: Confidence slope by layer (line plot)
     ax1 = axes[0]
-    baseline_corrs = np.array([analysis["per_layer"][l]["baseline_correlation"] for l in layers])
-    ablated_corrs = np.array([analysis["per_layer"][l]["ablated_correlation"] for l in layers])
-    ctrl_corrs = np.array([analysis["per_layer"][l]["control_correlation_mean"] for l in layers])
-    ctrl_corr_stds = np.array([analysis["per_layer"][l]["control_correlation_std"] for l in layers])
+    intro_slopes = np.array([analysis["per_layer"][l]["introspection_slope"] for l in layers])
+    ctrl_slopes = np.array([analysis["per_layer"][l]["control_slope_mean"] for l in layers])
+    ctrl_stds = np.array([analysis["per_layer"][l]["control_slope_std"] for l in layers])
+    p_values_pooled = [analysis["per_layer"][l]["p_value_pooled"] for l in layers]
+    sign_correct = [analysis["per_layer"][l]["sign_matches_expected"] for l in layers]
 
-    # Smaller markers, thinner lines for 80 layers
-    ax1.plot(x, baseline_corrs, '-', label='Baseline', color='blue', linewidth=1.5, marker='o', markersize=3)
-    ax1.plot(x, ablated_corrs, '-', label=f'{method} ablated', color='red', linewidth=1.5, marker='s', markersize=3)
-    # Control with ±1 SD band (SD of control correlations, not changes)
-    ax1.plot(x, ctrl_corrs, '--', label='Control ablated (mean)', color='gray', linewidth=1, alpha=0.8)
-    ax1.fill_between(x, ctrl_corrs - ctrl_corr_stds, ctrl_corrs + ctrl_corr_stds,
+    # Plot control band
+    ax1.fill_between(x, ctrl_slopes - ctrl_stds, ctrl_slopes + ctrl_stds,
                      color='gray', alpha=0.2, label='Control ±1σ')
+    ax1.plot(x, ctrl_slopes, '--', color='gray', linewidth=1, alpha=0.8, label='Control mean')
 
-    ax1.axhline(y=0, color='black', linestyle=':', alpha=0.3)
+    # Plot introspection line
+    ax1.plot(x, intro_slopes, '-', color='blue', linewidth=1.5, alpha=0.8, label=f'{method}')
+
+    # Mark significant layers (pooled p < 0.05), colored by sign correctness
+    sig_correct_x = [i for i, (p, sc) in enumerate(zip(p_values_pooled, sign_correct)) if p < 0.05 and sc]
+    sig_wrong_x = [i for i, (p, sc) in enumerate(zip(p_values_pooled, sign_correct)) if p < 0.05 and not sc]
+
+    if sig_correct_x:
+        ax1.scatter(sig_correct_x, [intro_slopes[i] for i in sig_correct_x],
+                   color='green', s=40, zorder=5, edgecolor='black', linewidth=0.5, label='Sig + correct sign')
+    if sig_wrong_x:
+        ax1.scatter(sig_wrong_x, [intro_slopes[i] for i in sig_wrong_x],
+                   color='red', s=40, zorder=5, edgecolor='black', linewidth=0.5, label='Sig + wrong sign')
+
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=1)
     ax1.set_xticks(x)
     ax1.set_xticklabels(layers)
     ax1.set_xlabel("Layer")
-    ax1.set_ylabel("Correlation (confidence vs metric)")
-    ax1.set_title("Correlation by Condition")
+    ax1.set_ylabel("Confidence Slope (Δconf / Δmult)")
+    ax1.set_title(f"Confidence Slope by Layer (expected slope: {sign_str})")
     ax1.legend(loc='best', fontsize=9)
     ax1.grid(True, alpha=0.3)
 
-    # Auto-zoom y-axis to data range with padding
-    all_vals = np.concatenate([baseline_corrs, ablated_corrs, ctrl_corrs - ctrl_corr_stds, ctrl_corrs + ctrl_corr_stds])
-    ymin, ymax = np.min(all_vals), np.max(all_vals)
-    padding = (ymax - ymin) * 0.1
-    ax1.set_ylim(ymin - padding, ymax + padding)
-
-    # Panel 2: Effect size with significance and CIs
+    # Panel 2: Confidence vs multiplier for all significant layers (sorted by effect size)
     ax2 = axes[1]
-    effect_sizes = [analysis["per_layer"][l]["effect_size_z"] for l in layers]
-    p_values_fdr = [analysis["per_layer"][l]["p_value_fdr"] for l in layers]
 
-    colors = ['red' if p < 0.05 else 'orange' if p < 0.1 else 'gray' for p in p_values_fdr]
-    bars = ax2.bar(x, effect_sizes, color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    # Get significant layers sorted by effect size (descending)
+    sig_layers = [l for l in layers if analysis["per_layer"][l]["p_value_pooled"] < 0.05]
+    sig_layers_sorted = sorted(sig_layers, key=lambda l: abs(analysis["per_layer"][l]["effect_size_z"]), reverse=True)
 
-    # Add error bars showing ±1 SD of control distribution (in Z-score units, this is ±1)
-    ax2.errorbar(x, effect_sizes, yerr=1.0, fmt='none', ecolor='black', capsize=2, alpha=0.4, linewidth=1)
+    # Use a colormap for different layers
+    if sig_layers_sorted:
+        cmap = plt.cm.viridis
+        colors_for_layers = [cmap(i / max(1, len(sig_layers_sorted) - 1)) for i in range(len(sig_layers_sorted))]
 
-    ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(layers)
-    ax2.set_xlabel("Layer")
-    ax2.set_ylabel("Effect Size (Z-score)")
-    ax2.set_title("Effect Size vs Controls (error bars = ±1 SD of null)")
-    ax2.grid(True, alpha=0.3, axis='y')
+        for idx, layer in enumerate(sig_layers_sorted):
+            layer_data = analysis["per_layer"][layer]
+            intro_conf_by_mult = layer_data["intro_mean_conf_by_mult"]
+            intro_confs = [intro_conf_by_mult[m] for m in multipliers]
 
-    legend_elements = [
-        Patch(facecolor='red', alpha=0.7, edgecolor='black', label='p < 0.05 (FDR)'),
-        Patch(facecolor='orange', alpha=0.7, edgecolor='black', label='p < 0.10 (FDR)'),
-        Patch(facecolor='gray', alpha=0.7, edgecolor='black', label='n.s.'),
-    ]
-    ax2.legend(handles=legend_elements, loc='best', fontsize=9)
+            # Mark whether sign is correct
+            sign_marker = "+" if layer_data["sign_matches_expected"] else "-"
+            effect_z = layer_data["effect_size_z"]
+
+            ax2.plot(multipliers, intro_confs, 'o-',
+                    label=f'L{layer} (Z={effect_z:+.1f}) {sign_marker}',
+                    linewidth=1.5, color=colors_for_layers[idx], markersize=4, alpha=0.8)
+
+        # Plot average control for reference (from best layer)
+        best_layer = analysis["summary"]["best_layer"]
+        ctrl_conf_by_mult = analysis["per_layer"][best_layer]["ctrl_mean_conf_by_mult"]
+        ctrl_confs = [ctrl_conf_by_mult[m] for m in multipliers]
+        ax2.plot(multipliers, ctrl_confs, 's--', label='Control avg', linewidth=2, color='gray', alpha=0.5, markersize=4)
+
+        ax2.axvline(x=0, color='black', linestyle='--', alpha=0.3)
+        ax2.set_xlabel("Steering Multiplier")
+        ax2.set_ylabel("Mean Confidence")
+        ax2.set_title(f"Confidence vs Multiplier - {len(sig_layers_sorted)} Significant Layers (sorted by |Z|)")
+        ax2.legend(loc='best', fontsize=8, ncol=2 if len(sig_layers_sorted) > 6 else 1)
+        ax2.grid(True, alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, "No significant layers found", ha='center', va='center', fontsize=12)
+        ax2.set_title("Confidence vs Multiplier - No Significant Layers")
 
     # Panel 3: Summary text
     ax3 = axes[2]
     ax3.axis('off')
 
     summary = analysis["summary"]
-    baseline_corr = np.mean(baseline_corrs)
+    best_layer = summary["best_layer"]
+    best_stats = analysis["per_layer"][best_layer]
 
     summary_text = f"""
-ABLATION ANALYSIS: {method.upper()}
+STEERING ANALYSIS: {method.upper()}
 
 Metric: {analysis['metric']}
+Expected slope sign: {sign_str} ({"−" if expected_sign < 0 else "+"}direction → {"lower" if expected_sign < 0 else "higher"} confidence)
 Layers tested: {len(layers)}
 Questions: {analysis['num_questions']}
 Controls per layer: {analysis['num_controls']}
 Pooled null size: {summary['pooled_null_size']}
 
 Results:
-  Baseline correlation: {baseline_corr:.4f}
   Significant layers (p<0.05 pooled): {summary['n_significant_pooled']}
   Significant layers (FDR<0.05): {summary['n_significant_fdr']}
+  Sign correct (pooled + expected sign): {summary['n_sign_correct_pooled']}
+  Sign correct (FDR + expected sign): {summary['n_sign_correct_fdr']}
 
-Best layer: {summary['best_layer']}
+Best layer (by |Z|): {summary['best_layer']}
+  Slope: {summary['best_slope']:.4f}
   Effect size (Z): {summary['best_effect_z']:.2f}
-  p-value (FDR): {analysis['per_layer'][summary['best_layer']]['p_value_fdr']:.4f}
-
-Note: Negative Z = ablation decreased correlation
-      (expected if direction is causally necessary)
-      Positive Z = ablation increased correlation
-      (opposite of expected causal effect)
+  p-value (pooled): {best_stats['p_value_pooled']:.4f}
+  p-value (FDR): {best_stats['p_value_fdr']:.4f}
+  Sign correct: {"Yes" if best_stats['sign_matches_expected'] else "No"}
 
 Interpretation:
 """
-    if summary['n_significant_fdr'] > 0:
-        # Check direction of effect
-        best_z = summary['best_effect_z']
-        if best_z < 0 and baseline_corr > 0:
-            direction_text = "Ablation DECREASED correlation (expected causal effect)"
-        elif best_z > 0 and baseline_corr > 0:
-            direction_text = "Ablation INCREASED correlation (opposite of expected)"
-        else:
-            direction_text = f"Effect direction: Z={best_z:.2f}"
-
-        summary_text += f"""  ✓ SIGNIFICANT after FDR correction
-  {summary['n_significant_fdr']} layer(s) show effects beyond
-  random direction ablations.
-  {direction_text}"""
+    if summary['n_sign_correct_fdr'] > 0:
+        summary_text += f"""  ✓ SIGNIFICANT (FDR) with CORRECT SIGN
+  {summary['n_sign_correct_fdr']} layer(s) show steering effects in
+  the expected direction after FDR correction."""
+    elif summary['n_sign_correct_pooled'] > 0:
+        summary_text += f"""  ✓ SIGNIFICANT (pooled) with CORRECT SIGN
+  {summary['n_sign_correct_pooled']} layer(s) show steering effects in
+  the expected direction (nominally significant)."""
+    elif summary['n_significant_fdr'] > 0:
+        summary_text += f"""  ⚠ SIGNIFICANT but WRONG SIGN
+  {summary['n_significant_fdr']} layer(s) show steering effects,
+  but in the opposite direction from expected."""
     elif summary['n_significant_pooled'] > 0:
-        summary_text += """  ⚠ Nominally significant (not FDR-corrected)
-  Suggestive but not definitive evidence."""
+        summary_text += f"""  ⚠ Nominally significant, wrong sign
+  {summary['n_significant_pooled']} layer(s) show effects (not FDR-corrected),
+  but in the opposite direction from expected."""
     else:
         summary_text += """  ✗ No significant effect detected
-  Direction may not be causally involved."""
+  Direction may not be sufficient for steering confidence."""
 
     ax3.text(0.05, 0.95, summary_text, transform=ax3.transAxes, fontsize=10,
              verticalalignment='top', fontfamily='monospace',
@@ -771,34 +811,35 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
 
     # Use layers from first method
     layers = analyses[methods[0]]["layers"]
+    multipliers = analyses[methods[0]]["multipliers"]
 
     fig, axes = plt.subplots(2, 1, figsize=(20, 10))
-    fig.suptitle("Method Comparison: Ablation Effects", fontsize=14)
+    fig.suptitle("Method Comparison: Steering Effects", fontsize=14)
 
     x = np.arange(len(layers))
     colors = {'probe': 'tab:blue', 'mean_diff': 'tab:orange'}
 
-    # Panel 1: Effect sizes by layer (line plot)
+    # Panel 1: Slope curves by layer (line plot)
     ax1 = axes[0]
     for method in methods:
-        effect_sizes = [analyses[method]["per_layer"][l]["effect_size_z"] for l in layers]
-        p_values_fdr = [analyses[method]["per_layer"][l]["p_value_fdr"] for l in layers]
+        slopes = [analyses[method]["per_layer"][l]["introspection_slope"] for l in layers]
+        p_values_pooled = [analyses[method]["per_layer"][l]["p_value_pooled"] for l in layers]
         color = colors.get(method, 'gray')
 
         # Line plot
-        ax1.plot(x, effect_sizes, '-', label=method, color=color, linewidth=1.5, alpha=0.8)
+        ax1.plot(x, slopes, '-', label=method, color=color, linewidth=1.5, alpha=0.8)
 
-        # Mark significant layers with filled markers
-        sig_x = [i for i, p in enumerate(p_values_fdr) if p < 0.05]
-        sig_y = [effect_sizes[i] for i in sig_x]
+        # Mark significant layers with filled markers (pooled p < 0.05)
+        sig_x = [i for i, p in enumerate(p_values_pooled) if p < 0.05]
+        sig_y = [slopes[i] for i in sig_x]
         ax1.scatter(sig_x, sig_y, color=color, s=40, zorder=5, edgecolor='black', linewidth=0.5)
 
     ax1.axhline(y=0, color='black', linestyle='-', linewidth=1)
     ax1.set_xticks(x)
     ax1.set_xticklabels(layers)
     ax1.set_xlabel("Layer")
-    ax1.set_ylabel("Effect Size (Z-score)")
-    ax1.set_title("Effect Size by Method (filled markers = FDR p<0.05)")
+    ax1.set_ylabel("Confidence Slope")
+    ax1.set_title("Confidence Slope by Method (filled markers = pooled p<0.05)")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
@@ -806,17 +847,25 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     ax2 = axes[1]
     ax2.axis('off')
 
+    expected_sign = analyses[methods[0]]["expected_slope_sign"]
+    sign_str = "negative" if expected_sign < 0 else "positive"
+
     comparison_text = "METHOD COMPARISON\n" + "=" * 40 + "\n\n"
+    comparison_text += f"Metric: {analyses[methods[0]]['metric']}\n"
+    comparison_text += f"Expected slope sign: {sign_str}\n\n"
 
     for method in methods:
         summary = analyses[method]["summary"]
         comparison_text += f"{method.upper()}:\n"
+        comparison_text += f"  Significant layers (pooled): {summary['n_significant_pooled']}\n"
         comparison_text += f"  Significant layers (FDR): {summary['n_significant_fdr']}\n"
-        comparison_text += f"  Best layer: {summary['best_layer']} (Z={summary['best_effect_z']:.2f})\n\n"
+        comparison_text += f"  Sign correct (pooled): {summary['n_sign_correct_pooled']}\n"
+        comparison_text += f"  Sign correct (FDR): {summary['n_sign_correct_fdr']}\n"
+        comparison_text += f"  Best layer: {summary['best_layer']} (slope={summary['best_slope']:.4f})\n\n"
 
-    # Winner
-    best_method = max(methods, key=lambda m: analyses[m]["summary"]["n_significant_fdr"])
-    comparison_text += f"Method with more FDR-significant layers: {best_method.upper()}\n"
+    # Winner by sign-correct layers (pooled since FDR may be 0)
+    best_method = max(methods, key=lambda m: analyses[m]["summary"]["n_sign_correct_pooled"])
+    comparison_text += f"Method with most sign-correct layers (pooled): {best_method.upper()}\n"
 
     ax2.text(0.1, 0.9, comparison_text, transform=ax2.transAxes, fontsize=11,
              verticalalignment='top', fontfamily='monospace',
@@ -829,10 +878,17 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
 
 
 def print_summary(analyses: Dict[str, Dict]):
-    """Print summary of ablation results."""
+    """Print summary of steering results."""
     print("\n" + "=" * 70)
-    print("ABLATION CAUSALITY TEST RESULTS")
+    print("STEERING CAUSALITY TEST RESULTS")
     print("=" * 70)
+
+    # Print expected sign info once
+    first_method = list(analyses.keys())[0]
+    expected_sign = analyses[first_method]["expected_slope_sign"]
+    sign_str = "negative" if expected_sign < 0 else "positive"
+    print(f"\nMetric: {analyses[first_method]['metric']}")
+    print(f"Expected slope sign: {sign_str}")
 
     for method, analysis in analyses.items():
         summary = analysis["summary"]
@@ -840,10 +896,12 @@ def print_summary(analyses: Dict[str, Dict]):
         print(f"  Layers tested: {len(analysis['layers'])}")
         print(f"  Significant (pooled p<0.05): {summary['n_significant_pooled']}")
         print(f"  Significant (FDR p<0.05): {summary['n_significant_fdr']}")
-        print(f"  Best layer: {summary['best_layer']} (Z={summary['best_effect_z']:.2f})")
+        print(f"  Sign correct (pooled): {summary['n_sign_correct_pooled']}")
+        print(f"  Sign correct (FDR): {summary['n_sign_correct_fdr']}")
+        print(f"  Best layer: {summary['best_layer']} (slope={summary['best_slope']:.4f}, Z={summary['best_effect_z']:.2f})")
 
-        if summary['significant_layers_fdr']:
-            print(f"  FDR-significant layers: {summary['significant_layers_fdr']}")
+        if summary['sign_correct_layers_pooled']:
+            print(f"  Sign-correct layers (pooled): {summary['sign_correct_layers_pooled'][:10]}{'...' if len(summary['sign_correct_layers_pooled']) > 10 else ''}")
 
 
 # =============================================================================
@@ -852,7 +910,7 @@ def print_summary(analyses: Dict[str, Dict]):
 
 def main():
     print("=" * 70)
-    print("ABLATION CAUSALITY TEST")
+    print("STEERING CAUSALITY TEST")
     print("=" * 70)
     print(f"\nModel: {MODEL}")
     print(f"Input: {INPUT_BASE_NAME}")
@@ -860,12 +918,22 @@ def main():
     print(f"Meta-task: {META_TASK}")
     print(f"Questions: {NUM_QUESTIONS}")
     print(f"Controls per layer: {NUM_CONTROLS}")
+    print(f"Multipliers: {STEERING_MULTIPLIERS}")
 
     # Load directions
     print("\nLoading directions...")
     all_directions = load_directions(INPUT_BASE_NAME, METRIC)
-    methods = list(all_directions.keys())
-    print(f"  Found methods: {methods}")
+    available_methods = list(all_directions.keys())
+    print(f"  Found methods: {available_methods}")
+
+    # Filter to requested methods
+    if METHODS is not None:
+        methods = [m for m in METHODS if m in available_methods]
+        if not methods:
+            raise ValueError(f"None of requested methods {METHODS} found in {available_methods}")
+        print(f"  Using methods: {methods}")
+    else:
+        methods = available_methods
 
     for method in methods:
         layers = sorted(all_directions[method].keys())
@@ -875,9 +943,7 @@ def main():
     print("\nLoading dataset...")
     dataset = load_dataset(INPUT_BASE_NAME)
     data_items = dataset["data"][:NUM_QUESTIONS]
-    # Extract questions (each item has question, options, correct_answer, etc.)
     questions = data_items
-    # Extract metric values from each item
     metric_values = np.array([item[METRIC] for item in data_items])
     print(f"  Questions: {len(questions)}")
     print(f"  {METRIC}: mean={metric_values.mean():.3f}, std={metric_values.std():.3f}")
@@ -901,16 +967,16 @@ def main():
     print(f"  Use chat template: {use_chat_template}")
     print(f"  Device: {DEVICE}")
 
-    # Run ablation for each method
+    # Run steering for each method
     all_results = {}
     all_analyses = {}
 
     for method in methods:
         print(f"\n{'='*60}")
-        print(f"ABLATION EXPERIMENT: {method.upper()}")
+        print(f"STEERING EXPERIMENT: {method.upper()}")
         print(f"{'='*60}")
 
-        results = run_ablation_for_method(
+        results = run_steering_for_method(
             model=model,
             tokenizer=tokenizer,
             questions=questions,
@@ -918,6 +984,7 @@ def main():
             directions=all_directions[method],
             num_controls=NUM_CONTROLS,
             meta_task=META_TASK,
+            multipliers=STEERING_MULTIPLIERS,
             use_chat_template=use_chat_template,
             layers=test_layers,
         )
@@ -925,16 +992,17 @@ def main():
 
         # Analyze results
         print(f"\n  Analyzing results...")
-        analysis = analyze_ablation_results(results, METRIC)
+        analysis = analyze_steering_results(results, METRIC)
         all_analyses[method] = analysis
 
         summary = analysis["summary"]
         print(f"  Significant layers (FDR): {summary['n_significant_fdr']}")
-        print(f"  Best layer: {summary['best_layer']} (Z={summary['best_effect_z']:.2f})")
+        print(f"  Sign correct (pooled): {summary['n_sign_correct_pooled']}")
+        print(f"  Best layer: {summary['best_layer']} (slope={summary['best_slope']:.4f})")
 
     # Generate output filename
     model_short = get_model_short_name(MODEL)
-    base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_ablation_{META_TASK}_{METRIC}"
+    base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_steering_{META_TASK}_{METRIC}"
 
     # Save JSON results
     print("\nSaving results...")
@@ -948,6 +1016,7 @@ def main():
             "meta_task": META_TASK,
             "num_questions": NUM_QUESTIONS,
             "num_controls": NUM_CONTROLS,
+            "multipliers": STEERING_MULTIPLIERS,
             "layers_tested": test_layers,
             "methods_tested": methods,
         },
@@ -963,14 +1032,17 @@ def main():
     if len(methods) >= 2:
         output_json["comparison"] = {
             method: {
+                "n_significant_pooled": all_analyses[method]["summary"]["n_significant_pooled"],
                 "n_significant_fdr": all_analyses[method]["summary"]["n_significant_fdr"],
+                "n_sign_correct_pooled": all_analyses[method]["summary"]["n_sign_correct_pooled"],
+                "n_sign_correct_fdr": all_analyses[method]["summary"]["n_sign_correct_fdr"],
                 "best_layer": all_analyses[method]["summary"]["best_layer"],
-                "best_effect_z": all_analyses[method]["summary"]["best_effect_z"],
+                "best_slope": all_analyses[method]["summary"]["best_slope"],
             }
             for method in methods
         }
-        best_method = max(methods, key=lambda m: all_analyses[m]["summary"]["n_significant_fdr"])
-        output_json["comparison"]["method_with_more_effect"] = best_method
+        best_method = max(methods, key=lambda m: all_analyses[m]["summary"]["n_sign_correct_pooled"])
+        output_json["comparison"]["method_with_more_sign_correct"] = best_method
 
     with open(results_path, "w") as f:
         json.dump(output_json, f, indent=2)
@@ -980,7 +1052,7 @@ def main():
     print("\nGenerating plots...")
     for method in methods:
         plot_path = OUTPUT_DIR / f"{base_output}_{method}.png"
-        plot_ablation_results(all_analyses[method], method, plot_path)
+        plot_steering_results(all_analyses[method], method, plot_path)
 
     if len(methods) >= 2:
         comparison_path = OUTPUT_DIR / f"{base_output}_comparison.png"

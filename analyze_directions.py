@@ -371,24 +371,50 @@ def load_directions(path: Path) -> Dict[int, Dict[str, np.ndarray]]:
         path: Path to .npz file
 
     Returns dict mapping layer_idx -> {direction_name: direction_vector}
+
+    Handles two key formats:
+    - "layer_N_name" or "layer_N" (old format, e.g., from introspection experiments)
+    - "name_layer_N" (new format from identify_mc_correlate.py, e.g., "probe_layer_0", "mean_diff_layer_0")
     """
     data = np.load(path)
 
     directions = defaultdict(dict)
 
     for key in data.files:
-        # Parse key format: "layer_N_name" or "layer_N"
+        # Skip metadata keys
+        if key.startswith("_metadata"):
+            continue
+
         parts = key.split("_")
+
+        # Try format 1: "layer_N_name" or "layer_N"
         if parts[0] == "layer" and len(parts) >= 2:
-            layer_idx = int(parts[1])
-            if len(parts) > 2:
-                direction_name = "_".join(parts[2:])
-            else:
-                # For files with just "layer_N" keys, use "probe" as direction name
-                # The source_name (like "introspection_logit_gap_TriviaMC") already
-                # encodes the full context, so we just need a short direction name
-                direction_name = "probe"
-            directions[layer_idx][direction_name] = data[key]
+            try:
+                layer_idx = int(parts[1])
+                if len(parts) > 2:
+                    direction_name = "_".join(parts[2:])
+                else:
+                    # For files with just "layer_N" keys, use "probe" as direction name
+                    direction_name = "probe"
+                directions[layer_idx][direction_name] = data[key]
+                continue
+            except ValueError:
+                pass
+
+        # Try format 2: "name_layer_N" (from identify_mc_correlate.py)
+        # Look for "_layer_" in the key
+        if "_layer_" in key:
+            # Split on "_layer_" to get (name, layer_idx)
+            layer_pos = key.rfind("_layer_")
+            direction_name = key[:layer_pos]
+            try:
+                layer_idx = int(key[layer_pos + 7:])  # len("_layer_") == 7
+                # Skip scaler keys (probe_scaler_scale_N, probe_scaler_mean_N)
+                if "scaler" in direction_name:
+                    continue
+                directions[layer_idx][direction_name] = data[key]
+            except ValueError:
+                pass
 
     return dict(directions)
 
