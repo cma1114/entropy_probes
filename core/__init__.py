@@ -25,7 +25,6 @@ from .model_utils import (
 from .extraction import (
     compute_entropy_from_probs,
     BatchedExtractor,
-    extract_activations_only,
 )
 
 from .metrics import (
@@ -122,7 +121,6 @@ __all__ = [
     # extraction
     "compute_entropy_from_probs",
     "BatchedExtractor",
-    "extract_activations_only",
     # metrics
     "compute_entropy",
     "compute_metrics_single",

@@ -106,14 +106,14 @@ def _format_nested_question(question_data: Dict, outer_question: str, outer_opti
     """Format a nested/meta question for display."""
     formatted = ""
     formatted += "-" * 30 + "\n"
-    formatted += outer_question + "\n"
-    formatted += "-" * 10 + "\n"
 
     formatted += question_data["question"] + "\n"
     if "options" in question_data:
         for key, value in question_data["options"].items():
             formatted += f"  {key}: {value}\n"
     formatted += "-" * 10 + "\n"
+
+    formatted += outer_question + "\n"
 
     if outer_options:
         for key, value in outer_options.items():
@@ -538,3 +538,98 @@ format_delegate_prompt = format_answer_or_delegate_prompt
 # Aliases for other-confidence task
 OTHER_CONFIDENCE_OPTION_DICT = OTHER_CONFIDENCE_OPTIONS
 format_other_confidence = format_other_confidence_prompt
+
+
+# ============================================================================
+# POSITION FINDING FOR MULTI-TOKEN EXTRACTION
+# ============================================================================
+
+def find_mc_positions(
+    prompt: str,
+    tokenizer,
+    question: Dict,
+) -> Dict[str, int]:
+    """
+    Find key token positions within a meta-task prompt.
+
+    Identifies positions for:
+    - question_mark: The "?" at end of embedded MC question text
+    - question_newline: The newline after the "?"
+    - options_newline: The newline after the last MC option (before "----------")
+    - final: The last token position (-1)
+
+    Args:
+        prompt: The full formatted prompt string
+        tokenizer: The tokenizer to use
+        question: The question dict with 'question' and 'options' keys
+
+    Returns:
+        Dict mapping position names to token indices
+    """
+    # Get the question text to find it in the prompt
+    q_text = question["question"]
+
+    # Find where the question text ends (the "?")
+    # Strategy: find the question text in the prompt, then locate the "?" position
+    # Use rfind to find the LAST occurrence (delegate prompts have example questions earlier)
+    q_start_char = prompt.rfind(q_text)
+    if q_start_char == -1:
+        # Fallback: try without trailing punctuation
+        q_text_stripped = q_text.rstrip("?").strip()
+        q_start_char = prompt.rfind(q_text_stripped)
+
+    if q_start_char == -1:
+        # Can't find question, fall back to final only
+        import warnings
+        warnings.warn(
+            f"find_mc_positions: Could not locate question text in prompt. "
+            f"Falling back to final position only. Question: {q_text[:50]}..."
+        )
+        return {"final": -1}
+
+    # Find the "?" at end of question
+    q_end_char = q_start_char + len(q_text)
+    # Look for "?" near the end of question text
+    question_mark_char = prompt.rfind("?", q_start_char, q_end_char + 5)
+    if question_mark_char == -1:
+        question_mark_char = q_end_char  # fallback
+
+    # Find the newline after the question mark
+    question_newline_char = prompt.find("\n", question_mark_char)
+    if question_newline_char == -1:
+        question_newline_char = question_mark_char + 1
+
+    # Find the last MC option line (before the "----------" delimiter)
+    # The MC options are like "  D: option4\n"
+    # Find the "----------" that comes after MC options
+    options = list(question.get("options", {}).keys())
+    if options:
+        last_option_key = options[-1]  # e.g., "D"
+        # Find this option in the prompt after the question
+        last_option_pattern = f"  {last_option_key}:"
+        last_option_char = prompt.find(last_option_pattern, question_newline_char)
+        if last_option_char != -1:
+            # Find the newline after this option
+            options_newline_char = prompt.find("\n", last_option_char)
+            if options_newline_char == -1:
+                options_newline_char = last_option_char + 20  # fallback
+        else:
+            options_newline_char = question_newline_char + 50  # fallback
+    else:
+        options_newline_char = question_newline_char + 50
+
+    # Convert character positions to token positions
+    # Strategy: encode prefix up to each position and count tokens
+    def char_to_token_pos(char_pos: int) -> int:
+        prefix = prompt[:char_pos + 1]
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        return len(prefix_tokens) - 1
+
+    positions = {
+        "question_mark": char_to_token_pos(question_mark_char),
+        "question_newline": char_to_token_pos(question_newline_char),
+        "options_newline": char_to_token_pos(options_newline_char),
+        "final": -1,
+    }
+
+    return positions

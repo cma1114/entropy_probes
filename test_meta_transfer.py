@@ -50,6 +50,7 @@ from tasks import (
     get_answer_or_delegate_signal,
     STATED_CONFIDENCE_OPTIONS,
     ANSWER_OR_DELEGATE_OPTIONS,
+    find_mc_positions,
 )
 
 # =============================================================================
@@ -87,6 +88,13 @@ PROBE_PCA_COMPONENTS = 100
 # Quantization (auto-detected from model name, but can override)
 LOAD_IN_4BIT = False #True if "70B" in model_name else False
 LOAD_IN_8BIT = False
+
+# Token positions to probe for transfer
+# question_mark: "?" at end of embedded MC question
+# question_newline: newline after "?"
+# options_newline: newline after last MC option (D: ...)
+# final: last token (current behavior)
+PROBE_POSITIONS = ["question_mark", "question_newline", "options_newline", "final"]
 
 # Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
@@ -552,6 +560,120 @@ def plot_transfer_results(
     print(f"  Saved: {output_path}")
 
 
+def plot_position_comparison(
+    transfer_results_by_pos: dict,
+    mean_diff_transfer_by_pos: dict,
+    num_layers: int,
+    output_path: Path,
+    meta_task: str,
+):
+    """
+    Plot transfer R² across layers comparing different token positions.
+
+    Creates a 2x2 grid:
+    - Top row: Probe-based transfer for each metric
+    - Bottom row: Mean-diff transfer for each metric
+
+    Each panel shows one metric with lines for each position.
+    """
+    metrics = set()
+    for pos_data in transfer_results_by_pos.values():
+        metrics.update(pos_data.keys())
+    metrics = sorted(metrics)
+
+    if len(metrics) == 0:
+        print("  No metrics found for position comparison plot")
+        return
+
+    positions = list(transfer_results_by_pos.keys())
+    pos_colors = {
+        "question_mark": "tab:blue",
+        "question_newline": "tab:cyan",
+        "options_newline": "tab:green",
+        "final": "tab:red",
+    }
+
+    # Use 2 rows x N cols where N = number of metrics
+    n_metrics = len(metrics)
+    fig, axes = plt.subplots(2, n_metrics, figsize=(6 * n_metrics, 10), squeeze=False)
+    fig.suptitle(f"Position Comparison: {meta_task}", fontsize=14, fontweight='bold')
+
+    layers = list(range(num_layers))
+
+    # Top row: probe-based
+    for col, metric in enumerate(metrics):
+        ax = axes[0, col]
+        ax.set_title(f"Probe Transfer: {metric}", fontsize=11)
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+
+        for pos in positions:
+            if metric not in transfer_results_by_pos.get(pos, {}):
+                continue
+            color = pos_colors.get(pos, "tab:gray")
+
+            r2_vals = []
+            for l in layers:
+                if l in transfer_results_by_pos[pos][metric]:
+                    r2_vals.append(transfer_results_by_pos[pos][metric][l]["centered"]["r2"])
+                else:
+                    r2_vals.append(np.nan)
+            r2_vals = np.array(r2_vals, dtype=float)
+
+            finite = np.isfinite(r2_vals)
+            if finite.any():
+                best_layer = int(np.argmax(np.where(finite, r2_vals, -np.inf)))
+                best_r2 = r2_vals[best_layer]
+                label = f"{pos} (L{best_layer}: {best_r2:.3f})"
+            else:
+                label = pos
+
+            ax.plot(layers, r2_vals, '-', label=label, color=color, linewidth=2)
+
+        ax.set_xlabel('Layer Index')
+        ax.set_ylabel('R²')
+        ax.legend(loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # Bottom row: mean-diff
+    for col, metric in enumerate(metrics):
+        ax = axes[1, col]
+        ax.set_title(f"Mean-Diff Transfer: {metric}", fontsize=11)
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+
+        for pos in positions:
+            if metric not in mean_diff_transfer_by_pos.get(pos, {}):
+                continue
+            color = pos_colors.get(pos, "tab:gray")
+
+            r2_vals = []
+            for l in layers:
+                if l in mean_diff_transfer_by_pos[pos][metric]:
+                    r2_vals.append(mean_diff_transfer_by_pos[pos][metric][l]["centered"]["r2"])
+                else:
+                    r2_vals.append(np.nan)
+            r2_vals = np.array(r2_vals, dtype=float)
+
+            finite = np.isfinite(r2_vals)
+            if finite.any():
+                best_layer = int(np.argmax(np.where(finite, r2_vals, -np.inf)))
+                best_r2 = r2_vals[best_layer]
+                label = f"{pos} (L{best_layer}: {best_r2:.3f})"
+            else:
+                label = pos
+
+            ax.plot(layers, r2_vals, '-', label=label, color=color, linewidth=2)
+
+        ax.set_xlabel('Layer Index')
+        ax.set_ylabel('R²')
+        ax.legend(loc='upper left', fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -611,6 +733,7 @@ def main():
     results_npz_path = OUTPUT_DIR / f"{base_output}_results.npz"
     plot_path = OUTPUT_DIR / f"{base_output}_results.png"
     plot_path_mean_diff = OUTPUT_DIR / f"{base_output}_mean_diff_results.png"
+    plot_path_positions = OUTPUT_DIR / f"{base_output}_position_comparison.png"
 
     print(f"\nMeta task: {META_TASK}")
     print(f"Output base: {base_output}")
@@ -621,15 +744,44 @@ def main():
         print("Loading from file (skipping model load and extraction)...")
         loaded = np.load(activations_path)
 
-        meta_activations = {}
-        for key in loaded.files:
-            if key.startswith("layer_"):
-                layer = int(key.split("_")[1])
-                meta_activations[layer] = loaded[key]
-            elif key == "confidences":
-                confidences = loaded[key]
+        # Detect format: multi-position (layer_N_posname) vs legacy (layer_N)
+        has_positions = any("_" in k.replace("layer_", "", 1) for k in loaded.files if k.startswith("layer_"))
 
-        print(f"  Loaded {len(meta_activations)} layers")
+        if has_positions:
+            # Multi-position format: {position: {layer: array}}
+            meta_activations = {pos: {} for pos in PROBE_POSITIONS}
+            position_valid_arrays = {}
+            for key in loaded.files:
+                if key.startswith("layer_"):
+                    parts = key.split("_")
+                    layer = int(parts[1])
+                    pos_name = "_".join(parts[2:])
+                    if pos_name in meta_activations:
+                        meta_activations[pos_name][layer] = loaded[key]
+                elif key.startswith("valid_"):
+                    pos_name = key[6:]  # Remove "valid_" prefix
+                    position_valid_arrays[pos_name] = loaded[key]
+                elif key == "confidences":
+                    confidences = loaded[key]
+            # If no validity masks found (old format), assume all valid
+            if not position_valid_arrays:
+                n_samples = len(confidences)
+                position_valid_arrays = {pos: np.ones(n_samples, dtype=bool) for pos in PROBE_POSITIONS}
+            print(f"  Loaded {len(meta_activations)} positions, {len(meta_activations.get('final', {}))} layers")
+        else:
+            # Legacy format: {layer: array} - wrap in "final" position
+            legacy_activations = {}
+            for key in loaded.files:
+                if key.startswith("layer_"):
+                    layer = int(key.split("_")[1])
+                    legacy_activations[layer] = loaded[key]
+                elif key == "confidences":
+                    confidences = loaded[key]
+            meta_activations = {"final": legacy_activations}
+            # Legacy format: only final position, all valid
+            n_samples = len(confidences)
+            position_valid_arrays = {"final": np.ones(n_samples, dtype=bool)}
+            print(f"  Loaded legacy format with {len(legacy_activations)} layers (final position only)")
     else:
         # Load model with appropriate quantization
         load_4bit = LOAD_IN_4BIT
@@ -663,12 +815,20 @@ def main():
         print(f"  Meta options: {meta_options}")
         print(f"  Option token IDs: {option_token_ids}")
 
-        # Extract meta activations
+        # Extract meta activations at multiple token positions
         print(f"\nExtracting meta activations (batch_size={BATCH_SIZE})...")
+        print(f"  Probe positions: {PROBE_POSITIONS}")
 
-        all_activations = {layer: [] for layer in range(num_layers)}
+        # Initialize storage: {position: {layer: [activations]}}
+        all_activations = {
+            pos: {layer: [] for layer in range(num_layers)}
+            for pos in PROBE_POSITIONS
+        }
         all_confidences = []
         all_mappings = []
+        # Track which examples have valid positions for each position name
+        # (when find_mc_positions fails, it returns only {"final": -1})
+        position_valid = {pos: [] for pos in PROBE_POSITIONS}
 
         with BatchedExtractor(model, num_layers) as extractor:
             for batch_start in tqdm(range(0, len(questions), BATCH_SIZE)):
@@ -676,6 +836,7 @@ def main():
 
                 prompts = []
                 batch_mappings = []
+                batch_positions = []  # List of position dicts per item
                 for i, q in enumerate(batch_questions):
                     trial_idx = batch_start + i
                     if META_TASK == "delegate":
@@ -686,55 +847,123 @@ def main():
                         batch_mappings.append(None)
                     prompts.append(prompt)
 
+                    # Find token positions for this prompt
+                    positions = find_mc_positions(prompt, tokenizer, q)
+                    batch_positions.append(positions)
+
                 encoded = tokenizer(
                     prompts,
                     return_tensors="pt",
                     padding=True,
-                    truncation=True,
-                    max_length=2048
+                    add_special_tokens=False,  # Prompts already have special tokens from chat template
                 )
                 input_ids = encoded["input_ids"].to(model.device)
                 attention_mask = encoded["attention_mask"].to(model.device)
 
-                layer_acts, probs, _, _ = extractor.extract_batch(input_ids, attention_mask, option_token_ids)
+                # Build token_positions dict: {pos_name: [idx_for_each_batch_item]}
+                # Also track validity: a position is valid if it exists in the dict
+                # (find_mc_positions returns only {"final": -1} on failure)
+                token_positions = {}
+                for pos_name in PROBE_POSITIONS:
+                    token_positions[pos_name] = [
+                        bp.get(pos_name, -1) for bp in batch_positions
+                    ]
+                    # Track validity for this batch
+                    for bp in batch_positions:
+                        position_valid[pos_name].append(pos_name in bp)
 
-                for item_acts in layer_acts:
-                    for layer, act in item_acts.items():
-                        all_activations[layer].append(act)
+                layer_acts_by_pos, probs, _, _ = extractor.extract_batch(
+                    input_ids, attention_mask, option_token_ids, token_positions
+                )
+
+                # Store activations per position
+                for pos_name in PROBE_POSITIONS:
+                    for item_acts in layer_acts_by_pos[pos_name]:
+                        for layer, act in item_acts.items():
+                            all_activations[pos_name][layer].append(act)
 
                 for p, mapping in zip(probs, batch_mappings):
                     confidence = signal_fn(p, mapping)
                     all_confidences.append(confidence)
                     all_mappings.append(mapping)
 
-        # Stack activations
+        # Stack activations: {position: {layer: np.array}}
         print("\nStacking activations...")
         meta_activations = {
-            layer: np.stack(acts) for layer, acts in all_activations.items()
+            pos: {layer: np.stack(acts) for layer, acts in pos_acts.items()}
+            for pos, pos_acts in all_activations.items()
         }
         confidences = np.array(all_confidences)
+        # Convert validity masks to arrays
+        position_valid_arrays = {pos: np.array(valid) for pos, valid in position_valid.items()}
+
+        # Report validity stats
+        for pos in PROBE_POSITIONS:
+            n_valid = position_valid_arrays[pos].sum()
+            n_total = len(position_valid_arrays[pos])
+            if n_valid < n_total:
+                print(f"  Warning: {pos} has {n_valid}/{n_total} valid positions")
 
         # Save activations for future runs
         print(f"Saving activations to {activations_path}...")
         save_dict = {"confidences": confidences}
-        for layer, acts in meta_activations.items():
-            save_dict[f"layer_{layer}"] = acts
+        for pos_name, pos_acts in meta_activations.items():
+            for layer, acts in pos_acts.items():
+                save_dict[f"layer_{layer}_{pos_name}"] = acts
+        # Save validity masks
+        for pos_name, valid_arr in position_valid_arrays.items():
+            save_dict[f"valid_{pos_name}"] = valid_arr
         np.savez_compressed(activations_path, **save_dict)
 
-    print(f"\nActivation shape per layer: {meta_activations[0].shape}")
+    # Get positions available in loaded data
+    positions_available = list(meta_activations.keys())
+    first_pos = positions_available[0]
+    first_layer = list(meta_activations[first_pos].keys())[0]
+    print(f"\nActivation shape per layer: {meta_activations[first_pos][first_layer].shape}")
+    print(f"Positions available: {positions_available}")
     target_name = "Stated confidence" if META_TASK == "confidence" else "P(Answer)"
     print(f"{target_name}: mean={confidences.mean():.3f}, std={confidences.std():.3f}")
 
-    # Train probes and test transfer for each metric
+    # Train probes and test transfer for each metric and position
     # Key: use same train/test split for both D→D and D→M (like run_introspection_experiment.py)
     print("\n" + "=" * 60)
     print("TRAINING PROBES AND TESTING TRANSFER")
     print("=" * 60)
 
-    transfer_results = {}
+    # Results structure: {position: {metric: {layer: {...}}}}
+    transfer_results_by_pos = {pos: {} for pos in positions_available}
     direct_r2 = {}
     direct_r2_std = {}
     metrics_tested = [m for m in METRICS if m in dataset["metric_values"]]
+
+    # Helper functions defined once
+    def _safe_corr(a, b):
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        if a.size == 0 or b.size == 0:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        r, p = pearsonr(a, b)
+        rs, ps = spearmanr(a, b)
+        return float(r), float(p), float(rs), float(ps)
+
+    def _bootstrap_corr_std(a: np.ndarray, b: np.ndarray, n_boot: int, seed: int) -> float:
+        rng = np.random.RandomState(seed)
+        n = len(a)
+        if n < 3:
+            return 0.0
+        vals = []
+        for _ in range(n_boot):
+            idx = rng.choice(n, n, replace=True)
+            aa = a[idx]
+            bb = b[idx]
+            if np.std(aa) < 1e-12 or np.std(bb) < 1e-12:
+                continue
+            r, _ = pearsonr(aa, bb)
+            if np.isfinite(r):
+                vals.append(float(r))
+        return float(np.std(vals)) if len(vals) > 1 else 0.0
 
     for metric in metrics_tested:
         print(f"\n--- {metric.upper()} ---")
@@ -747,17 +976,18 @@ def main():
         conf_test = confidences[test_idx]
         metric_sign = metric_sign_for_confidence(metric)
 
-
-        transfer_results[metric] = {}
         direct_r2[metric] = {}
         direct_r2_std[metric] = {}
+
+        # Initialize results for each position
+        for pos in positions_available:
+            transfer_results_by_pos[pos][metric] = {}
 
         for layer in tqdm(range(num_layers), desc=f"  {metric}"):
             X_direct_train = direct_activations[layer][train_idx]
             X_direct_test = direct_activations[layer][test_idx]
-            X_meta_test = meta_activations[layer][test_idx]
 
-            # Train probe on direct_train
+            # Train probe on direct_train (same probe for all positions)
             _, probe_info = probe_direction(
                 X_direct_train, y_train,
                 alpha=PROBE_ALPHA,
@@ -770,26 +1000,7 @@ def main():
             pca = probe_info["pca"]
             ridge = probe_info["ridge"]
 
-            # DEBUG: Print stats for first layer to diagnose R² issue
-            if layer == 0:
-                print(f"\n  DEBUG {metric} layer 0:")
-                print(f"    X_train shape: {X_direct_train.shape}, mean: {X_direct_train.mean():.3f}, std: {X_direct_train.std():.3f}")
-                print(f"    X_test shape: {X_direct_test.shape}, mean: {X_direct_test.mean():.3f}, std: {X_direct_test.std():.3f}")
-                print(f"    y_train: mean={y_train.mean():.3f}, std={y_train.std():.3f}, range=[{y_train.min():.3f}, {y_train.max():.3f}]")
-                print(f"    y_test: mean={y_test.mean():.3f}, std={y_test.std():.3f}, range=[{y_test.min():.3f}, {y_test.max():.3f}]")
-                print(f"    scaler mean: {scaler.mean_.mean():.3e}, scaler scale: mean={scaler.scale_.mean():.3e}, min={scaler.scale_.min():.3e}, max={scaler.scale_.max():.3e}")
-                # Apply probe step by step
-                X_test_scaled = scaler.transform(X_direct_test.astype(np.float32))
-                print(f"    X_test_scaled: mean={X_test_scaled.astype(np.float64).mean():.3f}, std={X_test_scaled.astype(np.float64).std():.3f}, finite={np.isfinite(X_test_scaled).all()}")
-                X_test_pca = pca.transform(X_test_scaled)
-                print(f"    X_test_pca: mean={X_test_pca.mean():.3f}, std={X_test_pca.std():.3f}")
-                y_pred = ridge.predict(X_test_pca)
-                print(f"    y_pred: mean={y_pred.mean():.3f}, std={y_pred.std():.3f}, range=[{y_pred.min():.3f}, {y_pred.max():.3f}]")
-                from sklearn.metrics import r2_score
-                r2_debug = r2_score(y_test, y_pred)
-                print(f"    R² = {r2_debug:.3f}")
-
-            # D→D: Test on direct_test (sanity check) - use shared scaler
+            # D→D: Test on direct_test (sanity check) - same for all positions
             d2d_result = apply_probe_shared(
                 X_direct_test, y_test, scaler, pca, ridge
             )
@@ -800,106 +1011,94 @@ def main():
             )
             direct_r2_std[metric][layer] = float(d2d_std) if np.isfinite(d2d_std) else 0.0
 
-            # D→M: Centered scaling (rigorous transfer test)
-            centered_result = apply_probe_centered(
-                X_meta_test, y_test, scaler, pca, ridge
-            )
+            # D→M: Test transfer at each position
+            for pos in positions_available:
+                if layer not in meta_activations[pos]:
+                    continue
 
-            # D→M: Separate scaling (upper bound)
-            separate_result = apply_probe_separate(
-                X_meta_test, y_test, pca, ridge
-            )
+                # Get validity mask for this position (only use examples with valid positions)
+                pos_valid = position_valid_arrays.get(pos, np.ones(len(test_idx), dtype=bool))
+                valid_test_mask = pos_valid[test_idx]
+                n_valid = valid_test_mask.sum()
 
-            # NEW: Does the transferred internal signal explain stated confidence?
-            # Correlate probe predictions from META activations with stated confidence.
-            # Use metric_sign so higher values correspond to higher confidence (e.g. invert entropy).
-            def _safe_corr(a, b):
-                a = np.asarray(a, dtype=np.float64)
-                b = np.asarray(b, dtype=np.float64)
-                if a.size == 0 or b.size == 0:
-                    return float("nan"), float("nan"), float("nan"), float("nan")
-                if np.std(a) < 1e-12 or np.std(b) < 1e-12:
-                    return float("nan"), float("nan"), float("nan"), float("nan")
-                r, p = pearsonr(a, b)
-                rs, ps = spearmanr(a, b)
-                return float(r), float(p), float(rs), float(ps)
+                if n_valid < 10:  # Need minimum samples for meaningful statistics
+                    continue
 
-            cen_r, cen_p, cen_rs, cen_ps = _safe_corr(centered_result["predictions"] * metric_sign, conf_test)
-            centered_result["pred_conf_pearson"] = cen_r
-            centered_result["pred_conf_p"] = cen_p
-            centered_result["pred_conf_spearman"] = cen_rs
-            centered_result["pred_conf_spearman_p"] = cen_ps
+                # Filter to valid examples only
+                X_meta_test = meta_activations[pos][layer][test_idx][valid_test_mask]
+                y_test_valid = y_test[valid_test_mask]
+                conf_test_valid = conf_test[valid_test_mask]
 
-            # Cheap CI for corr(predicted_metric_from_meta, stated_confidence): bootstrap test indices only.
-            def _bootstrap_corr_std(a: np.ndarray, b: np.ndarray, n_boot: int, seed: int) -> float:
-                rng = np.random.RandomState(seed)
-                n = len(a)
-                if n < 3:
-                    return 0.0
-                vals = []
-                for _ in range(n_boot):
-                    idx = rng.choice(n, n, replace=True)
-                    aa = a[idx]
-                    bb = b[idx]
-                    if np.std(aa) < 1e-12 or np.std(bb) < 1e-12:
-                        continue
-                    r, _ = pearsonr(aa, bb)
-                    if np.isfinite(r):
-                        vals.append(float(r))
-                return float(np.std(vals)) if len(vals) > 1 else 0.0
+                # D→M: Centered scaling (rigorous transfer test)
+                centered_result = apply_probe_centered(
+                    X_meta_test, y_test_valid, scaler, pca, ridge
+                )
 
-            centered_result["pred_conf_pearson_std"] = _bootstrap_corr_std(
-                centered_result["predictions"] * metric_sign,
-                conf_test,
-                n_boot=N_BOOTSTRAP,
-                seed=SEED + 10000 + layer,
-            )
+                # D→M: Separate scaling (upper bound)
+                separate_result = apply_probe_separate(
+                    X_meta_test, y_test_valid, pca, ridge
+                )
 
-            sep_r, sep_p, sep_rs, sep_ps = _safe_corr(separate_result["predictions"] * metric_sign, conf_test)
-            separate_result["pred_conf_pearson"] = sep_r
-            separate_result["pred_conf_p"] = sep_p
-            separate_result["pred_conf_spearman"] = sep_rs
-            separate_result["pred_conf_spearman_p"] = sep_ps
+                # Correlate probe predictions with stated confidence
+                cen_r, cen_p, cen_rs, cen_ps = _safe_corr(centered_result["predictions"] * metric_sign, conf_test_valid)
+                centered_result["pred_conf_pearson"] = cen_r
+                centered_result["pred_conf_p"] = cen_p
+                centered_result["pred_conf_spearman"] = cen_rs
+                centered_result["pred_conf_spearman_p"] = cen_ps
 
+                centered_result["pred_conf_pearson_std"] = _bootstrap_corr_std(
+                    centered_result["predictions"] * metric_sign,
+                    conf_test_valid,
+                    n_boot=N_BOOTSTRAP,
+                    seed=SEED + 10000 + layer,
+                )
 
-            # Bootstrap CIs for transfer R² (resample test set only)
-            _, centered_std = bootstrap_transfer_r2(
-                X_meta_test, y_test,
-                scaler, pca, ridge, "centered",
-                n_boot=N_BOOTSTRAP, seed=SEED + layer
-            )
-            centered_std = float(centered_std) if np.isfinite(centered_std) else 0.0
-            _, separate_std = bootstrap_transfer_r2(
-                X_meta_test, y_test,
-                scaler, pca, ridge, "separate",
-                n_boot=N_BOOTSTRAP, seed=SEED + layer
-            )
-            separate_std = float(separate_std) if np.isfinite(separate_std) else 0.0
+                sep_r, sep_p, sep_rs, sep_ps = _safe_corr(separate_result["predictions"] * metric_sign, conf_test_valid)
+                separate_result["pred_conf_pearson"] = sep_r
+                separate_result["pred_conf_p"] = sep_p
+                separate_result["pred_conf_spearman"] = sep_rs
+                separate_result["pred_conf_spearman_p"] = sep_ps
 
-            centered_result["r2_std"] = centered_std
-            separate_result["r2_std"] = separate_std
+                # Bootstrap CIs for transfer R² (resample test set only)
+                _, centered_std = bootstrap_transfer_r2(
+                    X_meta_test, y_test_valid,
+                    scaler, pca, ridge, "centered",
+                    n_boot=N_BOOTSTRAP, seed=SEED + layer
+                )
+                centered_std = float(centered_std) if np.isfinite(centered_std) else 0.0
+                _, separate_std = bootstrap_transfer_r2(
+                    X_meta_test, y_test_valid,
+                    scaler, pca, ridge, "separate",
+                    n_boot=N_BOOTSTRAP, seed=SEED + layer
+                )
+                separate_std = float(separate_std) if np.isfinite(separate_std) else 0.0
 
-            transfer_results[metric][layer] = {
-                "centered": centered_result,
-                "separate": separate_result,
-            }
+                centered_result["r2_std"] = centered_std
+                separate_result["r2_std"] = separate_std
 
-        # Print summary
-        layers_available = list(transfer_results[metric].keys())
-        best_layer_cen = max(layers_available, key=lambda l: transfer_results[metric][l]["centered"]["r2"])
-        best_r2_cen = transfer_results[metric][best_layer_cen]["centered"]["r2"]
+                transfer_results_by_pos[pos][metric][layer] = {
+                    "centered": centered_result,
+                    "separate": separate_result,
+                }
 
-        best_layer_sep = max(layers_available, key=lambda l: transfer_results[metric][l]["separate"]["r2"])
-        best_r2_sep = transfer_results[metric][best_layer_sep]["separate"]["r2"]
-
-        print(f"  D→M Centered: R²={best_r2_cen:.3f} (L{best_layer_cen})")
-        print(f"  D→M Separate: R²={best_r2_sep:.3f} (L{best_layer_sep})")
+        # Print summary for each position
+        print(f"\n  Transfer R² by position:")
+        for pos in positions_available:
+            if metric not in transfer_results_by_pos[pos] or not transfer_results_by_pos[pos][metric]:
+                continue
+            layers_available = list(transfer_results_by_pos[pos][metric].keys())
+            best_layer_cen = max(layers_available, key=lambda l: transfer_results_by_pos[pos][metric][l]["centered"]["r2"])
+            best_r2_cen = transfer_results_by_pos[pos][metric][best_layer_cen]["centered"]["r2"]
+            print(f"    {pos}: R²={best_r2_cen:.3f} (L{best_layer_cen})")
 
         # Show D→D test R² (computed above)
         if metric in direct_r2 and direct_r2[metric]:
             best_d2d_layer = max(direct_r2[metric].keys(), key=lambda l: direct_r2[metric][l])
             best_d2d_r2 = direct_r2[metric][best_d2d_layer]
             print(f"  D→D (test): R²={best_d2d_r2:.3f} (L{best_d2d_layer})")
+
+    # For backward compatibility, use "final" position for existing code
+    transfer_results = transfer_results_by_pos.get("final", transfer_results_by_pos.get(positions_available[0], {}))
 
     # Behavioral correlation: metric vs meta-task target
     # For confidence task: correlation between metric and stated confidence
@@ -953,7 +1152,8 @@ def main():
     print("MEAN-DIFF TRANSFER ANALYSIS")
     print("=" * 60)
 
-    mean_diff_transfer_results: dict = {}
+    # Results by position: {position: {metric: {layer: {...}}}}
+    mean_diff_transfer_by_pos: dict = {pos: {} for pos in positions_available}
     mean_diff_direct_r2: dict = {}
     mean_diff_direct_r2_std: dict = {}
 
@@ -977,7 +1177,8 @@ def main():
         y_train = direct_values[train_idx]
         y_test = direct_values[test_idx]
 
-        mean_diff_transfer_results[metric] = {}
+        for pos in positions_available:
+            mean_diff_transfer_by_pos[pos][metric] = {}
         mean_diff_direct_r2[metric] = {}
         mean_diff_direct_r2_std[metric] = {}
 
@@ -990,12 +1191,10 @@ def main():
 
             X_direct_train = direct_activations[layer][train_idx]
             X_direct_test = direct_activations[layer][test_idx]
-            X_meta_test = meta_activations[layer][test_idx]
 
-            # 1) Compute 1D scores by projection
+            # 1) Compute 1D scores by projection on direct data
             s_train = X_direct_train @ d
             s_test = X_direct_test @ d
-            s_meta = X_meta_test @ d
 
             # 2) Score standardization stats from DIRECT train (stable)
             s_mu = float(np.mean(s_train))
@@ -1006,7 +1205,6 @@ def main():
             z_train = (s_train - s_mu) / s_std
 
             # 3) Fit a 1D calibrator on DIRECT train: y ≈ a*z + b
-            # (This makes the resulting R² comparable to probe-based R².)
             from sklearn.linear_model import Ridge
             cal = Ridge(alpha=1e-6, fit_intercept=True)
             cal.fit(z_train.reshape(-1, 1), y_train)
@@ -1017,8 +1215,6 @@ def main():
 
             from sklearn.metrics import r2_score, mean_absolute_error
             d2d_r2 = float(r2_score(y_test, yhat_test))
-            d2d_mae = float(mean_absolute_error(y_test, yhat_test))
-            d2d_pear, _ = pearsonr(y_test, yhat_test)
 
             mean_diff_direct_r2[metric][layer] = d2d_r2
             _, d2d_std = bootstrap_r2_from_predictions(
@@ -1028,63 +1224,85 @@ def main():
             )
             mean_diff_direct_r2_std[metric][layer] = d2d_std
 
-            # D→M Centered: center META scores with their own mean, but scale with DIRECT std
-            z_meta = (s_meta - float(np.mean(s_meta))) / s_std
-            yhat_meta = cal.predict(z_meta.reshape(-1, 1))
+            # D→M: Test transfer at each position
+            for pos in positions_available:
+                if layer not in meta_activations[pos]:
+                    continue
 
-            cen_r2 = float(r2_score(y_test, yhat_meta))
-            cen_mae = float(mean_absolute_error(y_test, yhat_meta))
-            cen_pear, _ = pearsonr(y_test, yhat_meta)
+                # Get validity mask for this position
+                pos_valid = position_valid_arrays.get(pos, np.ones(len(test_idx), dtype=bool))
+                valid_test_mask = pos_valid[test_idx]
+                n_valid = valid_test_mask.sum()
 
-            centered_result = {
-                "r2": cen_r2,
-                "mae": cen_mae,
-                "pearson": float(cen_pear),
-                "predictions": yhat_meta,
-            }
+                if n_valid < 10:
+                    continue
 
-            # Bootstrap for centered R²: recompute META centering each resample (still cheap)
-            rng = np.random.RandomState(SEED + 30000 + layer)
-            n = len(y_test)
-            vals_r2 = []
-            vals_pc = []
-            for _ in range(N_BOOTSTRAP):
-                idx = rng.choice(n, n, replace=True)
-                sm = (X_meta_test[idx] @ d)
-                zm = (sm - float(np.mean(sm))) / s_std
-                yhat_b = cal.predict(zm.reshape(-1, 1))
-                # Stable R² (fixed denom) via helper for comparability to probe CI
-                r2_b = 1.0 - float(np.mean((y_test[idx] - yhat_b) ** 2)) / float(np.var(y_test))
-                if np.isfinite(r2_b):
-                    vals_r2.append(r2_b)
+                # Filter to valid examples only
+                X_meta_test = meta_activations[pos][layer][test_idx][valid_test_mask]
+                y_test_valid = y_test[valid_test_mask]
+                conf_test_valid = conf_test[valid_test_mask]
+
+                s_meta = X_meta_test @ d
+
+                # D→M Centered: center META scores with their own mean, but scale with DIRECT std
+                z_meta = (s_meta - float(np.mean(s_meta))) / s_std
+                yhat_meta = cal.predict(z_meta.reshape(-1, 1))
+
+                cen_r2 = float(r2_score(y_test_valid, yhat_meta))
+                cen_mae = float(mean_absolute_error(y_test_valid, yhat_meta))
+                cen_pear, _ = pearsonr(y_test_valid, yhat_meta)
+
+                centered_result = {
+                    "r2": cen_r2,
+                    "mae": cen_mae,
+                    "pearson": float(cen_pear),
+                    "predictions": yhat_meta,
+                }
+
+                # Bootstrap for centered R²
+                rng = np.random.RandomState(SEED + 30000 + layer)
+                n = len(y_test_valid)
+                vals_r2 = []
+                vals_pc = []
+                for _ in range(N_BOOTSTRAP):
+                    idx = rng.choice(n, n, replace=True)
+                    sm = (X_meta_test[idx] @ d)
+                    zm = (sm - float(np.mean(sm))) / s_std
+                    yhat_b = cal.predict(zm.reshape(-1, 1))
+                    r2_b = 1.0 - float(np.mean((y_test_valid[idx] - yhat_b) ** 2)) / float(np.var(y_test_valid))
+                    if np.isfinite(r2_b):
+                        vals_r2.append(r2_b)
+                    if np.std(yhat_b) > 1e-12 and np.std(conf_test_valid[idx]) > 1e-12:
+                        r_b, _ = pearsonr(yhat_b * metric_sign, conf_test_valid[idx])
+                        if np.isfinite(r_b):
+                            vals_pc.append(float(r_b))
+
+                centered_result["r2_std"] = float(np.std(vals_r2)) if len(vals_r2) > 1 else 0.0
+
                 # Prediction→confidence correlation
-                if np.std(yhat_b) > 1e-12 and np.std(conf_test[idx]) > 1e-12:
-                    r_b, _ = pearsonr(yhat_b * metric_sign, conf_test[idx])
-                    if np.isfinite(r_b):
-                        vals_pc.append(float(r_b))
+                pc_r, pc_p, pc_rs, pc_ps = _safe_corr(yhat_meta * metric_sign, conf_test_valid)
+                centered_result["pred_conf_pearson"] = pc_r
+                centered_result["pred_conf_p"] = pc_p
+                centered_result["pred_conf_spearman"] = pc_rs
+                centered_result["pred_conf_spearman_p"] = pc_ps
+                centered_result["pred_conf_pearson_std"] = float(np.std(vals_pc)) if len(vals_pc) > 1 else 0.0
 
-            centered_result["r2_std"] = float(np.std(vals_r2)) if len(vals_r2) > 1 else 0.0
+                mean_diff_transfer_by_pos[pos][metric][layer] = {"centered": centered_result}
 
-            # Prediction→confidence correlation (panel 1)
-            pc_r, pc_p, pc_rs, pc_ps = _safe_corr(yhat_meta * metric_sign, conf_test)
-            centered_result["pred_conf_pearson"] = pc_r
-            centered_result["pred_conf_p"] = pc_p
-            centered_result["pred_conf_spearman"] = pc_rs
-            centered_result["pred_conf_spearman_p"] = pc_ps
-            centered_result["pred_conf_pearson_std"] = float(np.std(vals_pc)) if len(vals_pc) > 1 else 0.0
+        # Summary by position
+        print(f"\n  Transfer R² by position (mean-diff):")
+        for pos in positions_available:
+            if metric not in mean_diff_transfer_by_pos[pos] or not mean_diff_transfer_by_pos[pos][metric]:
+                continue
+            layers_available = list(mean_diff_transfer_by_pos[pos][metric].keys())
+            if not layers_available:
+                continue
+            best_layer = max(layers_available, key=lambda l: mean_diff_transfer_by_pos[pos][metric][l]["centered"]["r2"])
+            best_r2 = mean_diff_transfer_by_pos[pos][metric][best_layer]["centered"]["r2"]
+            print(f"    {pos}: R²={best_r2:.3f} (L{best_layer})")
 
-            mean_diff_transfer_results[metric][layer] = {"centered": centered_result}
-
-        # Summary
-        layers_available = list(mean_diff_transfer_results[metric].keys())
-        if not layers_available:
-            continue
-        best_layer = max(layers_available, key=lambda l: mean_diff_transfer_results[metric][l]["centered"]["r2"])
-        best_r2 = mean_diff_transfer_results[metric][best_layer]["centered"]["r2"]
-        print(f"  D→M Centered (mean-diff): best R²={best_r2:.3f} (L{best_layer})")
-        best_conf_layer = max(layers_available, key=lambda l: mean_diff_transfer_results[metric][l]["centered"].get("pred_conf_pearson", -np.inf))
-        best_conf_r = mean_diff_transfer_results[metric][best_conf_layer]["centered"].get("pred_conf_pearson", float("nan"))
-        print(f"  Pred→Conf corr: best r={best_conf_r:.3f} (L{best_conf_layer})")
+    # For backward compatibility, use "final" position
+    mean_diff_transfer_results = mean_diff_transfer_by_pos.get("final", mean_diff_transfer_by_pos.get(positions_available[0], {}))
 
     # Plot mean-diff results (same 4-panel layout)
     if len(mean_diff_transfer_results) > 0:
@@ -1104,6 +1322,16 @@ def main():
     print(f"\nPlotting transfer results...")
     plot_transfer_results(transfer_results, direct_r2, direct_r2_std, behavioral, num_layers, plot_path, META_TASK, title_prefix="Probe Transfer Analysis")
 
+    # Plot position comparison
+    print(f"\nPlotting position comparison...")
+    plot_position_comparison(
+        transfer_results_by_pos,
+        mean_diff_transfer_by_pos,
+        num_layers,
+        plot_path_positions,
+        META_TASK,
+    )
+
     # Save JSON results
     print(f"Saving results to {results_json_path}...")
     results_json = {
@@ -1120,6 +1348,7 @@ def main():
             "seed": SEED,
             "probe_alpha": PROBE_ALPHA,
             "probe_pca_components": PROBE_PCA_COMPONENTS,
+            "probe_positions": positions_available,
         },
         "meta_target_stats": {
             "name": "stated_confidence" if META_TASK == "confidence" else "P(Answer)",
@@ -1176,6 +1405,59 @@ def main():
             for l in direct_r2[metric].keys():
                 if l in results_json["transfer"][metric]["per_layer"]:
                     results_json["transfer"][metric]["per_layer"][l]["d2d_r2"] = direct_r2[metric][l]
+
+    # Add position-level summary (best R² per position)
+    results_json["transfer_by_position"] = {}
+    for pos in positions_available:
+        results_json["transfer_by_position"][pos] = {}
+        for metric in metrics_tested:
+            if metric not in transfer_results_by_pos[pos] or not transfer_results_by_pos[pos][metric]:
+                continue
+            layers_available = list(transfer_results_by_pos[pos][metric].keys())
+            if not layers_available:
+                continue
+            best_layer = max(layers_available, key=lambda l: transfer_results_by_pos[pos][metric][l]["centered"]["r2"])
+            results_json["transfer_by_position"][pos][metric] = {
+                "best_layer": best_layer,
+                "best_r2": transfer_results_by_pos[pos][metric][best_layer]["centered"]["r2"],
+                "per_layer": {
+                    l: {
+                        "centered_r2": transfer_results_by_pos[pos][metric][l]["centered"]["r2"],
+                        "centered_r2_std": transfer_results_by_pos[pos][metric][l]["centered"].get("r2_std", 0.0),
+                        "centered_pearson": transfer_results_by_pos[pos][metric][l]["centered"]["pearson"],
+                        "centered_pred_conf_pearson": transfer_results_by_pos[pos][metric][l]["centered"].get("pred_conf_pearson"),
+                        "separate_r2": transfer_results_by_pos[pos][metric][l]["separate"]["r2"],
+                        "separate_r2_std": transfer_results_by_pos[pos][metric][l]["separate"].get("r2_std", 0.0),
+                        "separate_pearson": transfer_results_by_pos[pos][metric][l]["separate"]["pearson"],
+                    }
+                    for l in layers_available
+                },
+            }
+
+    # Add mean-diff position-level summary with full per-layer data
+    results_json["mean_diff_by_position"] = {}
+    for pos in positions_available:
+        results_json["mean_diff_by_position"][pos] = {}
+        for metric in metrics_tested:
+            if metric not in mean_diff_transfer_by_pos[pos] or not mean_diff_transfer_by_pos[pos][metric]:
+                continue
+            layers_available = list(mean_diff_transfer_by_pos[pos][metric].keys())
+            if not layers_available:
+                continue
+            best_layer = max(layers_available, key=lambda l: mean_diff_transfer_by_pos[pos][metric][l]["centered"]["r2"])
+            results_json["mean_diff_by_position"][pos][metric] = {
+                "best_layer": best_layer,
+                "best_r2": mean_diff_transfer_by_pos[pos][metric][best_layer]["centered"]["r2"],
+                "per_layer": {
+                    l: {
+                        "centered_r2": mean_diff_transfer_by_pos[pos][metric][l]["centered"]["r2"],
+                        "centered_r2_std": mean_diff_transfer_by_pos[pos][metric][l]["centered"].get("r2_std", 0.0),
+                        "centered_pearson": mean_diff_transfer_by_pos[pos][metric][l]["centered"]["pearson"],
+                        "centered_pred_conf_pearson": mean_diff_transfer_by_pos[pos][metric][l]["centered"].get("pred_conf_pearson"),
+                    }
+                    for l in layers_available
+                },
+            }
 
     with open(results_json_path, "w") as f:
         json.dump(results_json, f, indent=2)
@@ -1254,6 +1536,7 @@ def main():
     print(f"  {results_npz_path.name}")
     print(f"  {plot_path.name}")
     print(f"  {plot_path_mean_diff.name}")
+    print(f"  {plot_path_positions.name}")
 
 
 if __name__ == "__main__":
