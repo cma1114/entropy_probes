@@ -395,6 +395,7 @@ def run_ablation_for_method(
     use_chat_template: bool,
     layers: Optional[List[int]] = None,
     position: str = "final",
+    original_indices: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Run ablation experiment for a single direction method at a specific position.
@@ -411,6 +412,9 @@ def run_ablation_for_method(
             - "question_mark": Token after "?" in question
             - "question_newline": Newline after question
             - "options_newline": Newline after MC options
+        original_indices: Original dataset indices for each question. Used for
+            trial_index in delegate task to match prompt formatting with
+            test_meta_transfer.py. If None, uses local indices (legacy behavior).
 
     Returns dict with per-layer results including baseline, ablated, and controls.
     """
@@ -442,8 +446,11 @@ def run_ablation_for_method(
     mappings = []
     position_indices = []  # Per-prompt token index for intervention
     for q_idx, question in enumerate(questions):
+        # Use original dataset index for trial_index to match test_meta_transfer.py
+        # This ensures the delegate task uses consistent Answer/Delegate mapping
+        trial_idx = int(original_indices[q_idx]) if original_indices is not None else q_idx
         if meta_task == "delegate":
-            prompt, _, mapping = format_fn(question, tokenizer, trial_index=q_idx, use_chat_template=use_chat_template)
+            prompt, _, mapping = format_fn(question, tokenizer, trial_index=trial_idx, use_chat_template=use_chat_template)
         else:
             prompt, _ = format_fn(question, tokenizer, use_chat_template=use_chat_template)
             mapping = None
@@ -1585,10 +1592,14 @@ def main():
             indices, train_size=TRAIN_SPLIT, random_state=SEED
         )
         data_items = [all_data[i] for i in test_idx]
+        # Keep original indices for trial_index in delegate prompt formatting
+        original_indices = test_idx
         print(f"  Using transfer test split: {len(data_items)} questions (from {n_total} total, seed={SEED})")
     else:
         # Legacy behavior: first NUM_QUESTIONS
         data_items = all_data[:NUM_QUESTIONS]
+        # Original indices are just 0..NUM_QUESTIONS-1
+        original_indices = np.arange(len(data_items))
         print(f"  Using first {len(data_items)} questions (legacy mode)")
 
     # Extract questions (each item has question, options, correct_answer, etc.)
@@ -1708,6 +1719,7 @@ def main():
                 use_chat_template=use_chat_template,
                 layers=method_layers,
                 position=position,
+                original_indices=original_indices,
             )
             all_results_by_pos[position][method] = results
 
