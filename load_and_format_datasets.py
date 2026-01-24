@@ -48,6 +48,8 @@ def load_and_format_dataset(dataset_name, num_questions_needed=None, split=None,
             return load_and_format_popmc_filtered(num_questions_needed, split=split, skip_questions=skip_questions, shuffle_answers=shuffle_answers)
     elif dataset_name=="TriviaMC":
         return load_and_format_triviamc(num_questions_needed, skip_questions=skip_questions, shuffle_answers=shuffle_answers)
+    elif dataset_name=="TriviaMC_difficulty_filtered":
+        return load_and_format_triviamc_filtered(num_questions_needed, skip_questions=skip_questions, shuffle_answers=shuffle_answers)
     elif dataset_name=="Garupanese":
         if split is None:
             return load_and_format_garupanese(num_questions_needed, skip_questions=skip_questions)
@@ -1104,4 +1106,94 @@ def load_and_format_triviamc(num_questions_needed=None, split="test", skip_quest
         print(f"Warning: Only able to format {len(formatted_questions)} unique questions, but {num_questions_needed} were requested.")
 
     print(f"Successfully formatted {len(formatted_questions)} unique questions from TriviaMC.")
+    return formatted_questions
+
+
+def load_and_format_triviamc_filtered(num_questions_needed=None, split="test", skip_questions=None, shuffle_answers=True):
+    """
+    Loads the difficulty-filtered TriviaMC dataset (balanced correct/incorrect).
+    Same format as TriviaMC but from the filtered file.
+    """
+    import json
+    print(f"Attempting to load TriviaMC_difficulty_filtered...")
+    try:
+        filename = "./data/TriviaMC_difficulty_filtered.jsonl"
+        with open(filename, 'r') as f:
+            dataset = [json.loads(line) for line in f]
+        print(f"TriviaMC_difficulty_filtered Dataset loaded successfully ({len(dataset)} questions).")
+    except Exception as e:
+        print(f"Error loading TriviaMC_difficulty_filtered dataset: {e}")
+        print("Run filter_by_difficulty.py first to create this file.")
+        return None
+
+    formatted_questions = []
+
+    dataset_indices = list(range(len(dataset)))
+    random.shuffle(dataset_indices)
+
+    question_ids_added = set()
+
+    if not num_questions_needed: num_questions_needed = len(dataset)
+    print(f"Formatting {num_questions_needed} questions from TriviaMC_difficulty_filtered...")
+    for idx in dataset_indices:
+        if len(formatted_questions) >= num_questions_needed:
+            break
+
+        item = dataset[idx]
+        question_text = item.get('question')
+        qid = item.get('qid')
+
+        if qid in question_ids_added:
+            continue
+
+        if skip_questions is not None and question_text in skip_questions:
+            continue
+
+        # Check if options are pre-stored (from difficulty filtering with exact positions)
+        if "options" in item and isinstance(item["options"], dict):
+            # Pre-computed options - use directly without reshuffling
+            options_dict = item["options"]
+            correct_label = item["correct_answer"]
+        else:
+            # Legacy format with text answers - create new ordering
+            correct_answer_text = item.get('correct_answer', '').strip()
+            incorrect_answers_text = item.get('distractors', [])
+
+            if not correct_answer_text or not incorrect_answers_text:
+                continue
+            if len(incorrect_answers_text) < 3:
+                continue
+            if any(len(ans.strip()) == 0 for ans in incorrect_answers_text):
+                continue
+
+            # Create the pool of 4 options and optionally shuffle
+            options_list = [correct_answer_text] + incorrect_answers_text[:3]
+            if shuffle_answers:
+                random.shuffle(options_list)
+
+            # Assign labels (A-D) and find the correct one
+            options_dict = {}
+            correct_label = None
+            labels = ["A", "B", "C", "D"]
+
+            for i, option_text in enumerate(options_list):
+                label = labels[i]
+                options_dict[label] = option_text
+                if option_text == correct_answer_text:
+                    correct_label = label
+
+        # Create the formatted dictionary
+        formatted_q = {
+            "id": qid if qid else f"triviamc_filtered_{split}_{text_to_id(question_text)}",
+            "question": question_text,
+            "options": options_dict,
+            "correct_answer": correct_label
+        }
+        formatted_questions.append(formatted_q)
+        question_ids_added.add(qid if qid else formatted_q["id"])
+
+    if len(formatted_questions) < num_questions_needed:
+        print(f"Warning: Only able to format {len(formatted_questions)} unique questions, but {num_questions_needed} were requested.")
+
+    print(f"Successfully formatted {len(formatted_questions)} unique questions from TriviaMC_difficulty_filtered.")
     return formatted_questions

@@ -6,6 +6,11 @@ Corrections from previous version:
 2. Fixes RNG initialization (outside layer loop) to ensure independent permutations across layers.
 3. Restores missing metrics: transfer_efficiency, significant_layers list, best_layer index.
 4. Restores Config block and Synthesis plot.
+
+Statistical improvements:
+5. Fisher-z confidence intervals on observed Pearson r (cross and within).
+6. BH-FDR correction across layers within each panel.
+7. Safer Pearson computation with guards against degenerate cases.
 """
 
 from pathlib import Path
@@ -26,7 +31,7 @@ from core import metric_sign_for_confidence
 MODEL_PREFIX = "Llama-3.3-70B-Instruct"
 METRICS = ["entropy", "logit_gap"]
 METHODS = ["mean_diff", "probe"]
-META_TASKS = ["delegate"] 
+META_TASKS = ["delegate"]
 N_PERMUTATIONS = 100
 SEED = 42
 MEAN_DIFF_QUANTILE = 0.25
@@ -34,6 +39,86 @@ PROBE_ALPHA = 1000.0
 PROBE_PCA_COMPONENTS = 100
 WITHIN_TRAIN_SPLIT = 0.8
 OUTPUT_DIR = Path(__file__).parent / "outputs"
+
+# Statistical configuration
+ALPHA = 0.05  # Significance threshold
+CI_ALPHA = 0.05  # 95% Fisher-z CI for correlations
+USE_FDR = True  # Apply BH-FDR across layers within each panel
+EPS_DENOM = 1e-8  # Guard against near-constant predictions
+
+
+# =============================================================================
+# STATISTICS HELPERS
+# =============================================================================
+
+def _safe_pearson_r(preds: np.ndarray, y: np.ndarray, eps: float = EPS_DENOM) -> float:
+    """Fast, numerically-guarded Pearson r (returns 0.0 if degenerate)."""
+    preds = np.asarray(preds, dtype=np.float32).ravel()
+    y = np.asarray(y, dtype=np.float32).ravel()
+    if preds.size != y.size or preds.size < 2:
+        return 0.0
+    pc = preds - preds.mean()
+    yc = y - y.mean()
+    denom = float(np.linalg.norm(pc) * np.linalg.norm(yc))
+    if denom < eps:
+        return 0.0
+    r = float(np.dot(pc, yc) / denom)
+    if not np.isfinite(r):
+        return 0.0
+    return max(-1.0, min(1.0, r))
+
+
+def _fisher_ci(r: float, n: int, alpha: float = CI_ALPHA):
+    """Approximate CI for Pearson r via Fisher z-transform."""
+    if n is None or n <= 3:
+        return (float("nan"), float("nan"))
+    r_clip = float(np.clip(r, -0.999999, 0.999999))
+    z = np.arctanh(r_clip)
+    se = 1.0 / np.sqrt(n - 3)
+    # z-critical for two-tailed alpha
+    from scipy.stats import norm
+    zcrit = float(norm.ppf(1 - alpha / 2))
+    z_lo = z - zcrit * se
+    z_hi = z + zcrit * se
+    return (float(np.tanh(z_lo)), float(np.tanh(z_hi)))
+
+
+def _bh_fdr(pvals: np.ndarray) -> np.ndarray:
+    """Benjamini-Hochberg FDR correction (returns q-values)."""
+    pvals = np.asarray(pvals, dtype=np.float64)
+    m = pvals.size
+    if m == 0:
+        return pvals
+    order = np.argsort(pvals)
+    ranked = pvals[order]
+    q = ranked * m / (np.arange(1, m + 1))
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    out = np.empty_like(q)
+    out[order] = q
+    return out
+
+
+def _vectorized_null_rs(preds_perm: np.ndarray, y: np.ndarray, eps: float = EPS_DENOM) -> np.ndarray:
+    """Compute Pearson r for many prediction vectors vs y, with guards for degeneracy."""
+    y = np.asarray(y, dtype=np.float32).ravel()
+    y_centered = y - y.mean()
+    y_norm = np.linalg.norm(y_centered)
+    if y_norm < eps:
+        return np.zeros(preds_perm.shape[1], dtype=np.float32)
+
+    P = np.asarray(preds_perm, dtype=np.float32)
+    P_centered = P - P.mean(axis=0, keepdims=True)
+    P_norms = np.linalg.norm(P_centered, axis=0)
+    denom = P_norms * y_norm
+
+    dot = P_centered.T @ y_centered
+    rs = np.zeros(P.shape[1], dtype=np.float32)
+    valid = denom >= eps
+    rs[valid] = dot[valid] / denom[valid]
+    rs = np.clip(rs, -1.0, 1.0)
+    rs[~np.isfinite(rs)] = 0.0
+    return rs
 
 
 # =============================================================================
@@ -50,6 +135,9 @@ def compute_mean_diff_direction_vectorized(X: np.ndarray, y: np.ndarray, n_perms
                    May have fewer than n_perms rows if some permutations produced
                    degenerate (zero-norm) directions.
     """
+    # Cast to float32 to avoid overflow in float16 arithmetic
+    X = X.astype(np.float32)
+
     # Check for NaN/Inf in input (indicates data loading issue)
     if not np.isfinite(X).all():
         n_nan = np.isnan(X).sum()
@@ -142,6 +230,9 @@ class ProbeDirectionManager:
         from sklearn.preprocessing import StandardScaler
         from sklearn.decomposition import PCA
 
+        # Cast to float32 to avoid overflow in float16 arithmetic
+        X = X.astype(np.float32)
+
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X)
 
@@ -220,61 +311,80 @@ def extract_dataset_name(base_name: str, model_prefix: str) -> str:
 # EVALUATION LOGIC
 # =============================================================================
 
-def evaluate_transfer(target_acts: np.ndarray, target_vals: np.ndarray, 
+def evaluate_transfer(target_acts: np.ndarray, target_vals: np.ndarray,
                       real_dir: np.ndarray, perm_dirs: np.ndarray, two_sided: bool):
     """
     Applies directions to target activations and computes correlations.
-    two_sided: If True (D2M), checks abs(null) >= abs(real). If False (D2D), checks null >= real.
+    two_sided: If True, checks abs(null) >= abs(real). If False, checks null >= real.
+
+    Returns dict with cross_r, cross_ci_low, cross_ci_high, cross_p, p_value, and null_stats.
     """
-    # Real correlation
+    # Cast to float32 to avoid overflow in float16 arithmetic
+    target_acts = target_acts.astype(np.float32)
+    target_vals = np.asarray(target_vals, dtype=np.float32)
+    n = int(target_vals.shape[0])
+
+    # Real correlation with Fisher CI
     preds = target_acts @ real_dir
-    cross_r, cross_p = pearsonr(preds, target_vals)
-    
-    # Permutation correlations (Vectorized)
-    # target (N, D) @ perms.T (D, P) -> (N, P)
-    preds_perm = target_acts @ perm_dirs.T
-    
-    # Efficient Pearson R
-    y_centered = target_vals - target_vals.mean()
-    y_norm = np.linalg.norm(y_centered)
-    
-    P_centered = preds_perm - preds_perm.mean(axis=0)
-    P_norms = np.linalg.norm(P_centered, axis=0)
-    
-    dot_prods = P_centered.T @ y_centered
-    null_rs = dot_prods / (P_norms * y_norm + 1e-10)
-    
-    # Correct P-value Logic
-    if two_sided:
-        # D2M: Is the magnitude of correlation significant?
-        p_value = (np.sum(np.abs(null_rs) >= np.abs(cross_r)) + 1) / (len(null_rs) + 1)
+    cross_r = _safe_pearson_r(preds, target_vals)
+    cross_ci_low, cross_ci_high = _fisher_ci(cross_r, n, alpha=CI_ALPHA)
+
+    try:
+        _, cross_p = pearsonr(np.asarray(preds, dtype=np.float64), np.asarray(target_vals, dtype=np.float64))
+        cross_p = float(cross_p) if np.isfinite(cross_p) else 1.0
+    except Exception:
+        cross_p = 1.0
+
+    # Permutation null
+    if perm_dirs is None or len(perm_dirs) == 0:
+        p_value = float("nan")
+        null_mean = null_std = null_p5 = null_p95 = float("nan")
     else:
-        # D2D: Is the positive correlation significant?
-        p_value = (np.sum(null_rs >= cross_r) + 1) / (len(null_rs) + 1)
-    
+        preds_perm = target_acts @ perm_dirs.T
+        null_rs = _vectorized_null_rs(preds_perm, target_vals, eps=EPS_DENOM)
+
+        if two_sided:
+            p_value = (np.sum(np.abs(null_rs) >= abs(cross_r)) + 1) / (len(null_rs) + 1)
+        else:
+            p_value = (np.sum(null_rs >= cross_r) + 1) / (len(null_rs) + 1)
+
+        null_mean = float(np.mean(null_rs))
+        null_std = float(np.std(null_rs))
+        null_p5 = float(np.percentile(null_rs, 5))
+        null_p95 = float(np.percentile(null_rs, 95))
+
     return {
         "cross_r": float(cross_r),
+        "cross_ci_low": float(cross_ci_low),
+        "cross_ci_high": float(cross_ci_high),
         "cross_p": float(cross_p),
+        "p_value": float(p_value) if p_value == p_value else float("nan"),
         "null_stats": {
-            "mean": float(np.mean(null_rs)),
-            "std": float(np.std(null_rs)),
-            "p5": float(np.percentile(null_rs, 5)),
-            "p95": float(np.percentile(null_rs, 95)),
-            "raw_p": float(p_value) 
+            "mean": null_mean,
+            "std": null_std,
+            "p5": null_p5,
+            "p95": null_p95,
         }
     }
 
 def get_within_baseline(X_train, y_train, X_test, y_test, method):
-    """Computes within-dataset baseline."""
+    """Computes within-dataset baseline with Fisher-z CI."""
+    # Cast to float32 to avoid overflow in float16 arithmetic
+    X_train = X_train.astype(np.float32)
+    X_test = X_test.astype(np.float32)
+    y_test = np.asarray(y_test, dtype=np.float32)
+    n = int(y_test.shape[0])
+
     if method == "mean_diff":
         dr, _ = compute_mean_diff_direction_vectorized(X_train, y_train, 0, None, MEAN_DIFF_QUANTILE)
     else:
         mgr = ProbeDirectionManager(X_train, PROBE_ALPHA, PROBE_PCA_COMPONENTS)
         dr, _ = mgr.compute_directions(y_train, 0, None)
-        
+
     preds = X_test @ dr
-    r, _ = pearsonr(preds, y_test)
-    return float(r)
+    r = _safe_pearson_r(preds, y_test)
+    ci_low, ci_high = _fisher_ci(r, n, alpha=CI_ALPHA)
+    return {"within_r": float(r), "within_ci_low": float(ci_low), "within_ci_high": float(ci_high)}
 
 # =============================================================================
 # PLOTTING
@@ -323,19 +433,30 @@ def _plot_single(ax, results, title):
     layers = sorted(per_layer.keys())
     cross_r = np.array([per_layer[l]["cross_r"] for l in layers])
     within_r = np.array([per_layer[l]["within_r"] for l in layers])
-    null_5 = np.array([per_layer[l]["null_5th"] for l in layers])
-    null_95 = np.array([per_layer[l]["null_95th"] for l in layers])
     null_mean = np.array([per_layer[l]["null_mean"] for l in layers])
-    
-    ax.fill_between(layers, null_5, null_95, alpha=0.3, color="gray", label="Null 5-95%")
-    ax.plot(layers, null_mean, "--", color="gray", lw=1, label="Null mean")
-    ax.plot(layers, within_r, "-", color="green", lw=2, alpha=0.7, label="Within (B->B)")
+
+    # Get CIs if available
+    cross_lo = np.array([per_layer[l].get("cross_ci_low", np.nan) for l in layers])
+    cross_hi = np.array([per_layer[l].get("cross_ci_high", np.nan) for l in layers])
+    within_lo = np.array([per_layer[l].get("within_ci_low", np.nan) for l in layers])
+    within_hi = np.array([per_layer[l].get("within_ci_high", np.nan) for l in layers])
+
+    # Plot Fisher-z CIs for cross and within
+    if not np.all(np.isnan(within_lo)):
+        ax.fill_between(layers, within_lo, within_hi, alpha=0.18, color="green", label="Within 95% CI")
+    if not np.all(np.isnan(cross_lo)):
+        ax.fill_between(layers, cross_lo, cross_hi, alpha=0.18, color="blue", label="Cross 95% CI")
+
+    ax.plot(layers, null_mean, "--", color="gray", lw=1, label="Perm-null mean")
+    ax.plot(layers, within_r, "-", color="green", lw=2, alpha=0.8, label="Within (B->B)")
     ax.plot(layers, cross_r, "-", color="blue", lw=2, label="Cross (A->B)")
-    
-    sigs = [l for l in layers if per_layer[l]["p_value"] < 0.05]
+
+    # Use FDR-corrected p-value if available
+    p_key = "p_value_fdr" if USE_FDR and any("p_value_fdr" in per_layer[l] for l in layers) else "p_value"
+    sigs = [l for l in layers if float(per_layer[l].get(p_key, 1.0)) < ALPHA]
     if sigs:
         sig_rs = [per_layer[l]["cross_r"] for l in sigs]
-        ax.scatter(sigs, sig_rs, color="red", s=30, zorder=5, label="p<0.05")
+        ax.scatter(sigs, sig_rs, color="red", s=28, zorder=5, label=f"{p_key}<{ALPHA:g}")
     
     ax.axhline(0, color="black", ls=":", alpha=0.3)
     ax.set_xlabel("Layer")
@@ -500,18 +621,23 @@ def main():
                     X_B_train, X_B_test = X_B[train_idx_B], X_B[test_idx_B]
                     y_B_train, y_B_test = data_B["mc_metric"][train_idx_B], data_B["mc_metric"][test_idx_B]
                     
-                    # two_sided=False for D2D (entropy->entropy)
-                    d2d_eval = evaluate_transfer(X_B_test, y_B_test, real_dir, perm_dirs, two_sided=False)
-                    within_r = get_within_baseline(X_B_train, y_B_train, X_B_test, y_B_test, method)
-                    
+                    # two_sided=True for D2D
+                    d2d_eval = evaluate_transfer(X_B_test, y_B_test, real_dir, perm_dirs, two_sided=True)
+                    within_eval = get_within_baseline(X_B_train, y_B_train, X_B_test, y_B_test, method)
+                    within_r = within_eval["within_r"]
+
                     transfer_eff = d2d_eval["cross_r"] / within_r if abs(within_r) > 1e-6 else 0.0
-                    
+
                     res_d2d["per_layer"][layer] = {
                         "cross_r": d2d_eval["cross_r"],
+                        "cross_ci_low": d2d_eval["cross_ci_low"],
+                        "cross_ci_high": d2d_eval["cross_ci_high"],
                         "cross_p": d2d_eval["cross_p"],
                         "within_r": within_r,
+                        "within_ci_low": within_eval["within_ci_low"],
+                        "within_ci_high": within_eval["within_ci_high"],
                         "transfer_efficiency": float(transfer_eff),
-                        "p_value": d2d_eval["null_stats"]["raw_p"],
+                        "p_value": d2d_eval["p_value"],
                         "null_mean": d2d_eval["null_stats"]["mean"],
                         "null_std": d2d_eval["null_stats"]["std"],
                         "null_5th": d2d_eval["null_stats"]["p5"],
@@ -527,44 +653,53 @@ def main():
                         meta_acts = data_B["meta"][task]["acts"].get(layer)
                         if meta_acts is None: continue
 
-                        X_Meta = meta_acts[:len_B]
+                        X_Meta = meta_acts[:len_B].astype(np.float32)  # Cast to avoid float16 overflow
                         X_Meta_test = X_Meta[test_idx_B]
-                        conf_test = data_B["meta"][task]["conf"][:len_B][test_idx_B]
+                        conf_test = np.asarray(data_B["meta"][task]["conf"][:len_B][test_idx_B], dtype=np.float32)
+                        n_meta = int(conf_test.shape[0])
 
                         # Compute cross d2m: direction from A applied to B's meta activations
                         # Multiply projection by metric_sign so positive correlation = good transfer
                         cross_preds = (X_Meta_test @ real_dir) * msign
-                        cross_r, cross_p = pearsonr(cross_preds, conf_test)
+                        cross_r = _safe_pearson_r(cross_preds, conf_test)
+                        cross_ci_low, cross_ci_high = _fisher_ci(cross_r, n_meta, alpha=CI_ALPHA)
+
+                        try:
+                            _, cross_p = pearsonr(np.asarray(cross_preds, dtype=np.float64), np.asarray(conf_test, dtype=np.float64))
+                            cross_p = float(cross_p) if np.isfinite(cross_p) else 1.0
+                        except Exception:
+                            cross_p = 1.0
 
                         # Permutation test for significance (two-sided for d2m)
                         perm_preds = (X_Meta_test @ perm_dirs.T) * msign
-                        y_centered = conf_test - conf_test.mean()
-                        y_norm = np.linalg.norm(y_centered)
-                        P_centered = perm_preds - perm_preds.mean(axis=0)
-                        P_norms = np.linalg.norm(P_centered, axis=0)
-                        dot_prods = P_centered.T @ y_centered
-                        null_rs = dot_prods / (P_norms * y_norm + 1e-10)
+                        null_rs = _vectorized_null_rs(perm_preds, conf_test, eps=EPS_DENOM)
                         p_value = (np.sum(np.abs(null_rs) >= np.abs(cross_r)) + 1) / (len(null_rs) + 1)
 
                         # Within D2M Baseline (Train on B's MC, Test on B's Meta)
                         within_d2m_r = 0.0
+                        within_ci_low_m, within_ci_high_m = float("nan"), float("nan")
                         if len(X_B_train) > 0:
                             if method == "mean_diff":
-                                db, _ = compute_mean_diff_direction_vectorized(X_B_train, y_B_train, 0, None)
+                                db, _ = compute_mean_diff_direction_vectorized(X_B_train, y_B_train, 0, None, MEAN_DIFF_QUANTILE)
                             else:
                                 mb = ProbeDirectionManager(X_B_train, PROBE_ALPHA, PROBE_PCA_COMPONENTS)
                                 db, _ = mb.compute_directions(y_B_train, 0, None)
 
                             # Apply same metric_sign convention
                             p_within = (X_Meta_test @ db) * msign
-                            within_d2m_r, _ = pearsonr(p_within, conf_test)
+                            within_d2m_r = _safe_pearson_r(p_within, conf_test)
+                            within_ci_low_m, within_ci_high_m = _fisher_ci(within_d2m_r, n_meta, alpha=CI_ALPHA)
 
                         transfer_eff_m = cross_r / within_d2m_r if abs(within_d2m_r) > 1e-6 else 0.0
 
                         res_d2m[task]["per_layer"][layer] = {
                             "cross_r": float(cross_r),
+                            "cross_ci_low": float(cross_ci_low),
+                            "cross_ci_high": float(cross_ci_high),
                             "cross_p": float(cross_p),
                             "within_r": float(within_d2m_r),
+                            "within_ci_low": float(within_ci_low_m),
+                            "within_ci_high": float(within_ci_high_m),
                             "transfer_efficiency": float(transfer_eff_m),
                             "p_value": float(p_value),
                             "null_mean": float(np.mean(null_rs)),
@@ -573,27 +708,51 @@ def main():
                             "null_95th": float(np.percentile(null_rs, 95)),
                         }
 
-                # Save Summaries D2D
-                sig_layers = [l for l, d in res_d2d["per_layer"].items() if d["p_value"] < 0.05]
+                # Save Summaries D2D with FDR correction
+                d2d_layers = sorted(res_d2d["per_layer"].keys())
+                if d2d_layers:
+                    p_raw = np.array([res_d2d["per_layer"][l].get("p_value", 1.0) for l in d2d_layers], dtype=np.float64)
+                    if USE_FDR:
+                        q = _bh_fdr(p_raw)
+                        for l, qv in zip(d2d_layers, q):
+                            res_d2d["per_layer"][l]["p_value_fdr"] = float(qv)
+                        sig_layers = [l for l, qv in zip(d2d_layers, q) if qv < ALPHA]
+                    else:
+                        sig_layers = [l for l, pv in zip(d2d_layers, p_raw) if pv < ALPHA]
+                else:
+                    sig_layers = []
+
                 res_d2d["n_significant"] = len(sig_layers)
                 res_d2d["significant_layers"] = sig_layers
                 if sig_layers:
-                     best = max(sig_layers, key=lambda l: res_d2d["per_layer"][l]["cross_r"])
-                     res_d2d["best_layer"] = best
-                     res_d2d["best_cross_r"] = res_d2d["per_layer"][best]["cross_r"]
+                    best = max(sig_layers, key=lambda l: res_d2d["per_layer"][l]["cross_r"])
+                    res_d2d["best_layer"] = best
+                    res_d2d["best_cross_r"] = res_d2d["per_layer"][best]["cross_r"]
                 else:
                     res_d2d["best_layer"] = None
                     res_d2d["best_cross_r"] = None
-                
+
                 all_d2d[pair_key][metric][method] = res_d2d
-                
-                # Save Summaries D2M
+
+                # Save Summaries D2M with FDR correction
                 for task in res_d2m:
-                    sig_layers = [l for l, d in res_d2m[task]["per_layer"].items() if d["p_value"] < 0.05]
+                    task_layers = sorted(res_d2m[task]["per_layer"].keys())
+                    if task_layers:
+                        p_raw = np.array([res_d2m[task]["per_layer"][l].get("p_value", 1.0) for l in task_layers], dtype=np.float64)
+                        if USE_FDR:
+                            q = _bh_fdr(p_raw)
+                            for l, qv in zip(task_layers, q):
+                                res_d2m[task]["per_layer"][l]["p_value_fdr"] = float(qv)
+                            sig_layers = [l for l, qv in zip(task_layers, q) if qv < ALPHA]
+                        else:
+                            sig_layers = [l for l, pv in zip(task_layers, p_raw) if pv < ALPHA]
+                    else:
+                        sig_layers = []
+
                     res_d2m[task]["n_significant"] = len(sig_layers)
                     res_d2m[task]["significant_layers"] = sig_layers
                     if sig_layers:
-                        best = max(sig_layers, key=lambda l: abs(res_d2m[task]["per_layer"][l]["cross_r"]))
+                        best = max(sig_layers, key=lambda l: res_d2m[task]["per_layer"][l]["cross_r"])
                         res_d2m[task]["best_layer"] = best
                         res_d2m[task]["best_cross_r"] = res_d2m[task]["per_layer"][best]["cross_r"]
                     else:
@@ -626,7 +785,13 @@ def main():
             "n_permutations": N_PERMUTATIONS,
             "seed": SEED,
             "within_train_split": WITHIN_TRAIN_SPLIT,
-            "note": "Fair comparison: both cross (A_train) and within (B_train) use 80% for training. D2M p-value is two-sided."
+            "alpha": ALPHA,
+            "ci_alpha": CI_ALPHA,
+            "use_fdr": USE_FDR,
+            "note": (
+                "Fair comparison: both cross (A_train) and within (B_train) use 80% for training. "
+                "CIs are Fisher-z for observed r. BH-FDR is applied across layers within each panel when USE_FDR=True."
+            ),
         },
         "d2d": all_d2d,
         "d2m": all_d2m,

@@ -198,9 +198,39 @@ entropy_probes/
 │   ├── steering_experiments.py       # Ablation experiment utilities
 │   └── model_utils.py                # Model loading
 ├── tasks.py                          # Prompt templates
+├── filter_by_difficulty.py           # Filter by model correctness
 ├── outputs/                          # Results
-└── SimpleMC.jsonl, TriviaMC.jsonl    # Question datasets
+└── data/                             # Question datasets (see below)
 ```
+
+## Datasets
+
+Source datasets in `data/`:
+
+| Dataset | Questions | Description |
+|---------|-----------|-------------|
+| PopMC | 14,267 | Popular culture MC questions |
+| SimpleMC | 500 | Simple factual MC questions |
+| TriviaMC | 2,416 | Trivia MC questions |
+
+Experiments sample `NUM_QUESTIONS` (default 500) from these sources.
+
+### Difficulty Filtering
+
+To create balanced correct/incorrect subsets for better signal variance:
+
+```bash
+python filter_by_difficulty.py
+```
+
+Creates `data/TriviaMC_difficulty_filtered.jsonl` with 250 correct + 250 incorrect questions. Then use normally:
+
+```python
+# identify_mc_correlate.py
+DATASET = "TriviaMC_difficulty_filtered"
+```
+
+The filtered dataset plugs directly into the existing pipeline.
 
 ## Legacy Scripts
 

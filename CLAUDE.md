@@ -1,5 +1,31 @@
 # Guidelines for Claude
 
+## Current Project State (January 2026)
+
+### What We're Working On
+Difficulty-filtered datasets for D2M (direct-to-meta) transfer analysis. The 70B model is ~87% accurate on TriviaMC, causing low entropy variance. Goal: create balanced 50/50 correct/incorrect split to increase signal variance.
+
+### Recent Fix: Left-Padding Bug in filter_by_difficulty.py
+**Problem:** `filter_by_difficulty.py` was using wrong position calculation for left-padded sequences, causing meaningless filtering (87% accuracy instead of expected 50%).
+
+**Root cause:** `core/model_utils.py:160` sets `tokenizer.padding_side = "left"`. The filter script was using `logits[i, seq_len - 1, :]` which is wrong for left-padding - it reads from a middle position, not the last token.
+
+**Fix applied:** Changed to `logits[i, -1, :]` which always gets the last position regardless of padding direction. Compare to `core/extraction.py:151` which correctly uses `-1`.
+
+### Next Steps
+1. Run `python filter_by_difficulty.py` on remote machine to create new filtered dataset
+2. Run `python identify_mc_correlate.py` with `DATASET = "TriviaMC_difficulty_filtered"`
+3. Accuracy should now be ~50% (250 correct + 250 incorrect)
+
+### Key Files for This Work
+- `filter_by_difficulty.py` - Creates difficulty-filtered datasets
+- `load_and_format_datasets.py` - Contains `load_and_format_triviamc_filtered()` which handles pre-stored options
+- `identify_mc_correlate.py` - Main analysis script, currently set to `DATASET = "TriviaMC_difficulty_filtered"`
+- `core/model_utils.py` - Model loading, sets left-padding
+- `core/extraction.py` - Activation extraction with correct position handling
+
+---
+
 ## Do not run tests locally
 This repo runs on a remote machine. Never run `python run_mc_answer_ablation.py` or similar test commands locally - it won't work and wastes time. Rely on static analysis instead.
 
@@ -59,3 +85,16 @@ After ANY change, you must SHOW these outputs (not just promise to do them):
 4. **Code cannot be tested locally** - this repo runs remotely. So you must be extra thorough with static analysis. Trace through the code paths manually.
 
 5. **One crash = full audit**: If the user reports a crash after you said it was ready, grep for ALL similar patterns and fix them all. Show the grep output.
+
+## Critical Codebase Patterns
+
+### Left-Padding
+This codebase uses **left-padding** (`core/model_utils.py:160`). When extracting logits from the last token position:
+- **CORRECT:** `logits[i, -1, :]` - always gets last position
+- **WRONG:** `logits[i, seq_len - 1, :]` - gets wrong position with left-padding
+
+### Options Dict Preservation
+Difficulty-filtered datasets store options as a dict `{"A": "...", "B": "...", ...}` with letter keys. The loader in `load_and_format_datasets.py` checks for pre-stored options and uses them directly without reshuffling, preserving exact prompt reproducibility.
+
+### Configuration Pattern
+Scripts use module-level constants (MODEL, DATASET, NUM_QUESTIONS, etc.) rather than CLI args. Edit the constants directly to change behavior.

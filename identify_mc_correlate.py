@@ -40,16 +40,16 @@ from tasks import format_direct_prompt
 # CONFIGURATION
 # =============================================================================
 
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter
-DATASET = "SimpleMC"
+DATASET = "TriviaMC_difficulty_filtered"
 METRICS = ["entropy", "logit_gap"]  # Which metrics to analyze
 NUM_QUESTIONS = 500
 SEED = 42
-BATCH_SIZE = 8
+BATCH_SIZE = 8*4
 
 # Quantization (for large models like 70B)
-LOAD_IN_4BIT = False  # Set True for 70B+ models
+LOAD_IN_4BIT = True  # Set True for 70B+ models
 LOAD_IN_8BIT = False
 
 # Direction-finding parameters

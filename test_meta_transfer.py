@@ -56,6 +56,15 @@ from tasks import (
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+#
+# CACHING WARNING: Meta-task activations and P(Answer)/confidence values are
+# cached at: outputs/{INPUT_BASE_NAME}_transfer_{META_TASK}_activations.npz
+#
+# If you modify the prompts in tasks.py (e.g., teammate performance), you MUST
+# delete the cache file to force re-extraction. Otherwise the script will
+# silently use stale data from the old prompts.
+#
+# =============================================================================
 
 # Base name for input files from identify_mc_correlate.py
 # Will load: {INPUT_BASE_NAME}_mc_{metric}_probes.joblib and {INPUT_BASE_NAME}_mc_dataset.json
@@ -102,6 +111,85 @@ OUTPUT_DIR = Path(__file__).parent / "outputs"
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+
+def compute_behavioral_stats(
+    confidences: np.ndarray,
+    option_probs: np.ndarray = None,
+    meta_task: str = "delegate"
+) -> dict:
+    """
+    Compute behavioral statistics for the meta-task.
+
+    Args:
+        confidences: (n_samples,) array of confidence signals
+                     For delegate: P(Answer) in [0, 1]
+                     For confidence: expected confidence from weighted sum
+        option_probs: (n_samples, n_options) array of raw option probabilities
+                      For delegate: (n, 2) for ["1", "2"]
+                      For confidence: (n, 8) for ["S", "T", ..., "Z"]
+        meta_task: "delegate" or "confidence"
+
+    Returns:
+        dict with behavioral statistics
+    """
+    stats = {"n_samples": len(confidences)}
+
+    if meta_task == "delegate":
+        # For delegate task: confidences = P(Answer)
+        delegation_rate = float((confidences < 0.5).mean())
+        answer_rate = float((confidences >= 0.5).mean())
+        stats["delegation_rate"] = delegation_rate
+        stats["answer_rate"] = answer_rate
+        stats["P_answer_mean"] = float(confidences.mean())
+        stats["P_answer_std"] = float(confidences.std())
+        stats["P_answer_min"] = float(confidences.min())
+        stats["P_answer_max"] = float(confidences.max())
+        stats["P_answer_median"] = float(np.median(confidences))
+        stats["P_answer_quantiles"] = {
+            "q10": float(np.percentile(confidences, 10)),
+            "q25": float(np.percentile(confidences, 25)),
+            "q50": float(np.percentile(confidences, 50)),
+            "q75": float(np.percentile(confidences, 75)),
+            "q90": float(np.percentile(confidences, 90)),
+        }
+    else:
+        # For confidence task: confidences = weighted sum of S-Z midpoints
+        stats["confidence_mean"] = float(confidences.mean())
+        stats["confidence_std"] = float(confidences.std())
+        stats["confidence_min"] = float(confidences.min())
+        stats["confidence_max"] = float(confidences.max())
+        stats["confidence_median"] = float(np.median(confidences))
+        stats["confidence_quantiles"] = {
+            "q10": float(np.percentile(confidences, 10)),
+            "q25": float(np.percentile(confidences, 25)),
+            "q50": float(np.percentile(confidences, 50)),
+            "q75": float(np.percentile(confidences, 75)),
+            "q90": float(np.percentile(confidences, 90)),
+        }
+
+        # If we have raw option probs, compute response distribution
+        if option_probs is not None:
+            option_names = list(STATED_CONFIDENCE_OPTIONS.keys())  # ["S", "T", ..., "Z"]
+
+            # Mean probability mass on each option across samples
+            mean_probs = option_probs.mean(axis=0)
+            stats["mean_option_probs"] = {
+                name: float(mean_probs[i]) for i, name in enumerate(option_names)
+            }
+
+            # Modal response distribution (argmax for each sample)
+            modal_responses = np.argmax(option_probs, axis=1)
+            modal_counts = np.bincount(modal_responses, minlength=len(option_names))
+            stats["modal_response_counts"] = {
+                name: int(modal_counts[i]) for i, name in enumerate(option_names)
+            }
+            stats["modal_response_rates"] = {
+                name: float(modal_counts[i] / len(confidences))
+                for i, name in enumerate(option_names)
+            }
+
+    return stats
 
 
 def load_probes(probes_path: Path) -> dict:
@@ -995,6 +1083,11 @@ def main():
                     position_valid_arrays[pos_name] = loaded[key]
                 elif key == "confidences":
                     confidences = loaded[key]
+                elif key == "option_probs":
+                    option_probs = loaded[key]
+            # If no option_probs found (old cache), set to None
+            if "option_probs" not in loaded.files:
+                option_probs = None
             # If no validity masks found (old format), assume all valid
             if not position_valid_arrays:
                 n_samples = len(confidences)
@@ -1009,7 +1102,12 @@ def main():
                     legacy_activations[layer] = loaded[key]
                 elif key == "confidences":
                     confidences = loaded[key]
+                elif key == "option_probs":
+                    option_probs = loaded[key]
             meta_activations = {"final": legacy_activations}
+            # Legacy format: no option_probs
+            if "option_probs" not in loaded.files:
+                option_probs = None
             # Legacy format: only final position, all valid
             n_samples = len(confidences)
             position_valid_arrays = {"final": np.ones(n_samples, dtype=bool)}
@@ -1057,6 +1155,7 @@ def main():
             for pos in PROBE_POSITIONS
         }
         all_confidences = []
+        all_option_probs = []  # Raw probability distributions over options
         all_mappings = []
         # Track which examples have valid positions for each position name
         # (when find_mc_positions fails, it returns only {"final": -1})
@@ -1117,6 +1216,7 @@ def main():
                 for p, mapping in zip(probs, batch_mappings):
                     confidence = signal_fn(p, mapping)
                     all_confidences.append(confidence)
+                    all_option_probs.append(p)
                     all_mappings.append(mapping)
 
         # Stack activations: {position: {layer: np.array}}
@@ -1126,6 +1226,7 @@ def main():
             for pos, pos_acts in all_activations.items()
         }
         confidences = np.array(all_confidences)
+        option_probs = np.stack(all_option_probs)  # (n_samples, n_options)
         # Convert validity masks to arrays
         position_valid_arrays = {pos: np.array(valid) for pos, valid in position_valid.items()}
 
@@ -1138,7 +1239,7 @@ def main():
 
         # Save activations for future runs
         print(f"Saving activations to {activations_path}...")
-        save_dict = {"confidences": confidences}
+        save_dict = {"confidences": confidences, "option_probs": option_probs}
         for pos_name, pos_acts in meta_activations.items():
             for layer, acts in pos_acts.items():
                 save_dict[f"layer_{layer}_{pos_name}"] = acts
@@ -1608,13 +1709,9 @@ def main():
             "probe_pca_components": PROBE_PCA_COMPONENTS,
             "probe_positions": positions_available,
         },
-        "meta_target_stats": {
-            "name": "stated_confidence" if META_TASK == "confidence" else "P(Answer)",
-            "mean": float(confidences.mean()),
-            "std": float(confidences.std()),
-            "min": float(confidences.min()),
-            "max": float(confidences.max()),
-        },
+        "meta_target_stats": compute_behavioral_stats(
+            confidences, option_probs, META_TASK
+        ),
         "transfer": {},
         "behavioral": behavioral,
     }
