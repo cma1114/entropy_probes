@@ -78,6 +78,84 @@ outputs/
 └── {model}_{dataset}_ablation_{task}_{metric}_comparison.png
 ```
 
+## Additional Direction Types
+
+Beyond uncertainty directions, the workflow supports finding and analyzing other direction types.
+
+### MC Answer Directions
+
+Find directions that predict which answer (A/B/C/D) the model chose:
+
+```bash
+python identify_mc_answer_correlate.py
+```
+
+Reuses cached activations from `identify_mc_correlate.py`. Outputs:
+- `*_mc_answer_directions.npz` - Directions (classifier + centroid methods)
+- `*_mc_answer_probes.joblib` - 4-class probes (scaler, pca, clf per layer)
+- `*_mc_answer_results.json` - Per-layer accuracy
+
+When answer classifiers exist, `test_meta_transfer.py` automatically tests answer D2M transfer.
+
+### Confidence Directions
+
+Find directions that predict stated confidence from meta-task activations:
+
+```bash
+python identify_confidence_correlate.py
+```
+
+Reuses cached activations from `test_meta_transfer.py`. Configuration:
+```python
+INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC_difficulty_filtered"
+META_TASK = "delegate"  # or "confidence" or "other_confidence"
+```
+
+### Other-Confidence Meta-Task
+
+The `other_confidence` meta-task asks about estimated human difficulty rather than self-confidence:
+
+```bash
+python test_meta_transfer.py  # META_TASK = "other_confidence"
+```
+
+### Compare Direction Types
+
+Compare uncertainty, answer, and confidence directions:
+
+```bash
+python compare_direction_types.py
+```
+
+Outputs cosine similarities between direction types per layer.
+
+### Ablation with Different Direction Types
+
+```bash
+python run_ablation_causality.py  # DIRECTION_TYPE = "uncertainty" (default)
+python run_ablation_causality.py  # DIRECTION_TYPE = "answer"
+python run_ablation_causality.py  # DIRECTION_TYPE = "confidence"
+```
+
+### Full Pipeline with All Direction Types
+
+```bash
+# Phase 1: Direct task
+python identify_mc_correlate.py           # Extracts activations, finds uncertainty directions
+python identify_mc_answer_correlate.py    # Finds answer directions (reuses activations)
+
+# Phase 2: Meta-tasks
+python test_meta_transfer.py              # META_TASK="delegate"
+python test_meta_transfer.py              # META_TASK="other_confidence"
+python identify_confidence_correlate.py   # META_TASK="delegate"
+python identify_confidence_correlate.py   # META_TASK="other_confidence"
+
+# Phase 3: Analysis
+python compare_direction_types.py
+python run_ablation_causality.py          # DIRECTION_TYPE="uncertainty"
+python run_ablation_causality.py          # DIRECTION_TYPE="answer"
+```
+
 ## Direction-Finding Methods
 
 Two fundamentally different approaches:
@@ -179,20 +257,27 @@ The `core/` directory provides reusable utilities:
 - `model_utils.py`: Model loading, quantization support
 - `extraction.py`: Batched activation extraction
 - `metrics.py`: Uncertainty metric computation
-- `directions.py`: Direction finding (probe, mean_diff)
+- `directions.py`: Uncertainty direction finding (probe, mean_diff)
+- `answer_directions.py`: MC answer direction finding (4-class classification)
+- `confidence_directions.py`: Confidence direction finding from meta-task activations
 - `steering.py`: Activation intervention hooks
 
 ## Key Files
 
 ```
 entropy_probes/
-├── identify_mc_correlate.py          # Step 0: MC task
-├── identify_nexttoken_correlate.py   # Step 0: Next-token task
-├── test_meta_transfer.py             # Step 1: Transfer test
-├── run_ablation_causality.py         # Step 2: Ablation causality test
+├── identify_mc_correlate.py          # Find uncertainty directions (MC task)
+├── identify_nexttoken_correlate.py   # Find uncertainty directions (next-token task)
+├── identify_mc_answer_correlate.py   # Find MC answer directions
+├── identify_confidence_correlate.py  # Find confidence directions from meta-task
+├── test_meta_transfer.py             # Test D2M transfer
+├── compare_direction_types.py        # Compare direction types
+├── run_ablation_causality.py         # Ablation causality test
 ├── core/
 │   ├── metrics.py                    # Metric computation
-│   ├── directions.py                 # Direction finding
+│   ├── directions.py                 # Uncertainty direction finding
+│   ├── answer_directions.py          # MC answer direction finding
+│   ├── confidence_directions.py      # Confidence direction finding
 │   ├── extraction.py                 # Activation extraction
 │   ├── steering.py                   # Activation intervention hooks
 │   ├── steering_experiments.py       # Ablation experiment utilities

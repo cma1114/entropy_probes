@@ -6,6 +6,8 @@ Modules:
 - extraction: BatchedExtractor for activation/logit extraction
 - metrics: Uncertainty metric computation (entropy, logit_gap, etc.)
 - directions: Direction finding methods (probe, mean_diff)
+- answer_directions: MC answer choice direction finding (4-class classification)
+- confidence_directions: Meta-judgment confidence direction finding
 - probes: Linear probe training, transfer testing, permutation tests
 - questions: Question loading, hashing, consistency verification
 - steering: Steering and ablation hooks for activation intervention
@@ -45,6 +47,28 @@ from .directions import (
     apply_probe_centered,
     apply_probe_separate,
     evaluate_transfer,
+)
+
+from .answer_directions import (
+    train_mc_answer_classifier,
+    extract_answer_direction,
+    apply_answer_classifier_centered,
+    apply_answer_classifier_separate,
+    find_answer_directions,
+    find_answer_directions_both_methods,
+    class_centroid_direction,
+    encode_answers,
+    decode_answers,
+)
+
+from .confidence_directions import (
+    train_confidence_probe,
+    extract_confidence_direction,
+    evaluate_confidence_probe,
+    find_confidence_directions,
+    find_confidence_directions_both_methods,
+    compare_confidence_to_uncertainty,
+    cross_evaluate_directions,
 )
 
 from .probes import (
@@ -137,6 +161,24 @@ __all__ = [
     "apply_probe_centered",
     "apply_probe_separate",
     "evaluate_transfer",
+    # answer_directions
+    "train_mc_answer_classifier",
+    "extract_answer_direction",
+    "apply_answer_classifier_centered",
+    "apply_answer_classifier_separate",
+    "find_answer_directions",
+    "find_answer_directions_both_methods",
+    "class_centroid_direction",
+    "encode_answers",
+    "decode_answers",
+    # confidence_directions
+    "train_confidence_probe",
+    "extract_confidence_direction",
+    "evaluate_confidence_probe",
+    "find_confidence_directions",
+    "find_confidence_directions_both_methods",
+    "compare_confidence_to_uncertainty",
+    "cross_evaluate_directions",
     # probes
     "LinearProbe",
     "train_and_evaluate_probe",

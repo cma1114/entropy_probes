@@ -1,31 +1,5 @@
 # Guidelines for Claude
 
-## Current Project State (January 2026)
-
-### What We're Working On
-Difficulty-filtered datasets for D2M (direct-to-meta) transfer analysis. The 70B model is ~87% accurate on TriviaMC, causing low entropy variance. Goal: create balanced 50/50 correct/incorrect split to increase signal variance.
-
-### Recent Fix: Left-Padding Bug in filter_by_difficulty.py
-**Problem:** `filter_by_difficulty.py` was using wrong position calculation for left-padded sequences, causing meaningless filtering (87% accuracy instead of expected 50%).
-
-**Root cause:** `core/model_utils.py:160` sets `tokenizer.padding_side = "left"`. The filter script was using `logits[i, seq_len - 1, :]` which is wrong for left-padding - it reads from a middle position, not the last token.
-
-**Fix applied:** Changed to `logits[i, -1, :]` which always gets the last position regardless of padding direction. Compare to `core/extraction.py:151` which correctly uses `-1`.
-
-### Next Steps
-1. Run `python filter_by_difficulty.py` on remote machine to create new filtered dataset
-2. Run `python identify_mc_correlate.py` with `DATASET = "TriviaMC_difficulty_filtered"`
-3. Accuracy should now be ~50% (250 correct + 250 incorrect)
-
-### Key Files for This Work
-- `filter_by_difficulty.py` - Creates difficulty-filtered datasets
-- `load_and_format_datasets.py` - Contains `load_and_format_triviamc_filtered()` which handles pre-stored options
-- `identify_mc_correlate.py` - Main analysis script, currently set to `DATASET = "TriviaMC_difficulty_filtered"`
-- `core/model_utils.py` - Model loading, sets left-padding
-- `core/extraction.py` - Activation extraction with correct position handling
-
----
-
 ## Do not run tests locally
 This repo runs on a remote machine. Never run `python run_mc_answer_ablation.py` or similar test commands locally - it won't work and wastes time. Rely on static analysis instead.
 
@@ -66,6 +40,22 @@ After writing or revising a script, STOP and critically review it before telling
 4. **Check the comparison is fair**: When comparing method A vs method B, ensure both are evaluated on the same held-out data with equivalent methodology.
 
 5. **Read the code as a skeptic**: Pretend you're reviewing someone else's code and looking for flaws. What would you criticize?
+
+## Statistical/ML Code Review Checklist
+
+Before declaring any statistical or ML code complete, explicitly verify:
+
+1. **Complexity**: What's the time complexity? If bootstrap, am I refitting models or just recomputing metrics from fixed predictions? Refitting is almost always wrong.
+
+2. **Object identity**: Trace every scaler/pca/model - where was it created? If I call `scaler_shuf, pca_shuf, probe = train_probe(X, y_shuffled)`, I must use `scaler_shuf` and `pca_shuf` later, not objects from a different training run.
+
+3. **Formulas**: Write out symbolically and verify. Common errors:
+   - OLS slope = `corr × (σ_y/σ_x)`, NOT `(σ_y/σ_x) × sign(corr)`
+   - If computing a metric two ways (e.g., `test_r2` and bootstrapped `test_r2_mean`), they must measure the same thing
+
+4. **Numerical stability**: What happens when variance → 0? For bounded metrics (R² ∈ (-∞,1], accuracy ∈ [0,1]), is output actually bounded? Bootstrap resampling can create pathological samples.
+
+5. **Consistency check**: If I compute `metric` and `metric_mean` (bootstrapped), they should be approximately equal. If they differ systematically, there's a bug.
 
 ## Before declaring any refactoring complete
 

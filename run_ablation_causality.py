@@ -1,22 +1,27 @@
 """
-Ablation causality test for uncertainty directions.
+Ablation causality test for directions (uncertainty, answer, or confidence).
 
-Tests whether directions from identify_mc_correlate.py are causally necessary
-for the model's meta-judgments. If ablating a direction degrades the correlation
-between stated confidence and actual uncertainty, that's evidence the direction
-is causally involved in introspection.
+Tests whether directions are causally necessary for the model's meta-judgments.
+If ablating a direction degrades the correlation between stated confidence and
+actual uncertainty, that's evidence the direction is causally involved.
+
+Supports multiple direction types:
+- "uncertainty": From identify_mc_correlate.py (entropy, logit_gap, etc.)
+- "answer": From identify_mc_answer_correlate.py (MC answer A/B/C/D)
+- "confidence": From identify_confidence_correlate.py (stated confidence)
 
 Key features:
 - Tests ALL layers by default (no pre-filtering by transfer R²)
-- Tests BOTH probe and mean_diff methods in a single run for comparison
+- Tests BOTH probe and mean_diff methods (for uncertainty) or single method (for answer/confidence)
 - Uses pooled null distribution + FDR correction for robust statistics
 
 Usage:
     python run_ablation_causality.py
 
-Expects outputs from identify_mc_correlate.py:
-    outputs/{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz
-    outputs/{INPUT_BASE_NAME}_mc_dataset.json
+Expects outputs from identification scripts based on DIRECTION_TYPE:
+    For uncertainty: outputs/{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz
+    For answer: outputs/{INPUT_BASE_NAME}_mc_answer_directions.npz
+    For confidence: outputs/{INPUT_BASE_NAME}_{META_TASK}_confidence_directions.npz
 """
 
 import torch
@@ -64,8 +69,14 @@ from tasks import (
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC"
-METRIC = "top_logit"  # Which metric's directions to test
-META_TASK = "delegate"  # "confidence" or "delegate"
+METRIC = "top_logit"  # Which metric's directions to test (for DIRECTION_TYPE="uncertainty")
+META_TASK = "delegate"  # "confidence", "delegate", or "other_confidence"
+
+# Direction type to ablate:
+# - "uncertainty": Ablate uncertainty directions (from identify_mc_correlate.py)
+# - "answer": Ablate MC answer directions (from identify_mc_answer_correlate.py)
+# - "confidence": Ablate confidence directions (from identify_confidence_correlate.py)
+DIRECTION_TYPE = "uncertainty"
 
 # Confidence signal used as the meta-task output target.
 # - For META_TASK=delegate:
@@ -219,45 +230,126 @@ def get_layers_from_transfer(
 # DIRECTION LOADING
 # =============================================================================
 
-def load_directions(base_name: str, metric: str) -> Dict[str, Dict[int, np.ndarray]]:
+def load_directions(
+    base_name: str,
+    direction_type: str = "uncertainty",
+    metric: str = "entropy",
+    meta_task: str = "delegate"
+) -> Dict[str, Dict[int, np.ndarray]]:
     """
-    Load all direction methods from npz file.
+    Load direction vectors based on direction type.
+
+    Args:
+        base_name: Base name for input files
+        direction_type: "uncertainty", "answer", or "confidence"
+        metric: Uncertainty metric (only used for direction_type="uncertainty")
+        meta_task: Meta task (only used for direction_type="confidence")
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
-        e.g., {"probe": {0: arr, 1: arr, ...}, "mean_diff": {0: arr, 1: arr, ...}}
+        For uncertainty: {"probe": {...}, "mean_diff": {...}}
+        For answer: {"answer": {...}}
+        For confidence: {"confidence": {...}}
     """
-    path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+    if direction_type == "uncertainty":
+        path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+    elif direction_type == "answer":
+        path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
+    elif direction_type == "confidence":
+        path = OUTPUT_DIR / f"{base_name}_{meta_task}_confidence_directions.npz"
+    else:
+        raise ValueError(f"Unknown direction type: {direction_type}")
+
     if not path.exists():
         raise FileNotFoundError(f"Directions file not found: {path}")
 
     data = np.load(path)
 
     methods: Dict[str, Dict[int, np.ndarray]] = {}
-    for key in data.files:
-        if key.startswith("_"):
-            continue  # Skip metadata keys
 
+    if direction_type == "uncertainty":
         # Keys are like "probe_layer_0", "mean_diff_layer_5"
-        parts = key.rsplit("_layer_", 1)
-        if len(parts) != 2:
-            continue
+        for key in data.files:
+            if key.startswith("_"):
+                continue  # Skip metadata keys
 
-        method, layer_str = parts
-        try:
-            layer = int(layer_str)
-        except ValueError:
-            continue
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) != 2:
+                continue
 
-        if method not in methods:
-            methods[method] = {}
+            method, layer_str = parts
+            try:
+                layer = int(layer_str)
+            except ValueError:
+                continue
 
-        # Normalize direction
-        direction = data[key].astype(np.float32)
-        norm = np.linalg.norm(direction)
-        if norm > 0:
-            direction = direction / norm
-        methods[method][layer] = direction
+            if method not in methods:
+                methods[method] = {}
+
+            # Normalize direction
+            direction = data[key].astype(np.float32)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+            methods[method][layer] = direction
+
+    elif direction_type == "answer":
+        # Keys are like "classifier_layer_0", "centroid_layer_5"
+        # (matches uncertainty direction naming convention)
+        for key in data.files:
+            if key.startswith("_"):
+                continue
+
+            # Handle new format: "classifier_layer_0", "centroid_layer_5"
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) == 2:
+                method, layer_str = parts
+                try:
+                    layer = int(layer_str)
+                except ValueError:
+                    continue
+
+                if method not in methods:
+                    methods[method] = {}
+
+                direction = data[key].astype(np.float32)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction = direction / norm
+                methods[method][layer] = direction
+
+            # Also handle legacy format: "layer_0"
+            elif key.startswith("layer_"):
+                try:
+                    layer = int(key.replace("layer_", ""))
+                except ValueError:
+                    continue
+
+                if "answer" not in methods:
+                    methods["answer"] = {}
+
+                direction = data[key].astype(np.float32)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction = direction / norm
+                methods["answer"][layer] = direction
+
+    elif direction_type == "confidence":
+        # Keys are like "layer_0", "layer_1", etc.
+        methods["confidence"] = {}
+        for key in data.files:
+            if key.startswith("_"):
+                continue
+            if key.startswith("layer_"):
+                try:
+                    layer = int(key.replace("layer_", ""))
+                except ValueError:
+                    continue
+                direction = data[key].astype(np.float32)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction = direction / norm
+                methods["confidence"][layer] = direction
 
     return methods
 
@@ -1554,15 +1646,23 @@ def main():
     print("=" * 70)
     print(f"\nModel: {MODEL}")
     print(f"Input: {INPUT_BASE_NAME}")
-    print(f"Metric: {METRIC}")
+    print(f"Direction type: {DIRECTION_TYPE}")
+    if DIRECTION_TYPE == "uncertainty":
+        print(f"Metric: {METRIC}")
     print(f"Meta-task: {META_TASK}")
     print(f"Questions: {NUM_QUESTIONS}")
     print(f"Controls: {NUM_CONTROLS} (final), {NUM_CONTROLS_NONFINAL} (non-final)")
     print(f"Bootstrap: {BOOTSTRAP_N} resamples (CI={int((1-BOOTSTRAP_CI_ALPHA)*100)}%)")
 
-    # Load directions
+    # Load directions based on direction type
     print("\nLoading directions...")
-    all_directions = load_directions(INPUT_BASE_NAME, METRIC)
+    print(f"  Direction type: {DIRECTION_TYPE}")
+    all_directions = load_directions(
+        INPUT_BASE_NAME,
+        direction_type=DIRECTION_TYPE,
+        metric=METRIC,
+        meta_task=META_TASK
+    )
     available_methods = list(all_directions.keys())
     print(f"  Found methods: {available_methods}")
 
@@ -1737,12 +1837,15 @@ def main():
 
         # Incremental save after each position completes (crash protection)
         model_short = get_model_short_name(MODEL)
-        base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_ablation_{META_TASK}_{METRIC}"
+        # Include direction type in output name to distinguish different ablation experiments
+        dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
+        base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_ablation_{META_TASK}_{dir_suffix}"
         checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
         checkpoint_json = {
             "config": {
                 "model": MODEL,
                 "input_base_name": INPUT_BASE_NAME,
+                "direction_type": DIRECTION_TYPE,
                 "metric": METRIC,
                 "meta_task": META_TASK,
                 "num_questions": len(questions),

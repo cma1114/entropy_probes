@@ -43,13 +43,21 @@ from core import (
     metric_sign_for_confidence,
 )
 from core.directions import probe_direction
+from core.answer_directions import (
+    apply_answer_classifier_centered,
+    apply_answer_classifier_separate,
+    encode_answers,
+)
 from tasks import (
     format_stated_confidence_prompt,
     format_answer_or_delegate_prompt,
+    format_other_confidence_prompt,
     get_stated_confidence_signal,
     get_answer_or_delegate_signal,
+    get_other_confidence_signal,
     STATED_CONFIDENCE_OPTIONS,
     ANSWER_OR_DELEGATE_OPTIONS,
+    OTHER_CONFIDENCE_OPTIONS,
     find_mc_positions,
 )
 
@@ -77,10 +85,11 @@ METRICS = ["entropy", "top_logit"]
 # Optional adapter (must match identify step if used)
 ADAPTER = None
 
-# Meta task to test: "confidence" or "delegate"
+# Meta task to test: "confidence" or "other_confidence" or "delegate"
 META_TASK = "delegate"
 
 # Processing
+# Delegate task uses longer prompts, so smaller batch size
 BATCH_SIZE = 4 if META_TASK == "delegate" else 8
 
 # Bootstrap for confidence intervals
@@ -375,6 +384,37 @@ def bootstrap_r2_from_predictions(
     return float(r2s.mean()), float(r2s.std(ddof=0))
 
 
+def bootstrap_accuracy_from_predictions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_bootstrap: int = 100,
+    seed: int = 42,
+) -> tuple:
+    """
+    Bootstrap CI for classification accuracy by resampling test examples.
+
+    Resamples test indices and recomputes accuracy on each resample.
+
+    Returns:
+        (mean_acc, std_acc) over bootstrap replicates.
+    """
+    rng = np.random.RandomState(seed)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = len(y_true)
+    if n == 0:
+        return float("nan"), float("nan")
+
+    accs = []
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, n, replace=True)
+        acc = float((y_true[idx] == y_pred[idx]).mean())
+        accs.append(acc)
+
+    accs = np.array(accs)
+    return float(accs.mean()), float(accs.std(ddof=0))
+
+
 def load_dataset(dataset_path: Path) -> dict:
     """Load dataset JSON with questions and metric values."""
     with open(dataset_path) as f:
@@ -410,8 +450,10 @@ def get_meta_format_fn(meta_task: str):
         return format_stated_confidence_prompt
     elif meta_task == "delegate":
         return format_answer_or_delegate_prompt
+    elif meta_task == "other_confidence":
+        return format_other_confidence_prompt
     else:
-        raise ValueError(f"Unknown meta task: {meta_task}")
+        raise ValueError(f"Unknown meta task: {meta_task}. Valid options: confidence, delegate, other_confidence")
 
 
 def get_meta_signal_fn(meta_task: str):
@@ -420,8 +462,10 @@ def get_meta_signal_fn(meta_task: str):
         return lambda probs, mapping: get_stated_confidence_signal(probs)
     elif meta_task == "delegate":
         return get_answer_or_delegate_signal
+    elif meta_task == "other_confidence":
+        return lambda probs, mapping: get_other_confidence_signal(probs)
     else:
-        raise ValueError(f"Unknown meta task: {meta_task}")
+        raise ValueError(f"Unknown meta task: {meta_task}. Valid options: confidence, delegate, other_confidence")
 
 
 def get_meta_options(meta_task: str):
@@ -430,8 +474,10 @@ def get_meta_options(meta_task: str):
         return list(STATED_CONFIDENCE_OPTIONS.keys())
     elif meta_task == "delegate":
         return ANSWER_OR_DELEGATE_OPTIONS
+    elif meta_task == "other_confidence":
+        return list(OTHER_CONFIDENCE_OPTIONS.keys())
     else:
-        raise ValueError(f"Unknown meta task: {meta_task}")
+        raise ValueError(f"Unknown meta task: {meta_task}. Valid options: confidence, delegate, other_confidence")
 
 
 def plot_transfer_results(
@@ -854,6 +900,221 @@ def plot_mean_diff_transfer_results(
     print(f"  Saved: {output_path}")
 
 
+def plot_answer_transfer_results(
+    d2d_results: dict,
+    d2m_results_by_pos: dict,
+    num_layers: int,
+    output_path: Path,
+    meta_task: str,
+):
+    """
+    Plot answer classifier transfer accuracy across layers.
+
+    Follows the same visual language as uncertainty transfer plots:
+    - D→D shown as lighter reference lines
+    - D→M shown as solid transfer lines
+    - Per-position breakdown with consistent colors
+    - Chance baseline at 25%
+
+    2x2 grid:
+    - Panel 1: D→D vs D→M accuracy (centered) - main transfer result
+    - Panel 2: D→D vs D→M accuracy (separate) - upper bound
+    - Panel 3: Transfer efficiency (D→M / D→D ratio)
+    - Panel 4: Normalized accuracy (min-max scaled emergence)
+    """
+    CHANCE_LEVEL = 0.25  # 4-way classification
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Answer Direction D→M Transfer: {meta_task}", fontsize=14, fontweight='bold')
+
+    layers = list(range(num_layers))
+
+    # Position styling (match other transfer plots)
+    pos_colors = {
+        "question_mark": "tab:blue",
+        "question_newline": "tab:cyan",
+        "options_newline": "tab:green",
+        "final": "tab:red",
+    }
+    pos_labels = {
+        "question_mark": "question ?",
+        "question_newline": "question \\n",
+        "options_newline": "options \\n",
+        "final": "final",
+    }
+
+    positions = [p for p in d2m_results_by_pos.keys() if d2m_results_by_pos[p]]
+
+    # Build D→D accuracy and std arrays
+    d2d_acc = np.array([d2d_results.get(l, {}).get("accuracy", np.nan) for l in layers])
+    d2d_std = np.array([d2d_results.get(l, {}).get("accuracy_std", 0) for l in layers])
+
+    # Find best D→D layer
+    d2d_finite = np.isfinite(d2d_acc)
+    if d2d_finite.any():
+        best_d2d_layer = int(np.argmax(np.where(d2d_finite, d2d_acc, -np.inf)))
+        best_d2d_acc = d2d_acc[best_d2d_layer]
+    else:
+        best_d2d_layer, best_d2d_acc = 0, np.nan
+
+    # Panel 1: D→D vs D→M Centered (Rigorous Transfer Test)
+    ax1 = axes[0, 0]
+    ax1.set_title("Centered Scaling (Rigorous)\nD→D reference vs D→M transfer", fontsize=10)
+    ax1.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.7, linewidth=1.5, label=f"Chance ({CHANCE_LEVEL:.0%})")
+
+    # D→D as reference with CI band
+    ax1.plot(layers, d2d_acc, '-', color='tab:purple', linewidth=2, alpha=0.4,
+             label=f'D→D (best L{best_d2d_layer}: {best_d2d_acc:.1%})')
+    if np.any(d2d_std > 0):
+        ax1.fill_between(layers, d2d_acc - d2d_std, d2d_acc + d2d_std, color='tab:purple', alpha=0.18)
+
+    # D→M per position with CI bands
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        d2m_acc = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+        d2m_std = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy_std", 0)
+            for l in layers
+        ])
+
+        finite = np.isfinite(d2m_acc)
+        if finite.any():
+            best_layer = int(np.argmax(np.where(finite, d2m_acc, -np.inf)))
+            best_acc = d2m_acc[best_layer]
+            label = f'D→M {display_name} (L{best_layer}: {best_acc:.1%})'
+        else:
+            label = f'D→M {display_name}'
+
+        ax1.plot(layers, d2m_acc, '-', color=color, linewidth=2, label=label)
+        if np.any(d2m_std > 0):
+            ax1.fill_between(layers, d2m_acc - d2m_std, d2m_acc + d2m_std, color=color, alpha=0.2)
+
+    ax1.set_xlabel("Layer Index")
+    ax1.set_ylabel("Accuracy")
+    ax1.set_ylim(0, 1.0)
+    ax1.legend(loc='lower right', fontsize=7)
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: D→D vs D→M Separate (Upper Bound)
+    ax2 = axes[0, 1]
+    ax2.set_title("Separate Scaling (Upper Bound)\nD→D reference vs D→M with domain adaptation", fontsize=10)
+    ax2.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.7, linewidth=1.5, label=f"Chance ({CHANCE_LEVEL:.0%})")
+
+    # D→D as reference with CI band
+    ax2.plot(layers, d2d_acc, '-', color='tab:purple', linewidth=2, alpha=0.4,
+             label=f'D→D (best L{best_d2d_layer}: {best_d2d_acc:.1%})')
+    if np.any(d2d_std > 0):
+        ax2.fill_between(layers, d2d_acc - d2d_std, d2d_acc + d2d_std, color='tab:purple', alpha=0.18)
+
+    # D→M separate per position with CI bands
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        d2m_acc_sep = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("separate", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+        d2m_std_sep = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("separate", {}).get("accuracy_std", 0)
+            for l in layers
+        ])
+
+        finite = np.isfinite(d2m_acc_sep)
+        if finite.any():
+            best_layer = int(np.argmax(np.where(finite, d2m_acc_sep, -np.inf)))
+            best_acc = d2m_acc_sep[best_layer]
+            label = f'D→M {display_name} (L{best_layer}: {best_acc:.1%})'
+        else:
+            label = f'D→M {display_name}'
+
+        ax2.plot(layers, d2m_acc_sep, '-', color=color, linewidth=2, label=label)
+        if np.any(d2m_std_sep > 0):
+            ax2.fill_between(layers, d2m_acc_sep - d2m_std_sep, d2m_acc_sep + d2m_std_sep, color=color, alpha=0.2)
+
+    ax2.set_xlabel("Layer Index")
+    ax2.set_ylabel("Accuracy")
+    ax2.set_ylim(0, 1.0)
+    ax2.legend(loc='lower right', fontsize=7)
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Transfer Efficiency (D→M / D→D ratio)
+    ax3 = axes[1, 0]
+    ax3.set_title("Transfer Efficiency\n(D→M Centered / D→D)", fontsize=10)
+    ax3.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, linewidth=1, label='Perfect transfer')
+
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        ratios = []
+        ratio_layers = []
+        for layer in layers:
+            d2d_val = d2d_results.get(layer, {}).get("accuracy", np.nan)
+            d2m_val = d2m_results_by_pos[pos].get(layer, {}).get("centered", {}).get("accuracy", np.nan)
+            if np.isfinite(d2d_val) and np.isfinite(d2m_val) and d2d_val > CHANCE_LEVEL:
+                ratios.append(d2m_val / d2d_val)
+                ratio_layers.append(layer)
+
+        if ratios:
+            best_ratio_idx = int(np.argmax(ratios))
+            best_ratio = ratios[best_ratio_idx]
+            best_ratio_layer = ratio_layers[best_ratio_idx]
+            ax3.plot(ratio_layers, ratios, '-', color=color, linewidth=2,
+                     label=f'{display_name} (L{best_ratio_layer}: {best_ratio:.2f})')
+
+    ax3.set_xlabel("Layer Index")
+    ax3.set_ylabel("D→M / D→D Ratio")
+    ax3.set_ylim(0, 1.5)
+    ax3.legend(loc='lower right', fontsize=7)
+    ax3.grid(True, alpha=0.3)
+
+    # Panel 4: Signal Emergence (min-max scaled)
+    ax4 = axes[1, 1]
+    ax4.set_title("Signal Emergence (Min-Max Scaled)\nNormalized timecourse", fontsize=10)
+
+    # Normalize D→D
+    d2d_valid = d2d_acc[np.isfinite(d2d_acc)]
+    if len(d2d_valid) > 1:
+        d2d_min, d2d_max = d2d_valid.min(), d2d_valid.max()
+        if d2d_max > d2d_min:
+            d2d_norm = (d2d_acc - d2d_min) / (d2d_max - d2d_min)
+            ax4.plot(layers, d2d_norm, '-', color='tab:purple', linewidth=2, alpha=0.4, label='D→D')
+
+    # Normalize D→M per position
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        d2m_acc = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+
+        d2m_valid = d2m_acc[np.isfinite(d2m_acc)]
+        if len(d2m_valid) > 1:
+            d2m_min, d2m_max = d2m_valid.min(), d2m_valid.max()
+            if d2m_max > d2m_min:
+                d2m_norm = (d2m_acc - d2m_min) / (d2m_max - d2m_min)
+                ax4.plot(layers, d2m_norm, '-', color=color, linewidth=2, label=display_name)
+
+    ax4.set_xlabel("Layer Index")
+    ax4.set_ylabel("Normalized Accuracy (0-1)")
+    ax4.set_ylim(-0.1, 1.1)
+    ax4.legend(loc='lower right', fontsize=7)
+    ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
 def plot_position_comparison(
     transfer_results_by_pos: dict,
     mean_diff_transfer_by_pos: dict,
@@ -1254,7 +1515,7 @@ def main():
     first_layer = list(meta_activations[first_pos].keys())[0]
     print(f"\nActivation shape per layer: {meta_activations[first_pos][first_layer].shape}")
     print(f"Positions available: {positions_available}")
-    target_name = "Stated confidence" if META_TASK == "confidence" else "P(Answer)"
+    target_name = "P(Answer)" if META_TASK == "delegate" else "Stated confidence" if META_TASK == "confidence" else "Other confidence"
     print(f"{target_name}: mean={confidences.mean():.3f}, std={confidences.std():.3f}")
 
     # Train probes and test transfer for each metric and position
@@ -1436,7 +1697,7 @@ def main():
     # Behavioral correlation: metric vs meta-task target
     # For confidence task: correlation between metric and stated confidence
     # For delegate task: correlation between metric and P(Answer)
-    meta_target_name = "stated_confidence" if META_TASK == "confidence" else "P(Answer)"
+    meta_target_name = "P(Answer)" if META_TASK == "delegate" else "stated_confidence" if META_TASK == "confidence" else "other_confidence"
     print("\n" + "-" * 40)
     print(f"BEHAVIORAL CORRELATION (metric vs {meta_target_name})")
     print("-" * 40)
@@ -1642,6 +1903,154 @@ def main():
             best_r2 = mean_diff_transfer_by_pos[pos][metric][best_layer]["centered"]["r2"]
             print(f"    {pos}: R²={best_r2:.3f} (L{best_layer})")
 
+    # =============================================================================
+    # ANSWER DIRECTION D2M TRANSFER (confound control)
+    # =============================================================================
+    # This tests whether answer directions (trained to predict A/B/C/D from direct
+    # activations) can also predict answers in meta-task activations.
+    # If answer directions transfer as well as uncertainty directions, then D2M
+    # transfer might be confounded by answer encoding rather than uncertainty.
+    print("\n" + "=" * 60)
+    print("ANSWER DIRECTION D2M TRANSFER (Confound Control)")
+    print("=" * 60)
+
+    answer_transfer_results = {}
+    answer_probes_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_mc_answer_probes.joblib"
+
+    if answer_probes_path.exists():
+        print(f"\nLoading answer probes from {answer_probes_path}...")
+        answer_probe_data = joblib.load(answer_probes_path)
+        answer_probes = answer_probe_data["probes"]
+        answer_metadata = answer_probe_data["metadata"]
+        answer_mapping = answer_metadata["answer_mapping"]
+        print(f"  Answer mapping: {answer_mapping}")
+
+        # Get model answers from dataset
+        model_answers = [q["predicted_answer"] for q in dataset["questions"]]
+        encoded_answers, _ = encode_answers(model_answers)
+        y_answer_test = encoded_answers[test_idx]
+
+        # Answer D2D (sanity check): apply classifiers to direct test activations
+        print(f"\n  Testing D→D (direct test) answer prediction...")
+        answer_d2d_results = {}
+        for layer in tqdm(range(num_layers), desc="    D→D answer"):
+            if layer not in answer_probes:
+                continue
+            clf_info = answer_probes[layer]
+            X_direct_test = direct_activations[layer][test_idx]
+
+            # D→D: Use shared scaler
+            X_scaled = clf_info["scaler"].transform(X_direct_test.astype(np.float32))
+            X_pca = clf_info["pca"].transform(X_scaled)
+            y_pred = clf_info["clf"].predict(X_pca)
+            d2d_acc = float((y_pred == y_answer_test).mean())
+            _, d2d_std = bootstrap_accuracy_from_predictions(y_answer_test, y_pred, N_BOOTSTRAP, SEED + layer)
+            answer_d2d_results[layer] = {"accuracy": d2d_acc, "accuracy_std": d2d_std}
+
+        if answer_d2d_results:
+            best_d2d_layer = max(answer_d2d_results.keys(), key=lambda l: answer_d2d_results[l]["accuracy"])
+            best_d2d_acc = answer_d2d_results[best_d2d_layer]["accuracy"]
+            print(f"  D→D answer accuracy: {best_d2d_acc:.1%} at L{best_d2d_layer} (chance=25%)")
+
+        # Answer D2M: apply classifiers to meta activations
+        print(f"\n  Testing D→M (meta test) answer prediction...")
+        answer_d2m_results_by_pos = {pos: {} for pos in positions_available}
+
+        for layer in tqdm(range(num_layers), desc="    D→M answer"):
+            if layer not in answer_probes:
+                continue
+            clf_info = answer_probes[layer]
+
+            for pos in positions_available:
+                if layer not in meta_activations[pos]:
+                    continue
+
+                # Get validity mask
+                pos_valid = position_valid_arrays.get(pos, np.ones(len(test_idx), dtype=bool))
+                valid_test_mask = pos_valid[test_idx]
+                n_valid = valid_test_mask.sum()
+
+                if n_valid < 10:
+                    continue
+
+                X_meta_test = meta_activations[pos][layer][test_idx][valid_test_mask]
+                y_answer_test_valid = y_answer_test[valid_test_mask]
+
+                # D2M Centered: center meta with own mean, scale with direct's std
+                centered_result = apply_answer_classifier_centered(
+                    X_meta_test, y_answer_test_valid,
+                    clf_info["scaler"], clf_info["pca"], clf_info["clf"]
+                )
+                _, centered_std = bootstrap_accuracy_from_predictions(
+                    y_answer_test_valid, np.array(centered_result["predictions"]),
+                    N_BOOTSTRAP, SEED + layer
+                )
+                centered_result["accuracy_std"] = centered_std
+
+                # D2M Separate: use meta's own standardization
+                separate_result = apply_answer_classifier_separate(
+                    X_meta_test, y_answer_test_valid,
+                    clf_info["pca"], clf_info["clf"]
+                )
+                _, separate_std = bootstrap_accuracy_from_predictions(
+                    y_answer_test_valid, np.array(separate_result["predictions"]),
+                    N_BOOTSTRAP, SEED + layer + 1000
+                )
+                separate_result["accuracy_std"] = separate_std
+
+                answer_d2m_results_by_pos[pos][layer] = {
+                    "centered": centered_result,
+                    "separate": separate_result,
+                }
+
+        # Print answer D2M summary by position
+        print(f"\n  Answer D→M accuracy by position:")
+        for pos in positions_available:
+            if not answer_d2m_results_by_pos[pos]:
+                continue
+            layers_available = list(answer_d2m_results_by_pos[pos].keys())
+            if not layers_available:
+                continue
+            best_layer = max(layers_available, key=lambda l: answer_d2m_results_by_pos[pos][l]["centered"]["accuracy"])
+            best_acc = answer_d2m_results_by_pos[pos][best_layer]["centered"]["accuracy"]
+            print(f"    {pos}: {best_acc:.1%} at L{best_layer} (chance=25%)")
+
+        # Store for saving
+        answer_transfer_results = {
+            "d2d": answer_d2d_results,
+            "d2m_by_position": answer_d2m_results_by_pos,
+            "answer_mapping": answer_mapping,
+        }
+
+        # Compare uncertainty vs answer transfer
+        print("\n  Comparing uncertainty vs answer D→M transfer:")
+        for pos in positions_available:
+            if not answer_d2m_results_by_pos[pos]:
+                continue
+            answer_layers = list(answer_d2m_results_by_pos[pos].keys())
+            if not answer_layers:
+                continue
+
+            best_answer_layer = max(answer_layers, key=lambda l: answer_d2m_results_by_pos[pos][l]["centered"]["accuracy"])
+            best_answer_acc = answer_d2m_results_by_pos[pos][best_answer_layer]["centered"]["accuracy"]
+
+            # Get best uncertainty R² for this position
+            best_unc_r2 = -float("inf")
+            for metric in metrics_tested:
+                if metric not in transfer_results_by_pos[pos]:
+                    continue
+                for l, data in transfer_results_by_pos[pos][metric].items():
+                    if data["centered"]["r2"] > best_unc_r2:
+                        best_unc_r2 = data["centered"]["r2"]
+
+            if best_unc_r2 > -float("inf"):
+                print(f"    {pos}: answer_acc={best_answer_acc:.1%}, uncertainty_r2={best_unc_r2:.3f}")
+                if best_answer_acc > 0.35:  # Well above chance (25%)
+                    print(f"      Warning: Answer directions transfer well - possible confound")
+    else:
+        print(f"\n  No answer classifiers found at {answer_probes_path}")
+        print("  Run identify_mc_answer_correlate.py first to enable confound control.")
+
     # For backward compatibility, use "final" position for legacy plots
     mean_diff_transfer_results = mean_diff_transfer_by_pos.get("final", mean_diff_transfer_by_pos.get(positions_available[0], {}))
 
@@ -1690,6 +2099,18 @@ def main():
         plot_path_positions,
         META_TASK,
     )
+
+    # Plot answer transfer results (if available)
+    if answer_transfer_results:
+        print(f"\nPlotting answer transfer results...")
+        answer_plot_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_{META_TASK}_answer.png"
+        plot_answer_transfer_results(
+            d2d_results=answer_transfer_results["d2d"],
+            d2m_results_by_pos=answer_transfer_results["d2m_by_position"],
+            num_layers=num_layers,
+            output_path=answer_plot_path,
+            meta_task=META_TASK,
+        )
 
     # Save JSON results
     print(f"Saving results to {results_json_path}...")
@@ -1814,6 +2235,45 @@ def main():
                     }
                     for l in layers_available
                 },
+            }
+
+    # Add answer direction transfer results (confound control)
+    if answer_transfer_results:
+        results_json["answer_transfer"] = {
+            "answer_mapping": answer_transfer_results.get("answer_mapping", {}),
+            "d2d": {},
+            "d2m_by_position": {},
+        }
+
+        # D2D results
+        for layer, data in answer_transfer_results.get("d2d", {}).items():
+            results_json["answer_transfer"]["d2d"][layer] = {
+                "accuracy": data["accuracy"],
+                "accuracy_std": data.get("accuracy_std", 0),
+            }
+
+        # D2M by position
+        for pos, pos_data in answer_transfer_results.get("d2m_by_position", {}).items():
+            results_json["answer_transfer"]["d2m_by_position"][pos] = {}
+            for layer, layer_data in pos_data.items():
+                results_json["answer_transfer"]["d2m_by_position"][pos][layer] = {
+                    "centered_accuracy": layer_data["centered"]["accuracy"],
+                    "centered_accuracy_std": layer_data["centered"].get("accuracy_std", 0),
+                    "separate_accuracy": layer_data["separate"]["accuracy"],
+                    "separate_accuracy_std": layer_data["separate"].get("accuracy_std", 0),
+                }
+
+        # Summary: best answer transfer per position
+        results_json["answer_transfer"]["summary"] = {}
+        for pos in positions_available:
+            pos_data = answer_transfer_results.get("d2m_by_position", {}).get(pos, {})
+            if not pos_data:
+                continue
+            best_layer = max(pos_data.keys(), key=lambda l: pos_data[l]["centered"]["accuracy"])
+            best_acc = pos_data[best_layer]["centered"]["accuracy"]
+            results_json["answer_transfer"]["summary"][pos] = {
+                "best_layer": best_layer,
+                "best_centered_accuracy": best_acc,
             }
 
     # Add per-question paired data for easy verification of correlations
