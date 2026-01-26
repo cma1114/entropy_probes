@@ -1,0 +1,4331 @@
+{
+  "config": {
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "dataset": "TriviaMC_difficulty_filtered",
+    "meta_task": "delegate",
+    "num_questions": 500,
+    "num_layers": 32,
+    "input_base_name": "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered",
+    "train_split": 0.8,
+    "n_train": 400,
+    "n_test": 100,
+    "seed": 42,
+    "probe_alpha": 1000.0,
+    "probe_pca_components": 100,
+    "probe_positions": [
+      "final"
+    ]
+  },
+  "meta_target_stats": {
+    "n_samples": 500,
+    "delegation_rate": 0.5,
+    "answer_rate": 0.5,
+    "P_answer_mean": 0.4573753662109375,
+    "P_answer_std": 0.30535027884066757,
+    "P_answer_min": 0.07159423828125,
+    "P_answer_max": 0.8740234375,
+    "P_answer_median": 0.5128173828125,
+    "P_answer_quantiles": {
+      "q10": 0.11920166015625,
+      "q25": 0.1441650390625,
+      "q50": 0.5128173828125,
+      "q75": 0.7578125,
+      "q90": 0.79296875
+    }
+  },
+  "transfer": {
+    "logit_gap": {
+      "d2m_centered": {
+        "best_layer": 1,
+        "best_r2": 0.12860999303210696,
+        "best_r2_std": 0.0887273635563282,
+        "best_pearson": 0.41931799449616475
+      },
+      "d2m_separate": {
+        "best_layer": 1,
+        "best_r2": 0.16449127901345362,
+        "best_r2_std": 0.10260643153041617,
+        "best_pearson": 0.41539177437467745
+      },
+      "per_layer": {
+        "0": {
+          "d2m_centered_r2": 0.07491089493352654,
+          "d2m_centered_r2_std": 0.09437887213610283,
+          "d2m_centered_pearson": 0.30657497369974424,
+          "d2m_centered_pred_conf_pearson": -0.04847709849736201,
+          "d2m_separate_r2": 0.0940934883824015,
+          "d2m_separate_r2_std": 0.09740773021897757,
+          "d2m_separate_pred_conf_pearson": -0.04660476882835467,
+          "d2m_separate_pearson": 0.3265984555170474,
+          "d2d_r2": 0.2730023469539402
+        },
+        "1": {
+          "d2m_centered_r2": 0.12860999303210696,
+          "d2m_centered_r2_std": 0.0887273635563282,
+          "d2m_centered_pearson": 0.41931799449616475,
+          "d2m_centered_pred_conf_pearson": 0.17382638159421732,
+          "d2m_separate_r2": 0.16449127901345362,
+          "d2m_separate_r2_std": 0.10260643153041617,
+          "d2m_separate_pred_conf_pearson": 0.16074640404161541,
+          "d2m_separate_pearson": 0.41539177437467745,
+          "d2d_r2": 0.2606108413405158
+        },
+        "2": {
+          "d2m_centered_r2": 0.1173066836162725,
+          "d2m_centered_r2_std": 0.10148671582185347,
+          "d2m_centered_pearson": 0.36117911538526126,
+          "d2m_centered_pred_conf_pearson": 0.03397222101502218,
+          "d2m_separate_r2": 0.12420469344131924,
+          "d2m_separate_r2_std": 0.11187219153094502,
+          "d2m_separate_pred_conf_pearson": 0.04454356197427195,
+          "d2m_separate_pearson": 0.37399372475252995,
+          "d2d_r2": 0.22552275923732823
+        },
+        "3": {
+          "d2m_centered_r2": 0.07861465680904067,
+          "d2m_centered_r2_std": 0.10668739558871632,
+          "d2m_centered_pearson": 0.29503877707722986,
+          "d2m_centered_pred_conf_pearson": 0.044283334166054,
+          "d2m_separate_r2": 0.07556090390338399,
+          "d2m_separate_r2_std": 0.12175969075879899,
+          "d2m_separate_pred_conf_pearson": 0.059853149765566,
+          "d2m_separate_pearson": 0.30322174396905316,
+          "d2d_r2": 0.2140006093446466
+        },
+        "4": {
+          "d2m_centered_r2": 0.04793885354614935,
+          "d2m_centered_r2_std": 0.10281470625084088,
+          "d2m_centered_pearson": 0.2396011276046855,
+          "d2m_centered_pred_conf_pearson": 0.022645407737252564,
+          "d2m_separate_r2": 0.03877236489771774,
+          "d2m_separate_r2_std": 0.10711329497499485,
+          "d2m_separate_pred_conf_pearson": 0.044767944292829674,
+          "d2m_separate_pearson": 0.2627544314935818,
+          "d2d_r2": 0.18356312454207968
+        },
+        "5": {
+          "d2m_centered_r2": 0.04766476998154601,
+          "d2m_centered_r2_std": 0.10271438229260675,
+          "d2m_centered_pearson": 0.2394969629792138,
+          "d2m_centered_pred_conf_pearson": -0.017630007018778114,
+          "d2m_separate_r2": 0.046454876606979556,
+          "d2m_separate_r2_std": 0.10502888508950452,
+          "d2m_separate_pred_conf_pearson": 0.005332694440318841,
+          "d2m_separate_pearson": 0.2455994984352351,
+          "d2d_r2": 0.17049211319950508
+        },
+        "6": {
+          "d2m_centered_r2": 0.04386481467689707,
+          "d2m_centered_r2_std": 0.10146550250305476,
+          "d2m_centered_pearson": 0.2405949915441073,
+          "d2m_centered_pred_conf_pearson": -0.036452589540642226,
+          "d2m_separate_r2": 0.05569814515900828,
+          "d2m_separate_r2_std": 0.10533225037459332,
+          "d2m_separate_pred_conf_pearson": -0.055113340082255456,
+          "d2m_separate_pearson": 0.2528178766713933,
+          "d2d_r2": 0.23647464577748267
+        },
+        "7": {
+          "d2m_centered_r2": 0.0183213042799103,
+          "d2m_centered_r2_std": 0.1068008430049329,
+          "d2m_centered_pearson": 0.17278496044042665,
+          "d2m_centered_pred_conf_pearson": -0.15110855040181764,
+          "d2m_separate_r2": 0.014355237856794822,
+          "d2m_separate_r2_std": 0.11184404014089558,
+          "d2m_separate_pred_conf_pearson": -0.1486461756048149,
+          "d2m_separate_pearson": 0.21293941682078288,
+          "d2d_r2": 0.2631961778347848
+        },
+        "8": {
+          "d2m_centered_r2": 0.055271711145439606,
+          "d2m_centered_r2_std": 0.09650014767627943,
+          "d2m_centered_pearson": 0.27629170400767145,
+          "d2m_centered_pred_conf_pearson": 0.11661732643123246,
+          "d2m_separate_r2": 0.072131160268741,
+          "d2m_separate_r2_std": 0.1053265127343757,
+          "d2m_separate_pred_conf_pearson": 0.14921376981715678,
+          "d2m_separate_pearson": 0.2839711504401194,
+          "d2d_r2": 0.32378117851818145
+        },
+        "9": {
+          "d2m_centered_r2": 0.05434853086418889,
+          "d2m_centered_r2_std": 0.08887941081318715,
+          "d2m_centered_pearson": 0.3125869759781281,
+          "d2m_centered_pred_conf_pearson": 0.32705109950380135,
+          "d2m_separate_r2": 0.08626601989925786,
+          "d2m_separate_r2_std": 0.09378728413727401,
+          "d2m_separate_pred_conf_pearson": 0.3310891807765804,
+          "d2m_separate_pearson": 0.3117539386186176,
+          "d2d_r2": 0.3563294843740501
+        },
+        "10": {
+          "d2m_centered_r2": 0.045136169461109876,
+          "d2m_centered_r2_std": 0.10030025163108305,
+          "d2m_centered_pearson": 0.3642207479192617,
+          "d2m_centered_pred_conf_pearson": 0.17442950076034336,
+          "d2m_separate_r2": 0.08457118855863521,
+          "d2m_separate_r2_std": 0.10071587140492178,
+          "d2m_separate_pred_conf_pearson": 0.129167973585779,
+          "d2m_separate_pearson": 0.35442513561812267,
+          "d2d_r2": 0.455664460246601
+        },
+        "11": {
+          "d2m_centered_r2": -0.0006049116515092212,
+          "d2m_centered_r2_std": 0.1073481885165397,
+          "d2m_centered_pearson": 0.10929505317341287,
+          "d2m_centered_pred_conf_pearson": 0.47648997564063483,
+          "d2m_separate_r2": -0.04270373613768563,
+          "d2m_separate_r2_std": 0.11465841986684586,
+          "d2m_separate_pred_conf_pearson": 0.5072387363008911,
+          "d2m_separate_pearson": 0.12369488704565397,
+          "d2d_r2": 0.492718782798202
+        },
+        "12": {
+          "d2m_centered_r2": 0.02652266133819592,
+          "d2m_centered_r2_std": 0.0912331571390204,
+          "d2m_centered_pearson": 0.19269386242449646,
+          "d2m_centered_pred_conf_pearson": 0.7808305487215605,
+          "d2m_separate_r2": 0.014593615993823472,
+          "d2m_separate_r2_std": 0.10380610626205086,
+          "d2m_separate_pred_conf_pearson": 0.7357856122216142,
+          "d2m_separate_pearson": 0.1947248923663603,
+          "d2d_r2": 0.6192203789284579
+        },
+        "13": {
+          "d2m_centered_r2": 0.0030263204603115934,
+          "d2m_centered_r2_std": 0.10475813447222238,
+          "d2m_centered_pearson": 0.1159861161649,
+          "d2m_centered_pred_conf_pearson": 0.7427543227832015,
+          "d2m_separate_r2": 0.0012630399634445677,
+          "d2m_separate_r2_std": 0.11114059955915957,
+          "d2m_separate_pred_conf_pearson": 0.6210466165157177,
+          "d2m_separate_pearson": 0.11875351646557816,
+          "d2d_r2": 0.8080086510177842
+        },
+        "14": {
+          "d2m_centered_r2": 0.008569293323192895,
+          "d2m_centered_r2_std": 0.09577599750031555,
+          "d2m_centered_pearson": 0.2003162644984105,
+          "d2m_centered_pred_conf_pearson": -0.4484855062541013,
+          "d2m_separate_r2": 0.05334297583416869,
+          "d2m_separate_r2_std": 0.0923333236418063,
+          "d2m_separate_pred_conf_pearson": -0.2826815360320771,
+          "d2m_separate_pearson": 0.2743364472255306,
+          "d2d_r2": 0.8725658955849289
+        },
+        "15": {
+          "d2m_centered_r2": -0.014095056743090417,
+          "d2m_centered_r2_std": 0.09206888327980099,
+          "d2m_centered_pearson": 0.0191893887897051,
+          "d2m_centered_pred_conf_pearson": -0.7803659811833127,
+          "d2m_separate_r2": -0.01145582770243303,
+          "d2m_separate_r2_std": 0.09535116052381248,
+          "d2m_separate_pred_conf_pearson": -0.6072545538781119,
+          "d2m_separate_pearson": 0.11538260796991666,
+          "d2d_r2": 0.8734891503661812
+        },
+        "16": {
+          "d2m_centered_r2": 0.002198710155636885,
+          "d2m_centered_r2_std": 0.09693275399909894,
+          "d2m_centered_pearson": 0.10122820092652633,
+          "d2m_centered_pred_conf_pearson": -0.7371040359120189,
+          "d2m_separate_r2": 0.034178411821948806,
+          "d2m_separate_r2_std": 0.1001210578174272,
+          "d2m_separate_pred_conf_pearson": -0.5454965011023833,
+          "d2m_separate_pearson": 0.2108880787316493,
+          "d2d_r2": 0.8808746390248949
+        },
+        "17": {
+          "d2m_centered_r2": -0.0015563802813007843,
+          "d2m_centered_r2_std": 0.07776331316965264,
+          "d2m_centered_pearson": 0.08329223141027511,
+          "d2m_centered_pred_conf_pearson": -0.6015836543823285,
+          "d2m_separate_r2": 0.010451811816362011,
+          "d2m_separate_r2_std": 0.08535090786554986,
+          "d2m_separate_pred_conf_pearson": -0.43404571270360504,
+          "d2m_separate_pearson": 0.15699366980139856,
+          "d2d_r2": 0.9110774025965066
+        },
+        "18": {
+          "d2m_centered_r2": -0.024453956584422842,
+          "d2m_centered_r2_std": 0.11087837967409868,
+          "d2m_centered_pearson": -0.05394472518801733,
+          "d2m_centered_pred_conf_pearson": -0.796903236513809,
+          "d2m_separate_r2": -0.07666179976731757,
+          "d2m_separate_r2_std": 0.11915001118507905,
+          "d2m_separate_pred_conf_pearson": -0.6202435792518292,
+          "d2m_separate_pearson": 0.015493045362190603,
+          "d2d_r2": 0.9232806794437327
+        },
+        "19": {
+          "d2m_centered_r2": -0.016598316502831834,
+          "d2m_centered_r2_std": 0.10692363485825712,
+          "d2m_centered_pearson": -0.0188299585350047,
+          "d2m_centered_pred_conf_pearson": -0.7212097174683483,
+          "d2m_separate_r2": -0.05117065862449044,
+          "d2m_separate_r2_std": 0.11693554925540531,
+          "d2m_separate_pred_conf_pearson": -0.5618049978389944,
+          "d2m_separate_pearson": 0.054061791279191,
+          "d2d_r2": 0.9233987854185051
+        },
+        "20": {
+          "d2m_centered_r2": -0.020387160942675342,
+          "d2m_centered_r2_std": 0.09499637809027964,
+          "d2m_centered_pearson": -0.059815266794294636,
+          "d2m_centered_pred_conf_pearson": -0.730947985327833,
+          "d2m_separate_r2": -0.05529253845133808,
+          "d2m_separate_r2_std": 0.10567029369964143,
+          "d2m_separate_pred_conf_pearson": -0.5456278918299445,
+          "d2m_separate_pearson": 0.01369810597701288,
+          "d2d_r2": 0.9330682584262218
+        },
+        "21": {
+          "d2m_centered_r2": -0.010470126455332629,
+          "d2m_centered_r2_std": 0.11505978840150671,
+          "d2m_centered_pearson": 0.005738904194870203,
+          "d2m_centered_pred_conf_pearson": -0.5584495109907608,
+          "d2m_separate_r2": -0.024378861063877322,
+          "d2m_separate_r2_std": 0.12397556206496899,
+          "d2m_separate_pred_conf_pearson": -0.38074835919250183,
+          "d2m_separate_pearson": 0.0648056383442979,
+          "d2d_r2": 0.9359268953332976
+        },
+        "22": {
+          "d2m_centered_r2": -0.01644985789048148,
+          "d2m_centered_r2_std": 0.09929877740623713,
+          "d2m_centered_pearson": -0.03623705101986191,
+          "d2m_centered_pred_conf_pearson": -0.5273116349684671,
+          "d2m_separate_r2": -0.05621268850011241,
+          "d2m_separate_r2_std": 0.10511083259324847,
+          "d2m_separate_pred_conf_pearson": -0.3961038371387769,
+          "d2m_separate_pearson": 0.009757527702046484,
+          "d2d_r2": 0.9407007638814333
+        },
+        "23": {
+          "d2m_centered_r2": -0.023094668092940918,
+          "d2m_centered_r2_std": 0.09994721875068792,
+          "d2m_centered_pearson": -0.07801294710000578,
+          "d2m_centered_pred_conf_pearson": -0.6196876053385408,
+          "d2m_separate_r2": -0.0887818497563595,
+          "d2m_separate_r2_std": 0.11484425785820791,
+          "d2m_separate_pred_conf_pearson": -0.5205027420653814,
+          "d2m_separate_pearson": -0.037804085371595526,
+          "d2d_r2": 0.9450499291847412
+        },
+        "24": {
+          "d2m_centered_r2": -0.032845772301701937,
+          "d2m_centered_r2_std": 0.11073822807450379,
+          "d2m_centered_pearson": -0.1227806731041802,
+          "d2m_centered_pred_conf_pearson": -0.7074973764391647,
+          "d2m_separate_r2": -0.12917529387954962,
+          "d2m_separate_r2_std": 0.12856084045816746,
+          "d2m_separate_pred_conf_pearson": -0.552912927051419,
+          "d2m_separate_pearson": -0.08764653148829227,
+          "d2d_r2": 0.946325836405659
+        },
+        "25": {
+          "d2m_centered_r2": -0.028270428396484526,
+          "d2m_centered_r2_std": 0.10078500671338701,
+          "d2m_centered_pearson": -0.11737484813737499,
+          "d2m_centered_pred_conf_pearson": -0.6075152155418996,
+          "d2m_separate_r2": -0.10309684669383934,
+          "d2m_separate_r2_std": 0.10638403321779356,
+          "d2m_separate_pred_conf_pearson": -0.434199344051527,
+          "d2m_separate_pearson": -0.06889306744565565,
+          "d2d_r2": 0.9466690830196048
+        },
+        "26": {
+          "d2m_centered_r2": -0.028111066094196335,
+          "d2m_centered_r2_std": 0.10367169003463449,
+          "d2m_centered_pearson": -0.13355683354975892,
+          "d2m_centered_pred_conf_pearson": -0.7250223296327726,
+          "d2m_separate_r2": -0.09801943784595069,
+          "d2m_separate_r2_std": 0.1142938845254768,
+          "d2m_separate_pred_conf_pearson": -0.5712926618968024,
+          "d2m_separate_pearson": -0.09157088457289306,
+          "d2d_r2": 0.9442163765430666
+        },
+        "27": {
+          "d2m_centered_r2": -0.03381904455303508,
+          "d2m_centered_r2_std": 0.09547831395489144,
+          "d2m_centered_pearson": -0.15369447100707825,
+          "d2m_centered_pred_conf_pearson": -0.7039559024090362,
+          "d2m_separate_r2": -0.12955352045041324,
+          "d2m_separate_r2_std": 0.10127590807681114,
+          "d2m_separate_pred_conf_pearson": -0.5487752309094769,
+          "d2m_separate_pearson": -0.11761451839048045,
+          "d2d_r2": 0.9405397715867019
+        },
+        "28": {
+          "d2m_centered_r2": -0.030295420261984507,
+          "d2m_centered_r2_std": 0.09923652494296437,
+          "d2m_centered_pearson": -0.14524990884697875,
+          "d2m_centered_pred_conf_pearson": -0.6805672713766129,
+          "d2m_separate_r2": -0.1311614091137292,
+          "d2m_separate_r2_std": 0.11269394496260982,
+          "d2m_separate_pred_conf_pearson": -0.5668512195013781,
+          "d2m_separate_pearson": -0.11772942303295175,
+          "d2d_r2": 0.9418562188304209
+        },
+        "29": {
+          "d2m_centered_r2": -0.02368299571889798,
+          "d2m_centered_r2_std": 0.09769647512227278,
+          "d2m_centered_pearson": -0.10903041602631244,
+          "d2m_centered_pred_conf_pearson": -0.6545381889427057,
+          "d2m_separate_r2": -0.10310258375703363,
+          "d2m_separate_r2_std": 0.10428371954599285,
+          "d2m_separate_pred_conf_pearson": -0.5298520214156714,
+          "d2m_separate_pearson": -0.08216866109048623,
+          "d2d_r2": 0.9533328628453062
+        },
+        "30": {
+          "d2m_centered_r2": -0.02012502596120047,
+          "d2m_centered_r2_std": 0.09364934991923282,
+          "d2m_centered_pearson": -0.07404771648932348,
+          "d2m_centered_pred_conf_pearson": -0.7247292439383752,
+          "d2m_separate_r2": -0.08295315032053052,
+          "d2m_separate_r2_std": 0.09690014842495782,
+          "d2m_separate_pred_conf_pearson": -0.5889356368849078,
+          "d2m_separate_pearson": -0.029069488957384836,
+          "d2d_r2": 0.9477735485190457
+        },
+        "31": {
+          "d2m_centered_r2": -0.02471023172617892,
+          "d2m_centered_r2_std": 0.09664407396632002,
+          "d2m_centered_pearson": -0.11364464289124941,
+          "d2m_centered_pred_conf_pearson": -0.6353163940666703,
+          "d2m_separate_r2": -0.12328778857104106,
+          "d2m_separate_r2_std": 0.1087289992102843,
+          "d2m_separate_pred_conf_pearson": -0.5503604460966522,
+          "d2m_separate_pearson": -0.0747476920147471,
+          "d2d_r2": 0.9339576512333977
+        }
+      },
+      "d2d": {
+        "best_layer": 29,
+        "best_r2": 0.9533328628453062
+      }
+    }
+  },
+  "behavioral": {
+    "meta_target": "P(Answer)",
+    "logit_gap": {
+      "pearson_r": 0.022545761697789865,
+      "pearson_p": 0.6150059708480077,
+      "pearson_r_std": 0.044812655614703066,
+      "spearman_r": 0.014869991648683821,
+      "spearman_p": 0.740123922206309,
+      "test_pearson_r": 0.12070243107668445,
+      "test_pearson_p": 0.23160750779160275,
+      "test_pearson_r_std": 0.09879595129776504,
+      "test_spearman_r": 0.07757285915614148,
+      "test_spearman_p": 0.4430026032297205
+    }
+  },
+  "transfer_by_position": {
+    "final": {
+      "logit_gap": {
+        "best_layer": 1,
+        "best_r2": 0.12860999303210696,
+        "per_layer": {
+          "0": {
+            "centered_r2": 0.07491089493352654,
+            "centered_r2_std": 0.09437887213610283,
+            "centered_pearson": 0.30657497369974424,
+            "centered_pred_conf_pearson": -0.04847709849736201,
+            "centered_pred_conf_pearson_std": 0.10719708336194404,
+            "separate_r2": 0.0940934883824015,
+            "separate_r2_std": 0.09740773021897757,
+            "separate_pearson": 0.3265984555170474
+          },
+          "1": {
+            "centered_r2": 0.12860999303210696,
+            "centered_r2_std": 0.0887273635563282,
+            "centered_pearson": 0.41931799449616475,
+            "centered_pred_conf_pearson": 0.17382638159421732,
+            "centered_pred_conf_pearson_std": 0.09541848012876179,
+            "separate_r2": 0.16449127901345362,
+            "separate_r2_std": 0.10260643153041617,
+            "separate_pearson": 0.41539177437467745
+          },
+          "2": {
+            "centered_r2": 0.1173066836162725,
+            "centered_r2_std": 0.10148671582185347,
+            "centered_pearson": 0.36117911538526126,
+            "centered_pred_conf_pearson": 0.03397222101502218,
+            "centered_pred_conf_pearson_std": 0.11106782440337781,
+            "separate_r2": 0.12420469344131924,
+            "separate_r2_std": 0.11187219153094502,
+            "separate_pearson": 0.37399372475252995
+          },
+          "3": {
+            "centered_r2": 0.07861465680904067,
+            "centered_r2_std": 0.10668739558871632,
+            "centered_pearson": 0.29503877707722986,
+            "centered_pred_conf_pearson": 0.044283334166054,
+            "centered_pred_conf_pearson_std": 0.09651015996212346,
+            "separate_r2": 0.07556090390338399,
+            "separate_r2_std": 0.12175969075879899,
+            "separate_pearson": 0.30322174396905316
+          },
+          "4": {
+            "centered_r2": 0.04793885354614935,
+            "centered_r2_std": 0.10281470625084088,
+            "centered_pearson": 0.2396011276046855,
+            "centered_pred_conf_pearson": 0.022645407737252564,
+            "centered_pred_conf_pearson_std": 0.0979470999420246,
+            "separate_r2": 0.03877236489771774,
+            "separate_r2_std": 0.10711329497499485,
+            "separate_pearson": 0.2627544314935818
+          },
+          "5": {
+            "centered_r2": 0.04766476998154601,
+            "centered_r2_std": 0.10271438229260675,
+            "centered_pearson": 0.2394969629792138,
+            "centered_pred_conf_pearson": -0.017630007018778114,
+            "centered_pred_conf_pearson_std": 0.10361521633276478,
+            "separate_r2": 0.046454876606979556,
+            "separate_r2_std": 0.10502888508950452,
+            "separate_pearson": 0.2455994984352351
+          },
+          "6": {
+            "centered_r2": 0.04386481467689707,
+            "centered_r2_std": 0.10146550250305476,
+            "centered_pearson": 0.2405949915441073,
+            "centered_pred_conf_pearson": -0.036452589540642226,
+            "centered_pred_conf_pearson_std": 0.08922599638331626,
+            "separate_r2": 0.05569814515900828,
+            "separate_r2_std": 0.10533225037459332,
+            "separate_pearson": 0.2528178766713933
+          },
+          "7": {
+            "centered_r2": 0.0183213042799103,
+            "centered_r2_std": 0.1068008430049329,
+            "centered_pearson": 0.17278496044042665,
+            "centered_pred_conf_pearson": -0.15110855040181764,
+            "centered_pred_conf_pearson_std": 0.09688227004452331,
+            "separate_r2": 0.014355237856794822,
+            "separate_r2_std": 0.11184404014089558,
+            "separate_pearson": 0.21293941682078288
+          },
+          "8": {
+            "centered_r2": 0.055271711145439606,
+            "centered_r2_std": 0.09650014767627943,
+            "centered_pearson": 0.27629170400767145,
+            "centered_pred_conf_pearson": 0.11661732643123246,
+            "centered_pred_conf_pearson_std": 0.10218660010905706,
+            "separate_r2": 0.072131160268741,
+            "separate_r2_std": 0.1053265127343757,
+            "separate_pearson": 0.2839711504401194
+          },
+          "9": {
+            "centered_r2": 0.05434853086418889,
+            "centered_r2_std": 0.08887941081318715,
+            "centered_pearson": 0.3125869759781281,
+            "centered_pred_conf_pearson": 0.32705109950380135,
+            "centered_pred_conf_pearson_std": 0.10117672655874725,
+            "separate_r2": 0.08626601989925786,
+            "separate_r2_std": 0.09378728413727401,
+            "separate_pearson": 0.3117539386186176
+          },
+          "10": {
+            "centered_r2": 0.045136169461109876,
+            "centered_r2_std": 0.10030025163108305,
+            "centered_pearson": 0.3642207479192617,
+            "centered_pred_conf_pearson": 0.17442950076034336,
+            "centered_pred_conf_pearson_std": 0.09281244153106702,
+            "separate_r2": 0.08457118855863521,
+            "separate_r2_std": 0.10071587140492178,
+            "separate_pearson": 0.35442513561812267
+          },
+          "11": {
+            "centered_r2": -0.0006049116515092212,
+            "centered_r2_std": 0.1073481885165397,
+            "centered_pearson": 0.10929505317341287,
+            "centered_pred_conf_pearson": 0.47648997564063483,
+            "centered_pred_conf_pearson_std": 0.07314860548783629,
+            "separate_r2": -0.04270373613768563,
+            "separate_r2_std": 0.11465841986684586,
+            "separate_pearson": 0.12369488704565397
+          },
+          "12": {
+            "centered_r2": 0.02652266133819592,
+            "centered_r2_std": 0.0912331571390204,
+            "centered_pearson": 0.19269386242449646,
+            "centered_pred_conf_pearson": 0.7808305487215605,
+            "centered_pred_conf_pearson_std": 0.032080344311406335,
+            "separate_r2": 0.014593615993823472,
+            "separate_r2_std": 0.10380610626205086,
+            "separate_pearson": 0.1947248923663603
+          },
+          "13": {
+            "centered_r2": 0.0030263204603115934,
+            "centered_r2_std": 0.10475813447222238,
+            "centered_pearson": 0.1159861161649,
+            "centered_pred_conf_pearson": 0.7427543227832015,
+            "centered_pred_conf_pearson_std": 0.031196765291165347,
+            "separate_r2": 0.0012630399634445677,
+            "separate_r2_std": 0.11114059955915957,
+            "separate_pearson": 0.11875351646557816
+          },
+          "14": {
+            "centered_r2": 0.008569293323192895,
+            "centered_r2_std": 0.09577599750031555,
+            "centered_pearson": 0.2003162644984105,
+            "centered_pred_conf_pearson": -0.4484855062541013,
+            "centered_pred_conf_pearson_std": 0.06659633329188558,
+            "separate_r2": 0.05334297583416869,
+            "separate_r2_std": 0.0923333236418063,
+            "separate_pearson": 0.2743364472255306
+          },
+          "15": {
+            "centered_r2": -0.014095056743090417,
+            "centered_r2_std": 0.09206888327980099,
+            "centered_pearson": 0.0191893887897051,
+            "centered_pred_conf_pearson": -0.7803659811833127,
+            "centered_pred_conf_pearson_std": 0.03297688289361842,
+            "separate_r2": -0.01145582770243303,
+            "separate_r2_std": 0.09535116052381248,
+            "separate_pearson": 0.11538260796991666
+          },
+          "16": {
+            "centered_r2": 0.002198710155636885,
+            "centered_r2_std": 0.09693275399909894,
+            "centered_pearson": 0.10122820092652633,
+            "centered_pred_conf_pearson": -0.7371040359120189,
+            "centered_pred_conf_pearson_std": 0.044528825976214347,
+            "separate_r2": 0.034178411821948806,
+            "separate_r2_std": 0.1001210578174272,
+            "separate_pearson": 0.2108880787316493
+          },
+          "17": {
+            "centered_r2": -0.0015563802813007843,
+            "centered_r2_std": 0.07776331316965264,
+            "centered_pearson": 0.08329223141027511,
+            "centered_pred_conf_pearson": -0.6015836543823285,
+            "centered_pred_conf_pearson_std": 0.06888635613197586,
+            "separate_r2": 0.010451811816362011,
+            "separate_r2_std": 0.08535090786554986,
+            "separate_pearson": 0.15699366980139856
+          },
+          "18": {
+            "centered_r2": -0.024453956584422842,
+            "centered_r2_std": 0.11087837967409868,
+            "centered_pearson": -0.05394472518801733,
+            "centered_pred_conf_pearson": -0.796903236513809,
+            "centered_pred_conf_pearson_std": 0.04721008007332242,
+            "separate_r2": -0.07666179976731757,
+            "separate_r2_std": 0.11915001118507905,
+            "separate_pearson": 0.015493045362190603
+          },
+          "19": {
+            "centered_r2": -0.016598316502831834,
+            "centered_r2_std": 0.10692363485825712,
+            "centered_pearson": -0.0188299585350047,
+            "centered_pred_conf_pearson": -0.7212097174683483,
+            "centered_pred_conf_pearson_std": 0.05615049066307289,
+            "separate_r2": -0.05117065862449044,
+            "separate_r2_std": 0.11693554925540531,
+            "separate_pearson": 0.054061791279191
+          },
+          "20": {
+            "centered_r2": -0.020387160942675342,
+            "centered_r2_std": 0.09499637809027964,
+            "centered_pearson": -0.059815266794294636,
+            "centered_pred_conf_pearson": -0.730947985327833,
+            "centered_pred_conf_pearson_std": 0.04592495345485886,
+            "separate_r2": -0.05529253845133808,
+            "separate_r2_std": 0.10567029369964143,
+            "separate_pearson": 0.01369810597701288
+          },
+          "21": {
+            "centered_r2": -0.010470126455332629,
+            "centered_r2_std": 0.11505978840150671,
+            "centered_pearson": 0.005738904194870203,
+            "centered_pred_conf_pearson": -0.5584495109907608,
+            "centered_pred_conf_pearson_std": 0.07505548943880476,
+            "separate_r2": -0.024378861063877322,
+            "separate_r2_std": 0.12397556206496899,
+            "separate_pearson": 0.0648056383442979
+          },
+          "22": {
+            "centered_r2": -0.01644985789048148,
+            "centered_r2_std": 0.09929877740623713,
+            "centered_pearson": -0.03623705101986191,
+            "centered_pred_conf_pearson": -0.5273116349684671,
+            "centered_pred_conf_pearson_std": 0.0812002475134856,
+            "separate_r2": -0.05621268850011241,
+            "separate_r2_std": 0.10511083259324847,
+            "separate_pearson": 0.009757527702046484
+          },
+          "23": {
+            "centered_r2": -0.023094668092940918,
+            "centered_r2_std": 0.09994721875068792,
+            "centered_pearson": -0.07801294710000578,
+            "centered_pred_conf_pearson": -0.6196876053385408,
+            "centered_pred_conf_pearson_std": 0.07430050405891853,
+            "separate_r2": -0.0887818497563595,
+            "separate_r2_std": 0.11484425785820791,
+            "separate_pearson": -0.037804085371595526
+          },
+          "24": {
+            "centered_r2": -0.032845772301701937,
+            "centered_r2_std": 0.11073822807450379,
+            "centered_pearson": -0.1227806731041802,
+            "centered_pred_conf_pearson": -0.7074973764391647,
+            "centered_pred_conf_pearson_std": 0.05232578086601204,
+            "separate_r2": -0.12917529387954962,
+            "separate_r2_std": 0.12856084045816746,
+            "separate_pearson": -0.08764653148829227
+          },
+          "25": {
+            "centered_r2": -0.028270428396484526,
+            "centered_r2_std": 0.10078500671338701,
+            "centered_pearson": -0.11737484813737499,
+            "centered_pred_conf_pearson": -0.6075152155418996,
+            "centered_pred_conf_pearson_std": 0.07387330373804883,
+            "separate_r2": -0.10309684669383934,
+            "separate_r2_std": 0.10638403321779356,
+            "separate_pearson": -0.06889306744565565
+          },
+          "26": {
+            "centered_r2": -0.028111066094196335,
+            "centered_r2_std": 0.10367169003463449,
+            "centered_pearson": -0.13355683354975892,
+            "centered_pred_conf_pearson": -0.7250223296327726,
+            "centered_pred_conf_pearson_std": 0.052660800659401305,
+            "separate_r2": -0.09801943784595069,
+            "separate_r2_std": 0.1142938845254768,
+            "separate_pearson": -0.09157088457289306
+          },
+          "27": {
+            "centered_r2": -0.03381904455303508,
+            "centered_r2_std": 0.09547831395489144,
+            "centered_pearson": -0.15369447100707825,
+            "centered_pred_conf_pearson": -0.7039559024090362,
+            "centered_pred_conf_pearson_std": 0.060892852815236834,
+            "separate_r2": -0.12955352045041324,
+            "separate_r2_std": 0.10127590807681114,
+            "separate_pearson": -0.11761451839048045
+          },
+          "28": {
+            "centered_r2": -0.030295420261984507,
+            "centered_r2_std": 0.09923652494296437,
+            "centered_pearson": -0.14524990884697875,
+            "centered_pred_conf_pearson": -0.6805672713766129,
+            "centered_pred_conf_pearson_std": 0.0672467735854007,
+            "separate_r2": -0.1311614091137292,
+            "separate_r2_std": 0.11269394496260982,
+            "separate_pearson": -0.11772942303295175
+          },
+          "29": {
+            "centered_r2": -0.02368299571889798,
+            "centered_r2_std": 0.09769647512227278,
+            "centered_pearson": -0.10903041602631244,
+            "centered_pred_conf_pearson": -0.6545381889427057,
+            "centered_pred_conf_pearson_std": 0.06987578431062214,
+            "separate_r2": -0.10310258375703363,
+            "separate_r2_std": 0.10428371954599285,
+            "separate_pearson": -0.08216866109048623
+          },
+          "30": {
+            "centered_r2": -0.02012502596120047,
+            "centered_r2_std": 0.09364934991923282,
+            "centered_pearson": -0.07404771648932348,
+            "centered_pred_conf_pearson": -0.7247292439383752,
+            "centered_pred_conf_pearson_std": 0.05442808504674792,
+            "separate_r2": -0.08295315032053052,
+            "separate_r2_std": 0.09690014842495782,
+            "separate_pearson": -0.029069488957384836
+          },
+          "31": {
+            "centered_r2": -0.02471023172617892,
+            "centered_r2_std": 0.09664407396632002,
+            "centered_pearson": -0.11364464289124941,
+            "centered_pred_conf_pearson": -0.6353163940666703,
+            "centered_pred_conf_pearson_std": 0.0705785956112053,
+            "separate_r2": -0.12328778857104106,
+            "separate_r2_std": 0.1087289992102843,
+            "separate_pearson": -0.0747476920147471
+          }
+        }
+      }
+    }
+  },
+  "mean_diff_by_position": {
+    "final": {
+      "logit_gap": {
+        "best_layer": 2,
+        "best_r2": 0.12119546855005048,
+        "per_layer": {
+          "0": {
+            "centered_r2": 0.049206831054829814,
+            "centered_r2_std": 0.08929214300583108,
+            "centered_pearson": 0.30718655834714215,
+            "centered_pred_conf_pearson": 0.08469560474703292,
+            "centered_pred_conf_pearson_std": 0.09610290409202038
+          },
+          "1": {
+            "centered_r2": 0.09074077266467151,
+            "centered_r2_std": 0.10296955762308037,
+            "centered_pearson": 0.3874667738833152,
+            "centered_pred_conf_pearson": 0.08027882790654556,
+            "centered_pred_conf_pearson_std": 0.10024345495888967
+          },
+          "2": {
+            "centered_r2": 0.12119546855005048,
+            "centered_r2_std": 0.09028615039517603,
+            "centered_pearson": 0.5031749206986178,
+            "centered_pred_conf_pearson": 0.14825375755244494,
+            "centered_pred_conf_pearson_std": 0.08785167760678539
+          },
+          "3": {
+            "centered_r2": 0.10461255002333114,
+            "centered_r2_std": 0.0886514227350621,
+            "centered_pearson": 0.4785997886577807,
+            "centered_pred_conf_pearson": 0.16444774339833795,
+            "centered_pred_conf_pearson_std": 0.08727884635726638
+          },
+          "4": {
+            "centered_r2": 0.06457441638831807,
+            "centered_r2_std": 0.10200419423202178,
+            "centered_pearson": 0.34770412010288904,
+            "centered_pred_conf_pearson": 0.048230528953664024,
+            "centered_pred_conf_pearson_std": 0.08800880368829166
+          },
+          "5": {
+            "centered_r2": 0.03816238679160422,
+            "centered_r2_std": 0.10396625752145157,
+            "centered_pearson": 0.25961636378157743,
+            "centered_pred_conf_pearson": 0.015463076749389244,
+            "centered_pred_conf_pearson_std": 0.09263530492550627
+          },
+          "6": {
+            "centered_r2": 0.029364999039894646,
+            "centered_r2_std": 0.09542531298701754,
+            "centered_pearson": 0.25806442653380657,
+            "centered_pred_conf_pearson": -0.07928757519426335,
+            "centered_pred_conf_pearson_std": 0.09048577352866015
+          },
+          "7": {
+            "centered_r2": 0.03675196064375852,
+            "centered_r2_std": 0.10130366480637978,
+            "centered_pearson": 0.30776304447736164,
+            "centered_pred_conf_pearson": 0.05486068098479913,
+            "centered_pred_conf_pearson_std": 0.09872795151020551
+          },
+          "8": {
+            "centered_r2": 0.02715194450147962,
+            "centered_r2_std": 0.08173472188207598,
+            "centered_pearson": 0.24793219632250799,
+            "centered_pred_conf_pearson": 0.1949827179438649,
+            "centered_pred_conf_pearson_std": 0.08381503643667668
+          },
+          "9": {
+            "centered_r2": 0.025773605495895913,
+            "centered_r2_std": 0.10577835081015488,
+            "centered_pearson": 0.26570985041524814,
+            "centered_pred_conf_pearson": -0.003927077042006633,
+            "centered_pred_conf_pearson_std": 0.11657297492184725
+          },
+          "10": {
+            "centered_r2": 0.015141328665326803,
+            "centered_r2_std": 0.08713388714053702,
+            "centered_pearson": 0.18224352607256034,
+            "centered_pred_conf_pearson": 0.15722625381454472,
+            "centered_pred_conf_pearson_std": 0.09889317061407238
+          },
+          "11": {
+            "centered_r2": 0.010669663696958986,
+            "centered_r2_std": 0.1047861589117138,
+            "centered_pearson": 0.15546374966888726,
+            "centered_pred_conf_pearson": 0.1148379160312312,
+            "centered_pred_conf_pearson_std": 0.10198583709185524
+          },
+          "12": {
+            "centered_r2": 0.010996874066877105,
+            "centered_r2_std": 0.09400134763598458,
+            "centered_pearson": 0.21063970085228725,
+            "centered_pred_conf_pearson": 0.23723886389859422,
+            "centered_pred_conf_pearson_std": 0.10232643731843509
+          },
+          "13": {
+            "centered_r2": 0.026767642160949068,
+            "centered_r2_std": 0.09218089942703557,
+            "centered_pearson": 0.2496919987612208,
+            "centered_pred_conf_pearson": 0.9075049470913427,
+            "centered_pred_conf_pearson_std": 0.01039136420489769
+          },
+          "14": {
+            "centered_r2": 0.03148163710171836,
+            "centered_r2_std": 0.09561323441018145,
+            "centered_pearson": 0.3982536107616665,
+            "centered_pred_conf_pearson": 0.6699720966630471,
+            "centered_pred_conf_pearson_std": 0.04738664808655562
+          },
+          "15": {
+            "centered_r2": 0.044757435035078785,
+            "centered_r2_std": 0.07815412878311219,
+            "centered_pearson": 0.4514245301102961,
+            "centered_pred_conf_pearson": 0.3174801717770614,
+            "centered_pred_conf_pearson_std": 0.08604202582587774
+          },
+          "16": {
+            "centered_r2": 0.04386514681316678,
+            "centered_r2_std": 0.08658464855298023,
+            "centered_pearson": 0.4660628004572326,
+            "centered_pred_conf_pearson": 0.3474822860734857,
+            "centered_pred_conf_pearson_std": 0.08641063817729723
+          },
+          "17": {
+            "centered_r2": 0.03632097227271347,
+            "centered_r2_std": 0.08806862232383472,
+            "centered_pearson": 0.4437847739118179,
+            "centered_pred_conf_pearson": 0.277143234524276,
+            "centered_pred_conf_pearson_std": 0.09933176859359252
+          },
+          "18": {
+            "centered_r2": 0.022465737957030107,
+            "centered_r2_std": 0.09143195019372224,
+            "centered_pearson": 0.3796939263119571,
+            "centered_pred_conf_pearson": 0.012997138816652267,
+            "centered_pred_conf_pearson_std": 0.09856643023985374
+          },
+          "19": {
+            "centered_r2": 0.01926099232758749,
+            "centered_r2_std": 0.08720708472882086,
+            "centered_pearson": 0.3223458674563533,
+            "centered_pred_conf_pearson": -0.17746112944908946,
+            "centered_pred_conf_pearson_std": 0.10003123517980372
+          },
+          "20": {
+            "centered_r2": 0.016522178234625207,
+            "centered_r2_std": 0.09437996183662853,
+            "centered_pearson": 0.3221656069094664,
+            "centered_pred_conf_pearson": 0.05542274105710262,
+            "centered_pred_conf_pearson_std": 0.09771620556541614
+          },
+          "21": {
+            "centered_r2": 0.013395833429906245,
+            "centered_r2_std": 0.10820471353231682,
+            "centered_pearson": 0.28563022653196196,
+            "centered_pred_conf_pearson": 0.06195832541619379,
+            "centered_pred_conf_pearson_std": 0.09443797741905759
+          },
+          "22": {
+            "centered_r2": 0.008855342250477904,
+            "centered_r2_std": 0.08306236888982578,
+            "centered_pearson": 0.21875926338896962,
+            "centered_pred_conf_pearson": -0.05633230597132078,
+            "centered_pred_conf_pearson_std": 0.10435163775526675
+          },
+          "23": {
+            "centered_r2": 0.005691178752163628,
+            "centered_r2_std": 0.09645692927700616,
+            "centered_pearson": 0.18155635254657426,
+            "centered_pred_conf_pearson": -0.1629347893753891,
+            "centered_pred_conf_pearson_std": 0.09903608702869103
+          },
+          "24": {
+            "centered_r2": -0.0013365337434037006,
+            "centered_r2_std": 0.1093703637195753,
+            "centered_pearson": 0.09657464842348101,
+            "centered_pred_conf_pearson": -0.2746734639138902,
+            "centered_pred_conf_pearson_std": 0.09335678022769005
+          },
+          "25": {
+            "centered_r2": -0.003199328040798921,
+            "centered_r2_std": 0.08212690989554118,
+            "centered_pearson": 0.0757563345565054,
+            "centered_pred_conf_pearson": -0.32243294326922645,
+            "centered_pred_conf_pearson_std": 0.0891953036218672
+          },
+          "26": {
+            "centered_r2": -0.007002495268575437,
+            "centered_r2_std": 0.1041440126983838,
+            "centered_pearson": 0.03466548125374904,
+            "centered_pred_conf_pearson": -0.3682233210898789,
+            "centered_pred_conf_pearson_std": 0.09982555455280546
+          },
+          "27": {
+            "centered_r2": -0.007716244067758282,
+            "centered_r2_std": 0.10709436079886046,
+            "centered_pearson": 0.027573126679362344,
+            "centered_pred_conf_pearson": -0.405308648846732,
+            "centered_pred_conf_pearson_std": 0.08564509151694197
+          },
+          "28": {
+            "centered_r2": -0.007944551775353359,
+            "centered_r2_std": 0.09260918007993879,
+            "centered_pearson": 0.023873124669063467,
+            "centered_pred_conf_pearson": -0.43460180241256613,
+            "centered_pred_conf_pearson_std": 0.08365292389693307
+          },
+          "29": {
+            "centered_r2": -0.008571777418061144,
+            "centered_r2_std": 0.08368335888157893,
+            "centered_pearson": 0.015711127825884474,
+            "centered_pred_conf_pearson": -0.5065862392644591,
+            "centered_pred_conf_pearson_std": 0.08333130353055794
+          },
+          "30": {
+            "centered_r2": -0.010405982197040142,
+            "centered_r2_std": 0.0866876579188087,
+            "centered_pearson": -0.005041437086783014,
+            "centered_pred_conf_pearson": -0.5644707555711733,
+            "centered_pred_conf_pearson_std": 0.08084042047983239
+          },
+          "31": {
+            "centered_r2": -0.03838144167163482,
+            "centered_r2_std": 0.09303856747908532,
+            "centered_pearson": -0.06231804345491816,
+            "centered_pred_conf_pearson": -0.7486865873975285,
+            "centered_pred_conf_pearson_std": 0.04549040354590245
+          }
+        }
+      }
+    }
+  },
+  "answer_transfer": {
+    "answer_mapping": {
+      "A": 0,
+      "B": 1,
+      "C": 2,
+      "D": 3
+    },
+    "d2d": {
+      "0": {
+        "accuracy": 0.32,
+        "accuracy_std": 0.04637930573003438
+      },
+      "1": {
+        "accuracy": 0.3,
+        "accuracy_std": 0.04611117001334926
+      },
+      "2": {
+        "accuracy": 0.23,
+        "accuracy_std": 0.038178004138508866
+      },
+      "3": {
+        "accuracy": 0.22,
+        "accuracy_std": 0.03669591257892355
+      },
+      "4": {
+        "accuracy": 0.29,
+        "accuracy_std": 0.04191360161093294
+      },
+      "5": {
+        "accuracy": 0.28,
+        "accuracy_std": 0.04513036671687923
+      },
+      "6": {
+        "accuracy": 0.18,
+        "accuracy_std": 0.03613571640358054
+      },
+      "7": {
+        "accuracy": 0.23,
+        "accuracy_std": 0.04062708456190279
+      },
+      "8": {
+        "accuracy": 0.25,
+        "accuracy_std": 0.048484533616401836
+      },
+      "9": {
+        "accuracy": 0.31,
+        "accuracy_std": 0.045941158017620755
+      },
+      "10": {
+        "accuracy": 0.27,
+        "accuracy_std": 0.04304079460233047
+      },
+      "11": {
+        "accuracy": 0.37,
+        "accuracy_std": 0.04209465524267897
+      },
+      "12": {
+        "accuracy": 0.47,
+        "accuracy_std": 0.04738100885375913
+      },
+      "13": {
+        "accuracy": 0.66,
+        "accuracy_std": 0.04650365577027252
+      },
+      "14": {
+        "accuracy": 0.83,
+        "accuracy_std": 0.043870149304510005
+      },
+      "15": {
+        "accuracy": 0.8,
+        "accuracy_std": 0.0433057732871727
+      },
+      "16": {
+        "accuracy": 0.79,
+        "accuracy_std": 0.032313928885234613
+      },
+      "17": {
+        "accuracy": 0.95,
+        "accuracy_std": 0.024121359828998018
+      },
+      "18": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.018267731112538297
+      },
+      "19": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.019862275801126112
+      },
+      "20": {
+        "accuracy": 0.94,
+        "accuracy_std": 0.02401062264915258
+      },
+      "21": {
+        "accuracy": 0.94,
+        "accuracy_std": 0.02525549445170296
+      },
+      "22": {
+        "accuracy": 0.94,
+        "accuracy_std": 0.025012796724876628
+      },
+      "23": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.018650469162999624
+      },
+      "24": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.01934399131513452
+      },
+      "25": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.021028314245321703
+      },
+      "26": {
+        "accuracy": 0.97,
+        "accuracy_std": 0.01628004913997498
+      },
+      "27": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.018330302779823365
+      },
+      "28": {
+        "accuracy": 0.95,
+        "accuracy_std": 0.02456908626709588
+      },
+      "29": {
+        "accuracy": 0.96,
+        "accuracy_std": 0.020062651868584067
+      },
+      "30": {
+        "accuracy": 0.95,
+        "accuracy_std": 0.02563025555861664
+      },
+      "31": {
+        "accuracy": 0.9,
+        "accuracy_std": 0.029013617492481013
+      }
+    },
+    "d2m_by_position": {
+      "final": {
+        "0": {
+          "centered_accuracy": 0.29,
+          "centered_accuracy_std": 0.041155315574054344,
+          "separate_accuracy": 0.27,
+          "separate_accuracy_std": 0.04557148231076096
+        },
+        "1": {
+          "centered_accuracy": 0.26,
+          "centered_accuracy_std": 0.04648386816950585,
+          "separate_accuracy": 0.25,
+          "separate_accuracy_std": 0.04609077998906072
+        },
+        "2": {
+          "centered_accuracy": 0.24,
+          "centered_accuracy_std": 0.03917588543989785,
+          "separate_accuracy": 0.2,
+          "separate_accuracy_std": 0.04037065766122717
+        },
+        "3": {
+          "centered_accuracy": 0.22,
+          "centered_accuracy_std": 0.04090708985004922,
+          "separate_accuracy": 0.19,
+          "separate_accuracy_std": 0.036068823102507794
+        },
+        "4": {
+          "centered_accuracy": 0.24,
+          "centered_accuracy_std": 0.0421752296970627,
+          "separate_accuracy": 0.24,
+          "separate_accuracy_std": 0.04404213891263684
+        },
+        "5": {
+          "centered_accuracy": 0.23,
+          "centered_accuracy_std": 0.0452278675155042,
+          "separate_accuracy": 0.22,
+          "separate_accuracy_std": 0.04435808832670768
+        },
+        "6": {
+          "centered_accuracy": 0.28,
+          "centered_accuracy_std": 0.05056836956042779,
+          "separate_accuracy": 0.21,
+          "separate_accuracy_std": 0.04437071106033799
+        },
+        "7": {
+          "centered_accuracy": 0.25,
+          "centered_accuracy_std": 0.04284857057125711,
+          "separate_accuracy": 0.2,
+          "separate_accuracy_std": 0.03927798365496885
+        },
+        "8": {
+          "centered_accuracy": 0.26,
+          "centered_accuracy_std": 0.04005733391028414,
+          "separate_accuracy": 0.27,
+          "separate_accuracy_std": 0.04379315014930989
+        },
+        "9": {
+          "centered_accuracy": 0.3,
+          "centered_accuracy_std": 0.04357017328402539,
+          "separate_accuracy": 0.3,
+          "separate_accuracy_std": 0.053652492952331675
+        },
+        "10": {
+          "centered_accuracy": 0.25,
+          "centered_accuracy_std": 0.04172001917545101,
+          "separate_accuracy": 0.29,
+          "separate_accuracy_std": 0.04104570623098109
+        },
+        "11": {
+          "centered_accuracy": 0.32,
+          "centered_accuracy_std": 0.05040585283476513,
+          "separate_accuracy": 0.34,
+          "separate_accuracy_std": 0.04773300744767712
+        },
+        "12": {
+          "centered_accuracy": 0.26,
+          "centered_accuracy_std": 0.04044551891124652,
+          "separate_accuracy": 0.26,
+          "separate_accuracy_std": 0.04457847013974347
+        },
+        "13": {
+          "centered_accuracy": 0.32,
+          "centered_accuracy_std": 0.04627050896629515,
+          "separate_accuracy": 0.31,
+          "separate_accuracy_std": 0.04649731175025068
+        },
+        "14": {
+          "centered_accuracy": 0.34,
+          "centered_accuracy_std": 0.04932129357589884,
+          "separate_accuracy": 0.33,
+          "separate_accuracy_std": 0.04787316576120697
+        },
+        "15": {
+          "centered_accuracy": 0.32,
+          "centered_accuracy_std": 0.05574943945906541,
+          "separate_accuracy": 0.34,
+          "separate_accuracy_std": 0.04579301256742124
+        },
+        "16": {
+          "centered_accuracy": 0.35,
+          "centered_accuracy_std": 0.04804695619911838,
+          "separate_accuracy": 0.34,
+          "separate_accuracy_std": 0.04353515820575366
+        },
+        "17": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.04648386816950586,
+          "separate_accuracy": 0.39,
+          "separate_accuracy_std": 0.04880573736764972
+        },
+        "18": {
+          "centered_accuracy": 0.36,
+          "centered_accuracy_std": 0.04895140447423342,
+          "separate_accuracy": 0.43,
+          "separate_accuracy_std": 0.0551724568965349
+        },
+        "19": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.047874419056527465,
+          "separate_accuracy": 0.45,
+          "separate_accuracy_std": 0.048499381439354464
+        },
+        "20": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.052884307691412585,
+          "separate_accuracy": 0.42,
+          "separate_accuracy_std": 0.04949131236894007
+        },
+        "21": {
+          "centered_accuracy": 0.41,
+          "centered_accuracy_std": 0.0482048752721133,
+          "separate_accuracy": 0.43,
+          "separate_accuracy_std": 0.04402771854184588
+        },
+        "22": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.04982880692932553,
+          "separate_accuracy": 0.41,
+          "separate_accuracy_std": 0.04828705830758383
+        },
+        "23": {
+          "centered_accuracy": 0.35,
+          "centered_accuracy_std": 0.042880648315994474,
+          "separate_accuracy": 0.4,
+          "separate_accuracy_std": 0.041102189722689954
+        },
+        "24": {
+          "centered_accuracy": 0.42,
+          "centered_accuracy_std": 0.04964383143956558,
+          "separate_accuracy": 0.46,
+          "separate_accuracy_std": 0.04724404724407088
+        },
+        "25": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.04257041226016023,
+          "separate_accuracy": 0.43,
+          "separate_accuracy_std": 0.04840444194492899
+        },
+        "26": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.04561797891182817,
+          "separate_accuracy": 0.42,
+          "separate_accuracy_std": 0.0516405848146591
+        },
+        "27": {
+          "centered_accuracy": 0.4,
+          "centered_accuracy_std": 0.04705698672885888,
+          "separate_accuracy": 0.41,
+          "separate_accuracy_std": 0.04707610859023927
+        },
+        "28": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.05396332087631376,
+          "separate_accuracy": 0.46,
+          "separate_accuracy_std": 0.04994997497496872
+        },
+        "29": {
+          "centered_accuracy": 0.36,
+          "centered_accuracy_std": 0.046985529687340974,
+          "separate_accuracy": 0.38,
+          "separate_accuracy_std": 0.048207883172775794
+        },
+        "30": {
+          "centered_accuracy": 0.39,
+          "centered_accuracy_std": 0.044670348106993746,
+          "separate_accuracy": 0.4,
+          "separate_accuracy_std": 0.05614935440412472
+        },
+        "31": {
+          "centered_accuracy": 0.37,
+          "centered_accuracy_std": 0.05270901251209322,
+          "separate_accuracy": 0.4,
+          "separate_accuracy_std": 0.056920646517761894
+        }
+      }
+    },
+    "summary": {
+      "final": {
+        "best_layer": 24,
+        "best_centered_accuracy": 0.42
+      }
+    }
+  },
+  "per_question": [
+    {
+      "question": "In relation to phobias what word describes the fear of strangers or foreigners?",
+      "correct_answer": "C",
+      "stated_confidence": 0.79833984375,
+      "logit_gap": 2.734375
+    },
+    {
+      "question": "David Lloyd George was British Prime Minister during the reign of which monarch?",
+      "correct_answer": "B",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 6.78125
+    },
+    {
+      "question": "How many stars are on the national flag of New Zealand?",
+      "correct_answer": "D",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 2.0
+    },
+    {
+      "question": "In 1990 who faced banners saying Goodbye Pineapple Face?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 1.25
+    },
+    {
+      "question": "Who won the 1989 Ladies Singles Wimbledon Championship?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 0.96875
+    },
+    {
+      "question": "Which Muppet from the television series shares a name with a former US President?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 0.375
+    },
+    {
+      "question": "Which movie starred Michael Caine as a murderous transvestite psychiatrist?",
+      "correct_answer": "B",
+      "stated_confidence": 0.10821533203125,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "\"Which snooker player had the nickname \"\"The Thunder from Down Under\"\"?\"",
+      "correct_answer": "D",
+      "stated_confidence": 0.69287109375,
+      "logit_gap": 0.640625
+    },
+    {
+      "question": "Who composed the music for \u2018Billy Elliot, the Musical\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.79833984375,
+      "logit_gap": 2.765625
+    },
+    {
+      "question": "In January 1968 who was chosen as leader of the Communist Party in Czechoslovakia?",
+      "correct_answer": "B",
+      "stated_confidence": 0.80078125,
+      "logit_gap": 5.671875
+    },
+    {
+      "question": "By what nickname was English serial killer and armed robber Donald Neilson known?",
+      "correct_answer": "D",
+      "stated_confidence": 0.090087890625,
+      "logit_gap": 4.625
+    },
+    {
+      "question": "In 1931, what became the first ever televised sports event?",
+      "correct_answer": "B",
+      "stated_confidence": 0.83740234375,
+      "logit_gap": 0.53125
+    },
+    {
+      "question": "What was the former name of the British Green Party?",
+      "correct_answer": "A",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 9.859375
+    },
+    {
+      "question": "What is the middle name of US actor Samuel L Jackson?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1461181640625,
+      "logit_gap": 2.59375
+    },
+    {
+      "question": "What is the only letter of the alphabet which does not appear in any of the names of the 50 American states?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 2.5625
+    },
+    {
+      "question": "Who or what was Gentle Ben in the 60s TV series?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 10.203125
+    },
+    {
+      "question": "How many times was Boris Becker runner-up in the Men's Singles at Wimbledon?",
+      "correct_answer": "A",
+      "stated_confidence": 0.740234375,
+      "logit_gap": 0.5
+    },
+    {
+      "question": "Which 80 year old Irishman read the eulogy at Bernard Manning's funeral in June?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 0.484375
+    },
+    {
+      "question": "Which Thornbridge beer, gravity 5.9%, is named after an Indian city?",
+      "correct_answer": "D",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 5.59375
+    },
+    {
+      "question": "For which movie did Katharine Hepburn win her second Oscar?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1422119140625,
+      "logit_gap": 0.140625
+    },
+    {
+      "question": "What colour is the cross on the national flag of Switzerland?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1480712890625,
+      "logit_gap": 1.765625
+    },
+    {
+      "question": "Kurt Russell is the long term partner of which actress?",
+      "correct_answer": "D",
+      "stated_confidence": 0.10968017578125,
+      "logit_gap": 4.671875
+    },
+    {
+      "question": "In which northern British town can you find a large shopping centre called Hounds Hill?",
+      "correct_answer": "D",
+      "stated_confidence": 0.17333984375,
+      "logit_gap": 1.234375
+    },
+    {
+      "question": "Which 1962 ecological classic was written by Rachel Carson?",
+      "correct_answer": "A",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 12.703125
+    },
+    {
+      "question": "How many double-word score squares are there on a standard Scrabble board?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2393798828125,
+      "logit_gap": 0.6875
+    },
+    {
+      "question": "What is the art of hand-making cricket bats called?",
+      "correct_answer": "C",
+      "stated_confidence": 0.708984375,
+      "logit_gap": 6.671875
+    },
+    {
+      "question": "What colour are the flowers of a hawkbit plant?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 8.5
+    },
+    {
+      "question": "Which US city was named after a British Prime Minister?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 1.15625
+    },
+    {
+      "question": "Which other colour, along with yellow and green appears on the flag of Gabon?",
+      "correct_answer": "A",
+      "stated_confidence": 0.19677734375,
+      "logit_gap": 0.125
+    },
+    {
+      "question": "Name the magician who first introduced us to Basil Brush.",
+      "correct_answer": "D",
+      "stated_confidence": 0.1800537109375,
+      "logit_gap": 6.234375
+    },
+    {
+      "question": "In 2012, Bradford City FC presented the Dalai Lama with a personalised club shirt with which number on the back?",
+      "correct_answer": "B",
+      "stated_confidence": 0.71533203125,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "Acmeism relates to poetry from the early 20th Century in which country?",
+      "correct_answer": "C",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 12.0
+    },
+    {
+      "question": "The Lord Advocate is the chief law officer in which European country?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 10.453125
+    },
+    {
+      "question": "The names of which late British radio presenter\u2019s albums were published online in 2012 in a project called \u2018The Space\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.11920166015625,
+      "logit_gap": 8.171875
+    },
+    {
+      "question": "What was Warren Beatty's first movie?",
+      "correct_answer": "B",
+      "stated_confidence": 0.81982421875,
+      "logit_gap": 2.40625
+    },
+    {
+      "question": "The Canary Islands are named after what animal?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 9.8125
+    },
+    {
+      "question": "Which former English cricket umpire received an OBE in 2012?",
+      "correct_answer": "C",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 4.625
+    },
+    {
+      "question": "In Osacar Wilde's The Importance of Being Earnest who utters the line 'a handbag' ?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 1.5625
+    },
+    {
+      "question": "Which is the most southerly of the Canadian provinces?",
+      "correct_answer": "D",
+      "stated_confidence": 0.80078125,
+      "logit_gap": 1.078125
+    },
+    {
+      "question": "What colour are the two stars on the national flag of Syria?",
+      "correct_answer": "A",
+      "stated_confidence": 0.105224609375,
+      "logit_gap": 0.59375
+    },
+    {
+      "question": "What is secreted by the pancreas to regulate blood sugar levels?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 9.75
+    },
+    {
+      "question": "In which sport or pastime can you see nose walking?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1175537109375,
+      "logit_gap": 0.3125
+    },
+    {
+      "question": "Films. Which Dominic starred as Merry (Meriadoc) in \u2018The Lord of the Rings\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 1.125
+    },
+    {
+      "question": "In which year did it become compulsory to wear seat belts in front seats of cars in the UK?",
+      "correct_answer": "A",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 1.59375
+    },
+    {
+      "question": "The books were Alice and Jerry in the USA \u2013 what were they here?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1500244140625,
+      "logit_gap": 3.484375
+    },
+    {
+      "question": "Captain of the Flying Dustman, what was the name of Captain Pugwash's mortal enemy?",
+      "correct_answer": "C",
+      "stated_confidence": 0.71240234375,
+      "logit_gap": 5.21875
+    },
+    {
+      "question": "What are the major suits in the card game Bridge?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7607421875,
+      "logit_gap": 1.046875
+    },
+    {
+      "question": "In which country were motorized ambulances first used?",
+      "correct_answer": "B",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 0.25
+    },
+    {
+      "question": "Michael, John, Steven and Susan are the children of which former US President?",
+      "correct_answer": "A",
+      "stated_confidence": 0.12249755859375,
+      "logit_gap": 0.28125
+    },
+    {
+      "question": "In the human body, which pigment is primarily responsible for the colour of skin?",
+      "correct_answer": "D",
+      "stated_confidence": 0.8740234375,
+      "logit_gap": 11.4375
+    },
+    {
+      "question": "What would Kevin Scale have been called if it had adopted the originator's first name?",
+      "correct_answer": "C",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 3.0625
+    },
+    {
+      "question": "Who did Simple Simon meet on his way to the fair?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1943359375,
+      "logit_gap": 1.859375
+    },
+    {
+      "question": "Which sports event was first held at Worcester, Massachusetts in 1927?",
+      "correct_answer": "B",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 0.15625
+    },
+    {
+      "question": "Whose head was stuck on the roof of parliament after his body had been exhumed?",
+      "correct_answer": "D",
+      "stated_confidence": 0.689453125,
+      "logit_gap": 1.0
+    },
+    {
+      "question": "In 1934, local miners in Ashington, Northumberland, formed a group to study what?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 3.515625
+    },
+    {
+      "question": "More commonly known as the thigh bone, what is the medical name for the longest bone in the human body?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 11.703125
+    },
+    {
+      "question": "What was painter Rubens first name?",
+      "correct_answer": "D",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 8.375
+    },
+    {
+      "question": "Which Eastenders character had a dog called Willy?",
+      "correct_answer": "D",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 2.015625
+    },
+    {
+      "question": "Wolf Mankowitz wrote the 1953 novel \u2018A Kid For Two\u2026.\u2019what\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1175537109375,
+      "logit_gap": 0.984375
+    },
+    {
+      "question": "Which sporting trophy is made of melted silver rupees?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 0.984375
+    },
+    {
+      "question": "What had Edmond Hillary worked at before taking up mountain climbing?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1871337890625,
+      "logit_gap": 5.765625
+    },
+    {
+      "question": "The Kray twins were convicted of the murder of George Cornell in the East End of London in 1966. What was the name of the pub in which he was shot?",
+      "correct_answer": "A",
+      "stated_confidence": 0.6689453125,
+      "logit_gap": 10.84375
+    },
+    {
+      "question": "The Florentine Girdle was a type of what?",
+      "correct_answer": "D",
+      "stated_confidence": 0.79052734375,
+      "logit_gap": 1.75
+    },
+    {
+      "question": "Which serial killer is the subject of the films A Study In Terror, Murder By Decree and From Hell?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1312255859375,
+      "logit_gap": 10.140625
+    },
+    {
+      "question": "Who played Rachel Green in Friends?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1993408203125,
+      "logit_gap": 10.15625
+    },
+    {
+      "question": "What colour is a 100 Euro banknote?",
+      "correct_answer": "A",
+      "stated_confidence": 0.79833984375,
+      "logit_gap": 9.21875
+    },
+    {
+      "question": "Breve, Mocha and Americano are all types of which drink?",
+      "correct_answer": "C",
+      "stated_confidence": 0.80322265625,
+      "logit_gap": 0.46875
+    },
+    {
+      "question": "How many scottish football league teams names end in United?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 0.203125
+    },
+    {
+      "question": "In the British military, a bombadier is equivalent to which other rank?",
+      "correct_answer": "C",
+      "stated_confidence": 0.0966796875,
+      "logit_gap": 2.5625
+    },
+    {
+      "question": "After what is Fleet Street in London named?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 8.96875
+    },
+    {
+      "question": "The feathers of which bird are said to bring bad luck if they are brought into the house?",
+      "correct_answer": "C",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 0.0625
+    },
+    {
+      "question": "Which duo created the \u201cDagenham dialogues\u201d?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 1.71875
+    },
+    {
+      "question": "Which movie was a biopic about the life of David Helfgott?",
+      "correct_answer": "B",
+      "stated_confidence": 0.106689453125,
+      "logit_gap": 11.5
+    },
+    {
+      "question": "Who was the author of 'The Old Curiosity Shop'?",
+      "correct_answer": "B",
+      "stated_confidence": 0.80322265625,
+      "logit_gap": 11.171875
+    },
+    {
+      "question": "On a standard dartboard, what number lies opposite 18?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 0.09375
+    },
+    {
+      "question": "What type of creature is a Kokanee?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 11.625
+    },
+    {
+      "question": "Which late English singer released albums entitled \u2018Frank\u2019 and \u2018Back to Black\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.162353515625,
+      "logit_gap": 12.359375
+    },
+    {
+      "question": "In what film did Oprah Winfrey make her big screen acting debut?",
+      "correct_answer": "B",
+      "stated_confidence": 0.81982421875,
+      "logit_gap": 0.3125
+    },
+    {
+      "question": "Which London Underground rail line was nicknamed the \u2018Twopenny Tube\u2019 for its flat fare?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 1.828125
+    },
+    {
+      "question": "Who played factory boss Danny Baldwin in the British television soap \u2018Coronation Street\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.08154296875,
+      "logit_gap": 1.625
+    },
+    {
+      "question": "English novelist Barbara McCorquodale was better known by what name?",
+      "correct_answer": "A",
+      "stated_confidence": 0.103759765625,
+      "logit_gap": 2.390625
+    },
+    {
+      "question": "Fiji Day is celebrated in Fiji during which month of the year?",
+      "correct_answer": "B",
+      "stated_confidence": 0.82666015625,
+      "logit_gap": 1.734375
+    },
+    {
+      "question": "On a map of the London Underground, what colour is the Northern Line?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1561279296875,
+      "logit_gap": 0.78125
+    },
+    {
+      "question": "A skink is what type of reptile?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 11.46875
+    },
+    {
+      "question": "What name is given to the change of state from liquid to gas?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1666259765625,
+      "logit_gap": 8.953125
+    },
+    {
+      "question": "The 1965 film \u2018The Heroes of Telemark\u2019 is set in which European country?",
+      "correct_answer": "C",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 11.171875
+    },
+    {
+      "question": "Scleritis affects which part of the human body?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 11.40625
+    },
+    {
+      "question": "In which city are the administrative headquarters of the county of Cornwall?",
+      "correct_answer": "C",
+      "stated_confidence": 0.11920166015625,
+      "logit_gap": 10.40625
+    },
+    {
+      "question": "In which film does crooked computer programmer Dennis Nedry cause havoc?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7880859375,
+      "logit_gap": 9.703125
+    },
+    {
+      "question": "Who did Top of the Pops mistakenly portray in a Dexys Midnight Runners song?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1710205078125,
+      "logit_gap": 1.390625
+    },
+    {
+      "question": "Who played Dr. Doug Ross on the TV show E.R.?",
+      "correct_answer": "C",
+      "stated_confidence": 0.83740234375,
+      "logit_gap": 1.03125
+    },
+    {
+      "question": "How was the European Recovery Program in the 1940s more commonly known?",
+      "correct_answer": "A",
+      "stated_confidence": 0.80810546875,
+      "logit_gap": 13.75
+    },
+    {
+      "question": "\u2018Troilus and \u2018who\u2019 is the title of a play by William Shakespeare?",
+      "correct_answer": "C",
+      "stated_confidence": 0.73388671875,
+      "logit_gap": 7.796875
+    },
+    {
+      "question": "Athos and Porthos are two of the 3 musketeers, name the other one.",
+      "correct_answer": "A",
+      "stated_confidence": 0.162353515625,
+      "logit_gap": 2.109375
+    },
+    {
+      "question": "In the 2002 FIFA World Cup, which national football team became the first team in the Asian Football Confederation to reach the World Cup semi-finals?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 1.609375
+    },
+    {
+      "question": "The Naismith Award is presented in which sport?",
+      "correct_answer": "B",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 10.203125
+    },
+    {
+      "question": "In the 1965 film \u2018Those Magnificent Men in Their Flying Machines\u2019, how much is the prize money, in pounds sterling, for the fastest flight from London to Paris?",
+      "correct_answer": "B",
+      "stated_confidence": 0.2254638671875,
+      "logit_gap": 1.4375
+    },
+    {
+      "question": "How is the year 1994 depicted in Roman Numerals?",
+      "correct_answer": "B",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 7.875
+    },
+    {
+      "question": "Which US state lends its name to a baked pudding, made with ice cream, sponge and meringue?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2017822265625,
+      "logit_gap": 1.28125
+    },
+    {
+      "question": "Sindh is a province of which Asian country?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 13.203125
+    },
+    {
+      "question": "Who retired from the \u2018Eggheads\u2019 team in May 2014?",
+      "correct_answer": "D",
+      "stated_confidence": 0.64794921875,
+      "logit_gap": 7.0625
+    },
+    {
+      "question": "What was the first spacecraft to land on another planet?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 5.1875
+    },
+    {
+      "question": "\u2018A crutch and a duck\u2019 is the term for which bingo number?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 0.921875
+    },
+    {
+      "question": "Where does Roseanne have a tattoo of a pink rose?",
+      "correct_answer": "B",
+      "stated_confidence": 0.70263671875,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "Who designed St Paul\u2019s Cathedral in London?",
+      "correct_answer": "C",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 11.828125
+    },
+    {
+      "question": "In which country was the 2006 FIFA World Cup held?",
+      "correct_answer": "B",
+      "stated_confidence": 0.845703125,
+      "logit_gap": 11.5
+    },
+    {
+      "question": "In the Bible, who did the sun and moon stand still before?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1422119140625,
+      "logit_gap": 8.15625
+    },
+    {
+      "question": "Aung San Suu Kyi is a controversial leader in which country?",
+      "correct_answer": "C",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 13.078125
+    },
+    {
+      "question": "Which fashion brand had the advertising tagline \u2018When you put it on, something happens\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7216796875,
+      "logit_gap": 1.25
+    },
+    {
+      "question": "Which British king married Mary of Teck?",
+      "correct_answer": "A",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 10.359375
+    },
+    {
+      "question": "Which `B` was the name of the mechanical shark used in the original `Jaws` film?",
+      "correct_answer": "A",
+      "stated_confidence": 0.71240234375,
+      "logit_gap": 11.703125
+    },
+    {
+      "question": "What is the most popular name for Whistler's canvas Arrangement in Grey and Black?",
+      "correct_answer": "C",
+      "stated_confidence": 0.19189453125,
+      "logit_gap": 6.125
+    },
+    {
+      "question": "What type of animal is the star of the 2005 film Racing Stripes?",
+      "correct_answer": "A",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 4.359375
+    },
+    {
+      "question": "Proteus and Nereid are among the moons of which planet?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 2.265625
+    },
+    {
+      "question": "The love story of which writer is portrayed in the film Shadowlands?",
+      "correct_answer": "A",
+      "stated_confidence": 0.158203125,
+      "logit_gap": 11.4375
+    },
+    {
+      "question": "The board game Pachisi originated in which country?",
+      "correct_answer": "B",
+      "stated_confidence": 0.763671875,
+      "logit_gap": 9.703125
+    },
+    {
+      "question": "Which word can go after Cat, Board and Jay to make three other words?",
+      "correct_answer": "D",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 0.671875
+    },
+    {
+      "question": "What are the last six words of Rudyard Kipling\u2019s \u2018If\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 2.015625
+    },
+    {
+      "question": "What animal did Reggie Perrin think of every time his Mother-in-law was mentioned?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 1.703125
+    },
+    {
+      "question": "The collective noun for which British mammal is a 'cete'? [say \u201cSeat\u201d]",
+      "correct_answer": "B",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 0.171875
+    },
+    {
+      "question": "The Kremlin is situated in which city?",
+      "correct_answer": "A",
+      "stated_confidence": 0.76611328125,
+      "logit_gap": 14.453125
+    },
+    {
+      "question": "Which Scottish newspaper features the Broons and Oor Wullie?",
+      "correct_answer": "A",
+      "stated_confidence": 0.83544921875,
+      "logit_gap": 12.09375
+    },
+    {
+      "question": "What was Pete Sampras seeded when he won his first US Open?",
+      "correct_answer": "D",
+      "stated_confidence": 0.79296875,
+      "logit_gap": 1.390625
+    },
+    {
+      "question": "Which US comedian/actor is credited with saying \u2018A man is only as old as the woman he feels\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 0.53125
+    },
+    {
+      "question": "Which animal represents the deadly sin of envy?",
+      "correct_answer": "C",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 2.359375
+    },
+    {
+      "question": "Oona was the last of his four wives, and he died in 1977. Which famous film star?",
+      "correct_answer": "B",
+      "stated_confidence": 0.76904296875,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "Pike Bishop led which gang of film desperados?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1480712890625,
+      "logit_gap": 4.484375
+    },
+    {
+      "question": "In the game of Bingo, \u2018Get up and run\u2019 represents which number?",
+      "correct_answer": "C",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 1.0
+    },
+    {
+      "question": "Ushuaia, which is now generally accepted as the southernmost city in the world, is in which country?",
+      "correct_answer": "D",
+      "stated_confidence": 0.73388671875,
+      "logit_gap": 10.140625
+    },
+    {
+      "question": "Which part of the body are babies born without but develop from cartilaginous material that builds into bone in later life?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 2.6875
+    },
+    {
+      "question": "Yellow-pine, Uinta and Lodgepole are all types of which animal?",
+      "correct_answer": "B",
+      "stated_confidence": 0.76611328125,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "\"Used to describe insects such as the Mayfly that only live for a short time, what word derives from the Greek for \"\"living a day\"\"?\"",
+      "correct_answer": "C",
+      "stated_confidence": 0.1602783203125,
+      "logit_gap": 10.3125
+    },
+    {
+      "question": "In which UK city is Headingley railway station?",
+      "correct_answer": "A",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 11.234375
+    },
+    {
+      "question": "What colour is the cross on the national flag of Denmark?",
+      "correct_answer": "D",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 1.453125
+    },
+    {
+      "question": "Maria Fitzherbert was \u2018married\u2019 to which British monarch?",
+      "correct_answer": "B",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 4.71875
+    },
+    {
+      "question": "In 1986, which TV station sponsored the world's biggest wine tasting?",
+      "correct_answer": "D",
+      "stated_confidence": 0.106689453125,
+      "logit_gap": 1.5625
+    },
+    {
+      "question": "Who bought Chelsea football club for \u00a31 in 1982?",
+      "correct_answer": "D",
+      "stated_confidence": 0.67919921875,
+      "logit_gap": 3.828125
+    },
+    {
+      "question": "The Khyber Pass is approximately how many miles long?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 0.28125
+    },
+    {
+      "question": "In which country was Earl Spencer's acrimonious divorce settlement heard?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 5.3125
+    },
+    {
+      "question": "What is the first name of James bond villain Dr No?",
+      "correct_answer": "D",
+      "stated_confidence": 0.29736328125,
+      "logit_gap": 2.0625
+    },
+    {
+      "question": "In golf, the holing of a ball directly from a bunker is known as a \u2018Golden \u2018what\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.2147216796875,
+      "logit_gap": 2.171875
+    },
+    {
+      "question": "Which cartoon character had the maiden name \u2018Slaghoople\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 0.046875
+    },
+    {
+      "question": "American singer Al, late British television host Hughie and British businessman Philip all share which surname?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 1.953125
+    },
+    {
+      "question": "How many eyes does a bee have?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 11.3125
+    },
+    {
+      "question": "What nationality was the painter Vincent Van Gogh?",
+      "correct_answer": "B",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 9.609375
+    },
+    {
+      "question": "Spud, Shot and Hand are all types of what?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1943359375,
+      "logit_gap": 3.75
+    },
+    {
+      "question": "Where in Canada is the Lion's Gate bridge?",
+      "correct_answer": "D",
+      "stated_confidence": 0.162353515625,
+      "logit_gap": 10.65625
+    },
+    {
+      "question": "The Sun Woman provides the first light of dawn in which people\u2019s mythology?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "In which city was the first Model T produced outside the USA?",
+      "correct_answer": "B",
+      "stated_confidence": 0.763671875,
+      "logit_gap": 4.75
+    },
+    {
+      "question": "Which American car manufacturer has a logo which features three shields inside a circle?",
+      "correct_answer": "B",
+      "stated_confidence": 0.81298828125,
+      "logit_gap": 0.75
+    },
+    {
+      "question": "Apart from English, what is the official language of Canada?",
+      "correct_answer": "A",
+      "stated_confidence": 0.204345703125,
+      "logit_gap": 12.203125
+    },
+    {
+      "question": "If you heard the catchphrase \"They're great\" what would expect to be advertised?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1895751953125,
+      "logit_gap": 1.21875
+    },
+    {
+      "question": "Which King of England sold Dunkirk to Louis XIV of France?",
+      "correct_answer": "B",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 3.671875
+    },
+    {
+      "question": "In Greek mythology, Tiresias disclosed the crimes of who?",
+      "correct_answer": "D",
+      "stated_confidence": 0.79296875,
+      "logit_gap": 3.453125
+    },
+    {
+      "question": "What do the interior angles of a hexagon add up to in degrees?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 4.046875
+    },
+    {
+      "question": "Who is the narrator on the UK television show The Only Way Is Essex?",
+      "correct_answer": "B",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 1.375
+    },
+    {
+      "question": "Fruit, cricket and horseshoe are varieties of what type of animal?",
+      "correct_answer": "B",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 6.609375
+    },
+    {
+      "question": "Daniel Casey played the role of Detective Sergeant Troy in which TV series?",
+      "correct_answer": "B",
+      "stated_confidence": 0.106689453125,
+      "logit_gap": 9.296875
+    },
+    {
+      "question": "British MP, Diane Abbott, learned to play which musical instrument in the tv series \u2018Play It Again\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.115966796875,
+      "logit_gap": 3.203125
+    },
+    {
+      "question": "Which London football club won the last FA cup final held at the old Wembley Stadium?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 1.625
+    },
+    {
+      "question": "What is the name of the cockerel in the UK television series \u2018The Good Life\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.090087890625,
+      "logit_gap": 6.015625
+    },
+    {
+      "question": "What is Harrison Ford's real name?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 5.015625
+    },
+    {
+      "question": "Which \u2018A\u2019 means in the open air?",
+      "correct_answer": "D",
+      "stated_confidence": 0.20947265625,
+      "logit_gap": 4.921875
+    },
+    {
+      "question": "Labour Day is celebrated in France during which month of the year?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 0.21875
+    },
+    {
+      "question": "In January 1957, Russell Endean became the first batsman to be dismissed from a test cricket match for doing what?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "Peaches, Steve Wilkos, Tremont and Shawntel are all characters in which stage show?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 3.734375
+    },
+    {
+      "question": "Usually made of plastic, which transparent instrument, in the shape of a triangle with one angle at ninety degrees, is used for drawing angles on paper?",
+      "correct_answer": "C",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 6.140625
+    },
+    {
+      "question": "Davide Santon, Dino Zoff and Simone Barone have all played for which national football team?",
+      "correct_answer": "D",
+      "stated_confidence": 0.76611328125,
+      "logit_gap": 9.109375
+    },
+    {
+      "question": "\u2018Make Them Wait\u2019 is rhyming slang for which Bingo number?",
+      "correct_answer": "B",
+      "stated_confidence": 0.68603515625,
+      "logit_gap": 1.75
+    },
+    {
+      "question": "Who was the defending champion when Martina Navratilova first won Wimbledon singles?",
+      "correct_answer": "D",
+      "stated_confidence": 0.763671875,
+      "logit_gap": 0.5625
+    },
+    {
+      "question": "Which was nicknamed Old Rowley after a favourite stallion?",
+      "correct_answer": "B",
+      "stated_confidence": 0.103759765625,
+      "logit_gap": 5.359375
+    },
+    {
+      "question": "In which Poe tale is a wife murderer exposed by an ill-treated pet?",
+      "correct_answer": "A",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 6.34375
+    },
+    {
+      "question": "The husband of Lara Lewington, In which field is Martin Lewis a TV expert?",
+      "correct_answer": "A",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 11.3125
+    },
+    {
+      "question": "A bet of Manqu\u00e9 at roulette covers which group of numbers?",
+      "correct_answer": "D",
+      "stated_confidence": 0.71875,
+      "logit_gap": 1.65625
+    },
+    {
+      "question": "Which comedian/actor played the Doctor Who monster Abzorbaloff, which appeared in the 2006 episode \u2018Love and Monsters\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.103759765625,
+      "logit_gap": 7.265625
+    },
+    {
+      "question": "Which country does the airline TAAG come from?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 13.78125
+    },
+    {
+      "question": "Who wrote \u2018It\u2019s a Battlefield\u2019 (1934) and \u2018The Power and the Glory\u2019 (1940)?",
+      "correct_answer": "C",
+      "stated_confidence": 0.154052734375,
+      "logit_gap": 11.65625
+    },
+    {
+      "question": "Who played Beverley Hills hairdresser George Roundy in the 1975 film \u2018Shampoo\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.115966796875,
+      "logit_gap": 1.15625
+    },
+    {
+      "question": "What colour cape does Batman\u2019s sidekick Robin wear in the 1960\u2019s television series?",
+      "correct_answer": "B",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 1.328125
+    },
+    {
+      "question": "Who was born first, Kiefer Sutherland or Christian Slater?",
+      "correct_answer": "A",
+      "stated_confidence": 0.182373046875,
+      "logit_gap": 4.9375
+    },
+    {
+      "question": "In the game of Cluedo, what colour is the piece that represents Mrs Peacock?",
+      "correct_answer": "B",
+      "stated_confidence": 0.67919921875,
+      "logit_gap": 1.75
+    },
+    {
+      "question": "Noss, Unst, Lamba and Foula are part of which Scottish island group?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 13.21875
+    },
+    {
+      "question": "Which US state consist of a single syllable?",
+      "correct_answer": "C",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 0.515625
+    },
+    {
+      "question": "Singer and musician Bono called which venue \u2018Rock and roll\u2019s great cathedral\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1480712890625,
+      "logit_gap": 4.671875
+    },
+    {
+      "question": "Who painted The Judgement of Paris, In around 1636?",
+      "correct_answer": "D",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 0.21875
+    },
+    {
+      "question": "Which sitcom star appeared on the big screening The Object of My Affection?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 1.421875
+    },
+    {
+      "question": "How many hundredweight are in a UK ton?",
+      "correct_answer": "C",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 0.25
+    },
+    {
+      "question": "Stanislaw August Poniatowski was the last king of which European country?",
+      "correct_answer": "B",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 10.9375
+    },
+    {
+      "question": "Which musician founded the Red Hot Peppers?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1175537109375,
+      "logit_gap": 0.609375
+    },
+    {
+      "question": "Which Italian city is known as the pizza capital of the world?",
+      "correct_answer": "C",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 11.796875
+    },
+    {
+      "question": "What is the name of the London Underground station in EastEnders?",
+      "correct_answer": "C",
+      "stated_confidence": 0.69580078125,
+      "logit_gap": 0.375
+    },
+    {
+      "question": "Apart from white, what colour are the other two \u2018triangles\u2019 on the BMW logo?",
+      "correct_answer": "D",
+      "stated_confidence": 0.72802734375,
+      "logit_gap": 0.015625
+    },
+    {
+      "question": "Where was horse racing's Breeders' Cup held in 1989?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 4.28125
+    },
+    {
+      "question": "Which country invaded the Falkland Islands in April 1982?",
+      "correct_answer": "B",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 10.9375
+    },
+    {
+      "question": "Dmitri Mendeleev is credited with the first version of which \u2018table\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.162353515625,
+      "logit_gap": 11.515625
+    },
+    {
+      "question": "The nictitating membrane is found on which part of animal\u2019s body?",
+      "correct_answer": "B",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 10.03125
+    },
+    {
+      "question": "The SI unit the ohm is often represented by the upper-case form of which Greek letter?",
+      "correct_answer": "C",
+      "stated_confidence": 0.25390625,
+      "logit_gap": 7.015625
+    },
+    {
+      "question": "Which is the first written single word number in which the letter \u2018A\u2019 appears?",
+      "correct_answer": "D",
+      "stated_confidence": 0.2337646484375,
+      "logit_gap": 0.359375
+    },
+    {
+      "question": "How many chambers has the heart?",
+      "correct_answer": "D",
+      "stated_confidence": 0.25390625,
+      "logit_gap": 7.359375
+    },
+    {
+      "question": "In the novel \u2018Wuthering Heights\u2019 by Emily Bronte, Catherine\u2019s father found Heathcliffe on the streets of which English city?",
+      "correct_answer": "D",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 2.515625
+    },
+    {
+      "question": "Amr Shabana from Egypt is famous for playing which sport?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 9.09375
+    },
+    {
+      "question": "Which town is located closest to Junction 1 of the M6?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1461181640625,
+      "logit_gap": 1.234375
+    },
+    {
+      "question": "In golf what is the old-fashioned name for a No 3 wood?",
+      "correct_answer": "D",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 8.21875
+    },
+    {
+      "question": "Who plays Daphne in the 2002 film \u2018Scooby-Doo\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.11126708984375,
+      "logit_gap": 3.640625
+    },
+    {
+      "question": "Which city is the destination of the yacht race which leaves Sydney every Boxing Day?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 9.15625
+    },
+    {
+      "question": "How many Rings of Power were there, in total?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1422119140625,
+      "logit_gap": 3.546875
+    },
+    {
+      "question": "Who was the youngest brother in the Beach Boys?",
+      "correct_answer": "A",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 1.203125
+    },
+    {
+      "question": "According to a traditional English proverb, what is better than none?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1175537109375,
+      "logit_gap": 7.796875
+    },
+    {
+      "question": "\"Who, in 1983 sang the theme song to the James Bond film \"\"Octopussy\"\"?\"",
+      "correct_answer": "D",
+      "stated_confidence": 0.71533203125,
+      "logit_gap": 4.0
+    },
+    {
+      "question": "Which is the only Semitic language that is an official language of the EU?",
+      "correct_answer": "B",
+      "stated_confidence": 0.102294921875,
+      "logit_gap": 10.703125
+    },
+    {
+      "question": "Real Love in 1996 was whose last top 10 hit in the UK?",
+      "correct_answer": "B",
+      "stated_confidence": 0.81298828125,
+      "logit_gap": 2.65625
+    },
+    {
+      "question": "Which woman was voted BBC Sports Personality of the Year in 1971?",
+      "correct_answer": "A",
+      "stated_confidence": 0.09271240234375,
+      "logit_gap": 3.609375
+    },
+    {
+      "question": "The Hindhead Tunnel is in which English county?",
+      "correct_answer": "D",
+      "stated_confidence": 0.81298828125,
+      "logit_gap": 9.234375
+    },
+    {
+      "question": "Who was known as the Fat Boy of the Reserve",
+      "correct_answer": "D",
+      "stated_confidence": 0.69921875,
+      "logit_gap": 7.0
+    },
+    {
+      "question": "The Nazi regime was Germany's Third Reich; which was the first Reich?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7958984375,
+      "logit_gap": 8.390625
+    },
+    {
+      "question": "Antigonus is a character in which Shakespeare play?",
+      "correct_answer": "B",
+      "stated_confidence": 0.12249755859375,
+      "logit_gap": 0.296875
+    },
+    {
+      "question": "What is the name of the Jewish spring festival which celebrates the exodus of the Israelites from Egypt?",
+      "correct_answer": "A",
+      "stated_confidence": 0.08758544921875,
+      "logit_gap": 12.609375
+    },
+    {
+      "question": "Rolf Harris recorded a 1964 single calling for which member of The Beatles \u2018For President\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 3.84375
+    },
+    {
+      "question": "People born on the 1st March have which sign of the Zodiac?",
+      "correct_answer": "A",
+      "stated_confidence": 0.8173828125,
+      "logit_gap": 1.609375
+    },
+    {
+      "question": "What type of creature is a louvar?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7880859375,
+      "logit_gap": 9.609375
+    },
+    {
+      "question": "What does the title of the play \u2018Die Rauber\u2019, by German playwright Friedrich Schiller, translate to in English?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 4.859375
+    },
+    {
+      "question": "Keflavik is the main international airport of which country?",
+      "correct_answer": "D",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 11.21875
+    },
+    {
+      "question": "In World War I what was \u2018a blighty one\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.72802734375,
+      "logit_gap": 4.46875
+    },
+    {
+      "question": "Who were the four different Snooker World Champions in the 1990s?",
+      "correct_answer": "A",
+      "stated_confidence": 0.68603515625,
+      "logit_gap": 3.234375
+    },
+    {
+      "question": "By what score did GB beat Belgium to win the Davis Cup in November 2015?",
+      "correct_answer": "D",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 2.546875
+    },
+    {
+      "question": "In Hanna and Barbera's TV cartoons base on The Addams Family who was the voice of Gomez?",
+      "correct_answer": "A",
+      "stated_confidence": 0.71240234375,
+      "logit_gap": 0.484375
+    },
+    {
+      "question": "Who did Dr. Crippen murder?",
+      "correct_answer": "A",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 8.15625
+    },
+    {
+      "question": "Which South American capital is the nearest to the equator?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 9.140625
+    },
+    {
+      "question": "Which British artist\u2019s works include \u2018The First Real Target\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.09808349609375,
+      "logit_gap": 3.15625
+    },
+    {
+      "question": "In a standard deck of cards, how many Kings have a moustache?",
+      "correct_answer": "A",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 2.265625
+    },
+    {
+      "question": "Which country is bordered by Latvia to the north, Ukraine to the south, and Poland to the west?",
+      "correct_answer": "A",
+      "stated_confidence": 0.740234375,
+      "logit_gap": 4.4375
+    },
+    {
+      "question": "In which county will you find Fountains abbey and Studley Water Gardens?",
+      "correct_answer": "D",
+      "stated_confidence": 0.0953369140625,
+      "logit_gap": 4.484375
+    },
+    {
+      "question": "The Strawberry Museum in the town of Wepion is in which country?",
+      "correct_answer": "D",
+      "stated_confidence": 0.72802734375,
+      "logit_gap": 10.484375
+    },
+    {
+      "question": "Which word can go before Work, Guard and Dog to make three other words?",
+      "correct_answer": "A",
+      "stated_confidence": 0.219970703125,
+      "logit_gap": 0.0625
+    },
+    {
+      "question": "Michaelmas Day is celebrated on the 29th of which month?",
+      "correct_answer": "D",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 5.0625
+    },
+    {
+      "question": "Where does the infamous \"Streif\" downhill ski race take place?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1710205078125,
+      "logit_gap": 12.6875
+    },
+    {
+      "question": "Which is the only team to have won football\u2019s Premier League once and once only?",
+      "correct_answer": "A",
+      "stated_confidence": 0.76611328125,
+      "logit_gap": 1.0
+    },
+    {
+      "question": "Which rock star is known as 'The Boss'?",
+      "correct_answer": "B",
+      "stated_confidence": 0.81298828125,
+      "logit_gap": 10.78125
+    },
+    {
+      "question": "Ted Nevin, who died in 1992, was a leading authority in what sphere?",
+      "correct_answer": "A",
+      "stated_confidence": 0.162353515625,
+      "logit_gap": 0.15625
+    },
+    {
+      "question": "Who was the man behind The Chipmunks?",
+      "correct_answer": "A",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 0.375
+    },
+    {
+      "question": "What was late singer Michael Jackson\u2019s first solo UK number one hit single?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1500244140625,
+      "logit_gap": 2.1875
+    },
+    {
+      "question": "Which American band had a 1970\u2019s UK hit with \u2018Let\u2019s Work Together\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7958984375,
+      "logit_gap": 7.96875
+    },
+    {
+      "question": "Rita Coolidge sang the title song for which Bond film?",
+      "correct_answer": "A",
+      "stated_confidence": 0.158203125,
+      "logit_gap": 0.078125
+    },
+    {
+      "question": "What is the name of Terence and Shirley Conran's dress designer son?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1800537109375,
+      "logit_gap": 4.609375
+    },
+    {
+      "question": "Which actress was voted Miss Greenwich Village in 1942?",
+      "correct_answer": "B",
+      "stated_confidence": 0.0726318359375,
+      "logit_gap": 1.328125
+    },
+    {
+      "question": "What are the only two musical notes which have no flats?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 1.9375
+    },
+    {
+      "question": "On a standard dartboard, which number lies between 12 and 20?",
+      "correct_answer": "C",
+      "stated_confidence": 0.2451171875,
+      "logit_gap": 3.234375
+    },
+    {
+      "question": "What are the first names of the two dancing instructors in the UK television series \u2018Hi De Hi\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 0.953125
+    },
+    {
+      "question": "Which cartoon character is mentioned in the single \u2018Life on Mars\u2019 by David Bowie?",
+      "correct_answer": "B",
+      "stated_confidence": 0.80322265625,
+      "logit_gap": 0.546875
+    },
+    {
+      "question": "Which golf course has holes called Silver Tassie, Blink Bonnie and Wee Bogle?",
+      "correct_answer": "D",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 0.765625
+    },
+    {
+      "question": "Thomas the Tank Engine pulled two coaches. One was Clarabel. What was the other?",
+      "correct_answer": "B",
+      "stated_confidence": 0.265869140625,
+      "logit_gap": 1.296875
+    },
+    {
+      "question": "Which infamous character became Pope Alexander VI?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1461181640625,
+      "logit_gap": 9.375
+    },
+    {
+      "question": "Astrakhan is the curly hair of which young animal?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 0.515625
+    },
+    {
+      "question": "In golf, what name is given to a score of three under par on a given hole?",
+      "correct_answer": "D",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 0.890625
+    },
+    {
+      "question": "What is the name of the dog in the Punch and Judy shows?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1461181640625,
+      "logit_gap": 1.203125
+    },
+    {
+      "question": "\"Which character did Julia \"\"Roberts play in Steven Spielberg's Hook?\"",
+      "correct_answer": "A",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 3.1875
+    },
+    {
+      "question": "How many US states are prefixed by the word New?",
+      "correct_answer": "B",
+      "stated_confidence": 0.219970703125,
+      "logit_gap": 1.234375
+    },
+    {
+      "question": "What are the first names of art duo Proesch and Passmore?",
+      "correct_answer": "B",
+      "stated_confidence": 0.72802734375,
+      "logit_gap": 6.125
+    },
+    {
+      "question": "Robert Kirkpatrick of California grew the world's biggest what?",
+      "correct_answer": "B",
+      "stated_confidence": 0.2281494140625,
+      "logit_gap": 0.046875
+    },
+    {
+      "question": "Which was the first Liverpool group to top the UK chart?",
+      "correct_answer": "D",
+      "stated_confidence": 0.11920166015625,
+      "logit_gap": 0.421875
+    },
+    {
+      "question": "Whose official country residence is Dorneywood, Buckinghamshire?",
+      "correct_answer": "C",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 3.984375
+    },
+    {
+      "question": "Which fruit did Nell Gwynn, mistress of King Charles II, sell in Drury Lane?",
+      "correct_answer": "A",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 2.875
+    },
+    {
+      "question": "In which year did children\u2019s television show \u2018Sesame Street\u2019 debut on US television?",
+      "correct_answer": "C",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 7.40625
+    },
+    {
+      "question": "According to the Beatles, in which English town were there \u201cfour thousand holes\u201d?",
+      "correct_answer": "A",
+      "stated_confidence": 0.71533203125,
+      "logit_gap": 2.25
+    },
+    {
+      "question": "What name links an American singer and a Nottinghamshire and England cricketer?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7607421875,
+      "logit_gap": 3.46875
+    },
+    {
+      "question": "What story introduced the Cybermen?",
+      "correct_answer": "A",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 9.21875
+    },
+    {
+      "question": "Weighing-in at up 48 stone, who wrestled under the ring-name Giant Haystacks?",
+      "correct_answer": "A",
+      "stated_confidence": 0.65478515625,
+      "logit_gap": 6.4375
+    },
+    {
+      "question": "The letter t is the second most common letter used in the English language?",
+      "correct_answer": "B",
+      "stated_confidence": 0.22265625,
+      "logit_gap": 4.828125
+    },
+    {
+      "question": "Which comedy series was largely set in St. Aldhelm\u2019s Church Hall?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 3.078125
+    },
+    {
+      "question": "In the UK television series \u2018Dad\u2019s Army\u2019, what was Lance-Corpopal Jack Jones occupation?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 2.40625
+    },
+    {
+      "question": "Arkansas Black is a variety of which fruit?",
+      "correct_answer": "D",
+      "stated_confidence": 0.219970703125,
+      "logit_gap": 9.046875
+    },
+    {
+      "question": "Yuppy Love, Danger UXD, The Frog's Legacy, Diamonds Are For Trevor?",
+      "correct_answer": "B",
+      "stated_confidence": 0.158203125,
+      "logit_gap": 2.859375
+    },
+    {
+      "question": "How many times did Steffi Graf win the Ladies Singles at Wimbledon?",
+      "correct_answer": "A",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 0.765625
+    },
+    {
+      "question": "To whom did Helen Keller dedicate her autobiography, The Story of My Life?",
+      "correct_answer": "C",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 2.46875
+    },
+    {
+      "question": "Who became BBC Radio One Breakfast Show presenter in June 1973?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 1.015625
+    },
+    {
+      "question": "Who was the first US president Barbara Walters interviewed?",
+      "correct_answer": "D",
+      "stated_confidence": 0.158203125,
+      "logit_gap": 2.40625
+    },
+    {
+      "question": "In the piano-moving ad, what was the name of the \u2018man\u2019 in charge?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 0.40625
+    },
+    {
+      "question": "What is footballer Ryan Giggs real surname?",
+      "correct_answer": "D",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 0.0625
+    },
+    {
+      "question": "What is the second most common word in written English?",
+      "correct_answer": "C",
+      "stated_confidence": 0.80810546875,
+      "logit_gap": 2.84375
+    },
+    {
+      "question": "In \u2018Big School\u2019 (2013), what subject was taught by Philip Glenister\u2019s character?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7958984375,
+      "logit_gap": 1.140625
+    },
+    {
+      "question": "Who presents the new BBC documentary Science Britannica?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 0.28125
+    },
+    {
+      "question": "Where in England was actor Nigel Hawthorne born?",
+      "correct_answer": "B",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 2.09375
+    },
+    {
+      "question": "Which island group became known as The Friendly Islands?",
+      "correct_answer": "B",
+      "stated_confidence": 0.77978515625,
+      "logit_gap": 9.40625
+    },
+    {
+      "question": "Filbert Fox is the mascot of which English football club?",
+      "correct_answer": "A",
+      "stated_confidence": 0.106689453125,
+      "logit_gap": 0.140625
+    },
+    {
+      "question": "What is being built in the Olympic Park, that will be the world's longest and tallest of its kind?",
+      "correct_answer": "B",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 0.703125
+    },
+    {
+      "question": "Limburger cheese is made from the milk of which animal?",
+      "correct_answer": "C",
+      "stated_confidence": 0.204345703125,
+      "logit_gap": 1.15625
+    },
+    {
+      "question": "Who were the backing group of Junior Walker?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1710205078125,
+      "logit_gap": 8.6875
+    },
+    {
+      "question": "In which decade did stereo records first go on sale?",
+      "correct_answer": "A",
+      "stated_confidence": 0.79052734375,
+      "logit_gap": 3.15625
+    },
+    {
+      "question": "What is the name of the character played by actor Nicholas Lyndhurst in the British television series \u2018Goodnight Sweetheart\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.105224609375,
+      "logit_gap": 6.921875
+    },
+    {
+      "question": "Which politician, facing charges of murder, lost his seat in a General Election?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 0.96875
+    },
+    {
+      "question": "In October 2015, which city was named by VisitEngland as the \u2018Home of English Sport\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.106689453125,
+      "logit_gap": 0.984375
+    },
+    {
+      "question": "What sport or pastime would you be playing if your balls were black and blue and your opponent's were red and yellow?",
+      "correct_answer": "B",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 0.109375
+    },
+    {
+      "question": "Which king\u2019s beloved son William was drowned in the tragedy of the White Ship?",
+      "correct_answer": "B",
+      "stated_confidence": 0.70556640625,
+      "logit_gap": 2.40625
+    },
+    {
+      "question": "Which religion uses a domed structure called a Stupa as a shrine?",
+      "correct_answer": "B",
+      "stated_confidence": 0.154052734375,
+      "logit_gap": 9.46875
+    },
+    {
+      "question": "Which edible nut is found on a variety of Hickory Tree?",
+      "correct_answer": "D",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 8.59375
+    },
+    {
+      "question": "Who became the host of the BBC Radio 1 weekday breakfast show in September 2012?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7216796875,
+      "logit_gap": 8.3125
+    },
+    {
+      "question": "What is the International Vehicle Registration for Cambodia?",
+      "correct_answer": "D",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 6.5
+    },
+    {
+      "question": "In dentistry, what is the name given to hardened dental plaque?",
+      "correct_answer": "B",
+      "stated_confidence": 0.80810546875,
+      "logit_gap": 3.984375
+    },
+    {
+      "question": "What was the name of Roland Rat's gerbil friend?",
+      "correct_answer": "D",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 2.8125
+    },
+    {
+      "question": "Which famous female character of TV and films was played by a male when she was first introduced to our screens in 1943?",
+      "correct_answer": "C",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 0.9375
+    },
+    {
+      "question": "The English towns of Abingdon, Wallingford and Marlow lie on which river?",
+      "correct_answer": "D",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 5.421875
+    },
+    {
+      "question": "\u2018Before I Forget\u2019 is a 1981 Autobiography by which English actor?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12420654296875,
+      "logit_gap": 1.03125
+    },
+    {
+      "question": "What was the title of Fun Lovin\u2019 Criminals\u2019 1996 song that nearly made the Top 20?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 2.109375
+    },
+    {
+      "question": "Which Palestinian co-founded al Fatah in 1957?",
+      "correct_answer": "D",
+      "stated_confidence": 0.09271240234375,
+      "logit_gap": 7.78125
+    },
+    {
+      "question": "The bestselling children\u2019s book \u201cGrandpa\u2019s great escape\u201d is by which writer?",
+      "correct_answer": "A",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 0.59375
+    },
+    {
+      "question": "Which serial killer hanged himself in Wakefield Prison in January 2004, four years after being found guilty of 15 murders?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1259765625,
+      "logit_gap": 0.609375
+    },
+    {
+      "question": "Who owned the brass factory and just about everything else in the sitcom Brass?",
+      "correct_answer": "D",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 0.46875
+    },
+    {
+      "question": "The Western Roll is a technique used in which track and field athletics event?",
+      "correct_answer": "A",
+      "stated_confidence": 0.093994140625,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "In 1998 at the age of 77 who became the oldest person to fly in space?",
+      "correct_answer": "C",
+      "stated_confidence": 0.70263671875,
+      "logit_gap": 5.90625
+    },
+    {
+      "question": "Who wrote the 1790\u2019s work \u201cTravels in the Interior of Africa\u201d?",
+      "correct_answer": "D",
+      "stated_confidence": 0.69287109375,
+      "logit_gap": 6.75
+    },
+    {
+      "question": "The present Speaker\u2019s Chair in the House of Commons  in the UK was given by which country in 1951?",
+      "correct_answer": "A",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 0.53125
+    },
+    {
+      "question": "When David killed Goliath, how many of his five stones did he use?",
+      "correct_answer": "B",
+      "stated_confidence": 0.17333984375,
+      "logit_gap": 4.59375
+    },
+    {
+      "question": "Smoky, Leaf-nosed and Vesper are all species of which creature?",
+      "correct_answer": "B",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 9.0625
+    },
+    {
+      "question": "Which founder of the company Triad was accused by the USA of receiving bribes?",
+      "correct_answer": "B",
+      "stated_confidence": 0.11126708984375,
+      "logit_gap": 2.234375
+    },
+    {
+      "question": "Which act has had more Christmas number one singles than any other?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1895751953125,
+      "logit_gap": 4.9375
+    },
+    {
+      "question": "What is the traditional name for a 40th wedding anniversary?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7958984375,
+      "logit_gap": 1.984375
+    },
+    {
+      "question": "In which country could you drive along the 1700 kilometre Bruce Highway?",
+      "correct_answer": "A",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 14.40625
+    },
+    {
+      "question": "The town of Vittoria and the city of Ragusa can be found on which island?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7607421875,
+      "logit_gap": 10.484375
+    },
+    {
+      "question": "The Cartier Racing Awards are competed for in which sport?",
+      "correct_answer": "D",
+      "stated_confidence": 0.76904296875,
+      "logit_gap": 7.734375
+    },
+    {
+      "question": "How old was Woody Herman when he founded his own orchestra?",
+      "correct_answer": "D",
+      "stated_confidence": 0.76904296875,
+      "logit_gap": 0.6875
+    },
+    {
+      "question": "What type of creature is a bananaquit?",
+      "correct_answer": "D",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 10.4375
+    },
+    {
+      "question": "Merton Pride and Williams are varieties of which fruit?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2281494140625,
+      "logit_gap": 1.046875
+    },
+    {
+      "question": "Which Flemish Baroque painter\u2019s Antwerp home is now a museum?",
+      "correct_answer": "D",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 8.3125
+    },
+    {
+      "question": "\"Which \"\"Carry On\"\" film contained the line 'Oh yes colonel, many times, but never with a daffodil'?\"",
+      "correct_answer": "B",
+      "stated_confidence": 0.158203125,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "Although he never won an Oscar for best director, one of Hitchcock's films did win an Oscar for best picture. What was the film?",
+      "correct_answer": "A",
+      "stated_confidence": 0.291015625,
+      "logit_gap": 2.609375
+    },
+    {
+      "question": "Amanuensis is an archaic word for what profession?",
+      "correct_answer": "C",
+      "stated_confidence": 0.22265625,
+      "logit_gap": 9.875
+    },
+    {
+      "question": "Who wrote the BBC tv serial drama \u2018The Singing Detective\u2019 (1986)?",
+      "correct_answer": "A",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 12.546875
+    },
+    {
+      "question": "Which vegetable was the first to be canned?",
+      "correct_answer": "C",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 7.0
+    },
+    {
+      "question": "How many \u2018E\u2019 tiles are provided in a Scrabble game?",
+      "correct_answer": "B",
+      "stated_confidence": 0.72802734375,
+      "logit_gap": 0.0
+    },
+    {
+      "question": "In humans, microcephaly is having an abnormally small what?",
+      "correct_answer": "A",
+      "stated_confidence": 0.751953125,
+      "logit_gap": 0.03125
+    },
+    {
+      "question": "Which country has the internet domain .de?",
+      "correct_answer": "B",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 12.015625
+    },
+    {
+      "question": "Which train is the holder of the world speed record for steam locomotives?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1259765625,
+      "logit_gap": 9.125
+    },
+    {
+      "question": "What was Her Majesty's Prison Manchester called until 1990?",
+      "correct_answer": "C",
+      "stated_confidence": 0.115966796875,
+      "logit_gap": 9.953125
+    },
+    {
+      "question": "What is a group of ferrets called?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1312255859375,
+      "logit_gap": 9.015625
+    },
+    {
+      "question": "Cartoon character Penrod Pooch is better known by what name?",
+      "correct_answer": "D",
+      "stated_confidence": 0.12420654296875,
+      "logit_gap": 2.0
+    },
+    {
+      "question": "How many players are on the field in a hurling team?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1943359375,
+      "logit_gap": 4.21875
+    },
+    {
+      "question": "In what year was the first episode of Doctor Who broadcast? 1959, 1963 or 1967?",
+      "correct_answer": "B",
+      "stated_confidence": 0.845703125,
+      "logit_gap": 3.40625
+    },
+    {
+      "question": "Wayne Rooney scored his first senior goal against which club?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1602783203125,
+      "logit_gap": 0.984375
+    },
+    {
+      "question": "Mary has a large bedroom and the only light switch is on the wall approximately 20 feet away from her bed. How can she turn off the light, but still get into bed before it is dark?",
+      "correct_answer": "C",
+      "stated_confidence": 0.23095703125,
+      "logit_gap": 3.78125
+    },
+    {
+      "question": "Why did Jason Alexander from Louisiana hit the headlines in January 2004?",
+      "correct_answer": "B",
+      "stated_confidence": 0.63330078125,
+      "logit_gap": 1.46875
+    },
+    {
+      "question": "Which German philosopher wrote \u2018Das Kapital\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.11279296875,
+      "logit_gap": 9.46875
+    },
+    {
+      "question": "Mossel Bay is a harbour town which lies on the coast of which African country?",
+      "correct_answer": "B",
+      "stated_confidence": 0.810546875,
+      "logit_gap": 11.484375
+    },
+    {
+      "question": "What is the approximate circumference of the earth?",
+      "correct_answer": "D",
+      "stated_confidence": 0.27197265625,
+      "logit_gap": 0.015625
+    },
+    {
+      "question": "What relation was Flo Jo to Jackie Joyner Kersee?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 0.375
+    },
+    {
+      "question": "In any given year in the UK are there more boys or girls born?",
+      "correct_answer": "A",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 1.53125
+    },
+    {
+      "question": "Which England cricketer was born of Anglo-Welsh parents on Christmas Day 1984?",
+      "correct_answer": "B",
+      "stated_confidence": 0.73388671875,
+      "logit_gap": 0.84375
+    },
+    {
+      "question": "What was the name of the band, featuring members of Thin Lizzy and the Sex Pistols, which recorded a 1979 song called \u2018A Merry Jingle\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 8.515625
+    },
+    {
+      "question": "What type of creature is a Dog Face?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12939453125,
+      "logit_gap": 0.40625
+    },
+    {
+      "question": "What year did E.T. Hit the cinema screen?",
+      "correct_answer": "C",
+      "stated_confidence": 0.83544921875,
+      "logit_gap": 10.765625
+    },
+    {
+      "question": "Which planet in our solar system takes around 165 Earth years to orbit the Sun?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7607421875,
+      "logit_gap": 0.625
+    },
+    {
+      "question": "How old would Elvis Presley have been had he lived to the end of the 20th century?",
+      "correct_answer": "D",
+      "stated_confidence": 0.19189453125,
+      "logit_gap": 0.953125
+    },
+    {
+      "question": "Which English religious leader founded The Religious Society of Friends (Quakers) in the 17th Century?",
+      "correct_answer": "B",
+      "stated_confidence": 0.79052734375,
+      "logit_gap": 9.375
+    },
+    {
+      "question": "What seven letter word, beginning with the letters 'Ra' is a palindrome?",
+      "correct_answer": "D",
+      "stated_confidence": 0.763671875,
+      "logit_gap": 7.796875
+    },
+    {
+      "question": "Which bodily fluid is collected in a lachrymatory?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 10.890625
+    },
+    {
+      "question": "What is the first name of Irish singer Van Morrison?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1688232421875,
+      "logit_gap": 1.296875
+    },
+    {
+      "question": "How many pieces are there in a standard set of dominoes?",
+      "correct_answer": "A",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 0.765625
+    },
+    {
+      "question": "How many months is the gestation period for an elephant?",
+      "correct_answer": "D",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 1.828125
+    },
+    {
+      "question": "What was Walter Matthau's first movie?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1666259765625,
+      "logit_gap": 0.078125
+    },
+    {
+      "question": "Marjorie Courtenay-Latimer discovered which rare fish in 1938?",
+      "correct_answer": "C",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 11.203125
+    },
+    {
+      "question": "Wilbroe beer is produced in which European country?",
+      "correct_answer": "A",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 1.0625
+    },
+    {
+      "question": "In Risk, what colour is Europe?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7880859375,
+      "logit_gap": 0.40625
+    },
+    {
+      "question": "How many times did Actress Zsa Zsa Gabor marry?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1561279296875,
+      "logit_gap": 0.921875
+    },
+    {
+      "question": "Which was the first country outside the UK to screen the television series \u2018Doctor Who\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.08758544921875,
+      "logit_gap": 3.546875
+    },
+    {
+      "question": "The largest known volcano in our solar system is on which planet?",
+      "correct_answer": "B",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 2.453125
+    },
+    {
+      "question": "Which US actor appeared in the films \u2018Ironweed\u2019, \u2018The Pledge\u2019 and \u2018Easy Rider\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7607421875,
+      "logit_gap": 1.6875
+    },
+    {
+      "question": "Which British monarch was nicknamed \u2018The Sailor King\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.8154296875,
+      "logit_gap": 5.28125
+    },
+    {
+      "question": "\u2018No dragons were harmed in the making of this movie\u2019 is in the credits of which film?",
+      "correct_answer": "B",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 1.09375
+    },
+    {
+      "question": "Which plant is known as the butterfly bush?",
+      "correct_answer": "C",
+      "stated_confidence": 0.810546875,
+      "logit_gap": 11.6875
+    },
+    {
+      "question": "Ereuthophobia is the irrational fear of which colour?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 4.09375
+    },
+    {
+      "question": "Who succeeded Alf Ramsey as England (caretaker) football manager in 1974?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "Grizzled Giant, Southern Flying and Provost\u2019s are all types of which creature?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12249755859375,
+      "logit_gap": 7.015625
+    },
+    {
+      "question": "Which American singer was born Eleanora Fagan?",
+      "correct_answer": "C",
+      "stated_confidence": 0.12420654296875,
+      "logit_gap": 10.6875
+    },
+    {
+      "question": "What type of coal is brown and fibrous?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2069091796875,
+      "logit_gap": 11.0625
+    },
+    {
+      "question": "In Only Fools And Horses, Rodney Trotter shares his middle name with which London football club?",
+      "correct_answer": "B",
+      "stated_confidence": 0.71533203125,
+      "logit_gap": 0.546875
+    },
+    {
+      "question": "Which fruit is traditionally used in the recipe for the dessert dish Liverpool Tart?",
+      "correct_answer": "B",
+      "stated_confidence": 0.8154296875,
+      "logit_gap": 0.125
+    },
+    {
+      "question": "Which word can go before Side, End and Ability to make three other words?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2421875,
+      "logit_gap": 0.078125
+    },
+    {
+      "question": "An oropendola is what type of creature?",
+      "correct_answer": "D",
+      "stated_confidence": 0.79296875,
+      "logit_gap": 10.921875
+    },
+    {
+      "question": "Which county won the County Cricket Championship in 1959, after Surrey had won seven consecutive titles from 1952 to 1958?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1365966796875,
+      "logit_gap": 0.78125
+    },
+    {
+      "question": "In which sport might you see the \u2018suicide squad\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 2.59375
+    },
+    {
+      "question": "Aladdin is a variety of which vegetable?",
+      "correct_answer": "C",
+      "stated_confidence": 0.822265625,
+      "logit_gap": 0.75
+    },
+    {
+      "question": "If it is 3 a.m. in Nevada, what time is it in Montana?",
+      "correct_answer": "D",
+      "stated_confidence": 0.27197265625,
+      "logit_gap": 0.5625
+    },
+    {
+      "question": "By what name is comic book villain Oswald Chesterfield Cobblepot better known?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 12.328125
+    },
+    {
+      "question": "What was the surname of the woman who was the inspiration behind the Rolling Stones song Angie?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 5.484375
+    },
+    {
+      "question": "Who was the first person after Scott to reach the South Pole overland?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1312255859375,
+      "logit_gap": 1.5625
+    },
+    {
+      "question": "What former X-Factor contestant had a top ten hit album called Picture Of You in 2007?",
+      "correct_answer": "A",
+      "stated_confidence": 0.65478515625,
+      "logit_gap": 1.53125
+    },
+    {
+      "question": "Which cartoon and film character is the nickname of super athlete Michael Johnson?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1480712890625,
+      "logit_gap": 5.125
+    },
+    {
+      "question": "The Tumut Hydroelectric Power Station is in which Australian state?",
+      "correct_answer": "A",
+      "stated_confidence": 0.71240234375,
+      "logit_gap": 12.3125
+    },
+    {
+      "question": "What was the name of the concert held at the Cleveland Arena, Ohio, on 21st March 1952, said to be the world\u2019s first major rock & roll concert?",
+      "correct_answer": "C",
+      "stated_confidence": 0.74609375,
+      "logit_gap": 10.5
+    },
+    {
+      "question": "Which former British PM was christened \u201cGrocer\u201d by Private Eye?",
+      "correct_answer": "B",
+      "stated_confidence": 0.80322265625,
+      "logit_gap": 4.0625
+    },
+    {
+      "question": "What Michelle Pfeiffer movie got a boost from the Coolio song Gangsta's Paradise?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2017822265625,
+      "logit_gap": 9.53125
+    },
+    {
+      "question": "Betty, Earl and Joyce are the puppet pensioners in ads for which company?",
+      "correct_answer": "C",
+      "stated_confidence": 0.07159423828125,
+      "logit_gap": 2.265625
+    },
+    {
+      "question": "Which hormone helps control ovulation?",
+      "correct_answer": "C",
+      "stated_confidence": 0.82666015625,
+      "logit_gap": 7.890625
+    },
+    {
+      "question": "General Charles de Gaulle was French President 1959 to 1969. Who succeeded him?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2147216796875,
+      "logit_gap": 4.359375
+    },
+    {
+      "question": "Who directed the 1969 film \u2018Women in Love\u2019, starring Oliver Reed and Glenda Jackson?",
+      "correct_answer": "C",
+      "stated_confidence": 0.10089111328125,
+      "logit_gap": 2.21875
+    },
+    {
+      "question": "In which South Asian country is Phewa Lake?",
+      "correct_answer": "D",
+      "stated_confidence": 0.73388671875,
+      "logit_gap": 9.375
+    },
+    {
+      "question": "Which island group in the South Atlantic was once known as the Sebald Islands?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 1.265625
+    },
+    {
+      "question": "What is Osbert Lancaster best known for producing?",
+      "correct_answer": "C",
+      "stated_confidence": 0.80322265625,
+      "logit_gap": 9.03125
+    },
+    {
+      "question": "What is Australian slang for an outside lavatory?",
+      "correct_answer": "D",
+      "stated_confidence": 0.69921875,
+      "logit_gap": 5.046875
+    },
+    {
+      "question": "What was President Gerald Ford's middle name?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1666259765625,
+      "logit_gap": 2.046875
+    },
+    {
+      "question": "Who was the only British Prime Minister to hold office during the reign of King Edward VIII?",
+      "correct_answer": "D",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 3.03125
+    },
+    {
+      "question": "\"The opera \"\"Duke Bluebeard's Castle\"\" and the ballet \"\"The Wooden Prince\"\" are the works of which composer?\"",
+      "correct_answer": "D",
+      "stated_confidence": 0.1143798828125,
+      "logit_gap": 0.78125
+    },
+    {
+      "question": "What is a female gerbil called?",
+      "correct_answer": "C",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 1.65625
+    },
+    {
+      "question": "\"Which composer's operas are famously staged in the town of Bayreuth (say \"\"Bye-royt\"\")?\"",
+      "correct_answer": "A",
+      "stated_confidence": 0.81298828125,
+      "logit_gap": 14.0
+    },
+    {
+      "question": "What might a Geordie call a \u2018tab\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7216796875,
+      "logit_gap": 1.6875
+    },
+    {
+      "question": "What was the first name of the mother of US President Barack Obama?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 9.484375
+    },
+    {
+      "question": "Cagliari is the capital of which island?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 10.71875
+    },
+    {
+      "question": "what is the 21st letter of the Greek alphabet?",
+      "correct_answer": "A",
+      "stated_confidence": 0.67919921875,
+      "logit_gap": 3.453125
+    },
+    {
+      "question": "Liverpool played against whom in the first ever \u2018Match of the Day\u2019 in 1964?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 0.015625
+    },
+    {
+      "question": "Captain Corelli's mandolin is a book a film set in which country",
+      "correct_answer": "B",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 6.15625
+    },
+    {
+      "question": "Who played Saffron Monsoon in the UK television comedy series \u2018Absolutely Fabulous\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.120849609375,
+      "logit_gap": 2.3125
+    },
+    {
+      "question": "What colour is \u2018Mr Man\u2019 Mr Strong\u2019s hat?",
+      "correct_answer": "C",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 1.6875
+    },
+    {
+      "question": "What is the name of the fictional motor racing circuit in the children\u2019s television series \u2018Roary the Racing Car\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.689453125,
+      "logit_gap": 2.265625
+    },
+    {
+      "question": "Which grand slam did Pete Sampras not win in the 20th century?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1710205078125,
+      "logit_gap": 1.1875
+    },
+    {
+      "question": "Which orchestral conductor was married to one of the subjects of the film Hillary and Jackie?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7490234375,
+      "logit_gap": 1.953125
+    },
+    {
+      "question": "Which much-loved actor won the Best Actor Oscar for The Philadelphia Story?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1259765625,
+      "logit_gap": 1.46875
+    },
+    {
+      "question": "Which birds collect in a convocation?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 3.21875
+    },
+    {
+      "question": "How many imperial gallons are in a firkin?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1480712890625,
+      "logit_gap": 0.125
+    },
+    {
+      "question": "In WWII, who was the head of the Nazi party's security service?",
+      "correct_answer": "B",
+      "stated_confidence": 0.73095703125,
+      "logit_gap": 9.4375
+    },
+    {
+      "question": "Who designed Madonna's wedding dress for her marriage to Guy Ritchie?",
+      "correct_answer": "C",
+      "stated_confidence": 0.71875,
+      "logit_gap": 6.84375
+    },
+    {
+      "question": "Which Syrian city is said to be the oldest continually inhabited city in the world?",
+      "correct_answer": "B",
+      "stated_confidence": 0.138427734375,
+      "logit_gap": 3.984375
+    },
+    {
+      "question": "The French town of Bordeaux lies on which river?",
+      "correct_answer": "D",
+      "stated_confidence": 0.8056640625,
+      "logit_gap": 11.796875
+    },
+    {
+      "question": "In which decade of the 20th century was Anne Bancroft born?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1688232421875,
+      "logit_gap": 1.609375
+    },
+    {
+      "question": "What was the first Beatles film?",
+      "correct_answer": "C",
+      "stated_confidence": 0.219970703125,
+      "logit_gap": 7.875
+    },
+    {
+      "question": "Gary, Jason, Mark and Howard are all members of which British band?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1365966796875,
+      "logit_gap": 2.71875
+    },
+    {
+      "question": "In the poem \u2018Monday\u2019s Child\u2019, what is Wednesday\u2019s child full of?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 0.078125
+    },
+    {
+      "question": "What are the four classical elements that make up our world?",
+      "correct_answer": "C",
+      "stated_confidence": 0.294189453125,
+      "logit_gap": 0.515625
+    },
+    {
+      "question": "\"What traditional herb is used in a \"\"Margharita\"\" pizza ?\"",
+      "correct_answer": "A",
+      "stated_confidence": 0.77197265625,
+      "logit_gap": 10.71875
+    },
+    {
+      "question": "Which former prime minister appeared on the Morecambe and Wise Christmas Special in 1978?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1312255859375,
+      "logit_gap": 0.015625
+    },
+    {
+      "question": "Over how many complete furlongs is the Chester Cup now run?",
+      "correct_answer": "C",
+      "stated_confidence": 0.79052734375,
+      "logit_gap": 1.765625
+    },
+    {
+      "question": "In which \u2018business\u2019 did John Davidson Rockefeller make his fortune?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7431640625,
+      "logit_gap": 10.046875
+    },
+    {
+      "question": "How many male strippers perform on stage together in the 1997 film \u2018The Full Monty\u2019?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 1.5
+    },
+    {
+      "question": "As at March 2001, who holds the record for scoring the most league goals for the soccer team Arsenal?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 0.609375
+    },
+    {
+      "question": "Which former West Indian fast bowler was known as 'Whispering Death'?",
+      "correct_answer": "D",
+      "stated_confidence": 0.7373046875,
+      "logit_gap": 8.8125
+    },
+    {
+      "question": "Who played the role of Caligula in the 1976 UK tv series \u2018I, Claudius\u2019?",
+      "correct_answer": "B",
+      "stated_confidence": 0.69580078125,
+      "logit_gap": 1.484375
+    },
+    {
+      "question": "What is the historical subject matter of Arthur Miller\u2019s 1953 play The Crucible?",
+      "correct_answer": "B",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 11.375
+    },
+    {
+      "question": "How many balls are on a snooker table at the beginning of a game?",
+      "correct_answer": "A",
+      "stated_confidence": 0.78271484375,
+      "logit_gap": 1.8125
+    },
+    {
+      "question": "Who played Miss Pugh on the Hancock radio show?",
+      "correct_answer": "D",
+      "stated_confidence": 0.79052734375,
+      "logit_gap": 4.65625
+    },
+    {
+      "question": "What type of animal was Boris, the subject of a song by The Who?",
+      "correct_answer": "C",
+      "stated_confidence": 0.77978515625,
+      "logit_gap": 2.109375
+    },
+    {
+      "question": "Who wrote the novel \u2018Seven Pillars of Wisdom\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.16455078125,
+      "logit_gap": 13.28125
+    },
+    {
+      "question": "Which cryptic heptarchy owned a Cocker Spaniel called Scamper?",
+      "correct_answer": "A",
+      "stated_confidence": 0.740234375,
+      "logit_gap": 0.34375
+    },
+    {
+      "question": "In Ian Fleming\u2019s novel \u2018Moonraker\u2019, Sir Hugo Drax is suspected of cheating at which game in the Mayfair club \u2018Blades\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1365966796875,
+      "logit_gap": 2.546875
+    },
+    {
+      "question": "What is the name of the perfume launched by British boyband JLS in January 2013?",
+      "correct_answer": "B",
+      "stated_confidence": 0.0863037109375,
+      "logit_gap": 2.0
+    },
+    {
+      "question": "What color golf balls are used on the golf course in Antarctica?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 3.34375
+    },
+    {
+      "question": "Who was the first US-born winner of golf's British Open?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 4.171875
+    },
+    {
+      "question": "In March 1994, what was \u2018David and Jerry\u2019s Guide to the World Wide Web\u2019 renamed?",
+      "correct_answer": "D",
+      "stated_confidence": 0.175537109375,
+      "logit_gap": 9.265625
+    },
+    {
+      "question": "In which year did divorce become officially legal in the Republic of Ireland?",
+      "correct_answer": "B",
+      "stated_confidence": 0.83740234375,
+      "logit_gap": 0.328125
+    },
+    {
+      "question": "Which opera by Borodin features the Polovtsian Dances?",
+      "correct_answer": "B",
+      "stated_confidence": 0.10968017578125,
+      "logit_gap": 10.15625
+    },
+    {
+      "question": "Which female singer was born on exactly the same day as impressionist Rich Little?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "Buddy Holly and the Big Bopper were two of the three musicians who died in a plane crash in February 1959. Who was the other one?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7744140625,
+      "logit_gap": 11.421875
+    },
+    {
+      "question": "Which British Prime Minister said of Downing Street \u2018One of the most precious jewels in the national heritage\u2019?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1312255859375,
+      "logit_gap": 0.421875
+    },
+    {
+      "question": "\u2018The Darling Buds of May\u2019 is set in which English county?",
+      "correct_answer": "A",
+      "stated_confidence": 0.184814453125,
+      "logit_gap": 12.671875
+    },
+    {
+      "question": "In music, who was Sweet and Innocent and Too Young?",
+      "correct_answer": "B",
+      "stated_confidence": 0.77978515625,
+      "logit_gap": 0.328125
+    },
+    {
+      "question": "Bryan Ferry was the lead singer of which 1970\u2019s band?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1259765625,
+      "logit_gap": 11.703125
+    },
+    {
+      "question": "What is the surname of the title character of Anne of Green Gables?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1519775390625,
+      "logit_gap": 5.640625
+    },
+    {
+      "question": "Strangles is a bacterial infection of the respiratory tract of which animal?",
+      "correct_answer": "B",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 10.328125
+    },
+    {
+      "question": "What percentage of the earth's surface is covered by Europe?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1778564453125,
+      "logit_gap": 1.25
+    },
+    {
+      "question": "Which state on the Gulf of Mexico is nearest the end of the alphabet?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1871337890625,
+      "logit_gap": 1.96875
+    },
+    {
+      "question": "Who dubbed Miss Piggy's singing voice in The Muppet Movie?",
+      "correct_answer": "A",
+      "stated_confidence": 0.11920166015625,
+      "logit_gap": 3.046875
+    },
+    {
+      "question": "In stamp collecting, what do the initials F D C represent?",
+      "correct_answer": "A",
+      "stated_confidence": 0.08154296875,
+      "logit_gap": 9.921875
+    },
+    {
+      "question": "What was the name of the old Waddington\u2019s game based on newspapers?",
+      "correct_answer": "D",
+      "stated_confidence": 0.76611328125,
+      "logit_gap": 3.984375
+    },
+    {
+      "question": "Atychiphobia is the irrational fear of what?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1329345703125,
+      "logit_gap": 13.546875
+    },
+    {
+      "question": "In cooking, 190 degrees Celsius is the equivalent to which Gas Mark?",
+      "correct_answer": "C",
+      "stated_confidence": 0.7880859375,
+      "logit_gap": 2.5
+    },
+    {
+      "question": "\u2018The Battle of the Ages\u2019 took place in April 1991 between George Foreman and which other boxer?",
+      "correct_answer": "C",
+      "stated_confidence": 0.134765625,
+      "logit_gap": 1.9375
+    },
+    {
+      "question": "Punchestown Racecourse is in which European country?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1895751953125,
+      "logit_gap": 12.046875
+    },
+    {
+      "question": "\"In which movie did Garbo say, \"\"I want to be alone\"\".\"",
+      "correct_answer": "B",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 1.53125
+    },
+    {
+      "question": "In \u2018Follow That Camel\u2019, the fourteenth Carry On film, Sid James was replaced by which US actor?",
+      "correct_answer": "B",
+      "stated_confidence": 0.127685546875,
+      "logit_gap": 0.453125
+    },
+    {
+      "question": "Tony Hadley was the lead singer with which 1980s new romantic band?",
+      "correct_answer": "B",
+      "stated_confidence": 0.1365966796875,
+      "logit_gap": 7.796875
+    },
+    {
+      "question": "Who played the doctor in the famous Hancock sketch on blood doning?",
+      "correct_answer": "C",
+      "stated_confidence": 0.71875,
+      "logit_gap": 2.703125
+    },
+    {
+      "question": "Which rock star did Cindy Crawford name her first son after?",
+      "correct_answer": "A",
+      "stated_confidence": 0.120849609375,
+      "logit_gap": 3.3125
+    },
+    {
+      "question": "Who played the title role in the 1951 film \u2018Captain Horatio Hornblower RN\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.11126708984375,
+      "logit_gap": 2.515625
+    },
+    {
+      "question": "Who was the star of the film based on the record Harper Valley PTA by Jeannie C Riley?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1441650390625,
+      "logit_gap": 0.6875
+    },
+    {
+      "question": "England won the 1966 World Cup beating Germany 4-2. Hurst scored 3 of England's goals who scored the other?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1895751953125,
+      "logit_gap": 4.5
+    },
+    {
+      "question": "Mathematical Formulae - What is the mathematical formula for the area of a circle?",
+      "correct_answer": "D",
+      "stated_confidence": 0.392333984375,
+      "logit_gap": 9.078125
+    },
+    {
+      "question": "Which 90s sci fi series with James Belushi was based on Bruce Wagner's comic strip of the same name?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7548828125,
+      "logit_gap": 1.453125
+    },
+    {
+      "question": "To a thousand, what is the area of Illinois in square miles?",
+      "correct_answer": "A",
+      "stated_confidence": 0.79296875,
+      "logit_gap": 2.5625
+    },
+    {
+      "question": "Who is the only person allowed to consume alcohol in the chamber of the British House of Commons and even then on only one special day of the year?",
+      "correct_answer": "B",
+      "stated_confidence": 0.7578125,
+      "logit_gap": 6.125
+    },
+    {
+      "question": "Mordant is the general term for a chemical which allows what to work properly?",
+      "correct_answer": "B",
+      "stated_confidence": 0.2120361328125,
+      "logit_gap": 7.015625
+    },
+    {
+      "question": "\u2026 Wordsworth questioning whether it was a bird at all, \u201cor but a wandering voice\u201d?",
+      "correct_answer": "A",
+      "stated_confidence": 0.182373046875,
+      "logit_gap": 2.28125
+    },
+    {
+      "question": "Who does the commentary in the UK tv programme \u2018Come Dine With Me\u2019?",
+      "correct_answer": "A",
+      "stated_confidence": 0.7216796875,
+      "logit_gap": 11.203125
+    },
+    {
+      "question": "When bored, what major vice does Holmes succumb to, much to the annoyance of his companion?",
+      "correct_answer": "A",
+      "stated_confidence": 0.68603515625,
+      "logit_gap": 2.40625
+    },
+    {
+      "question": "Which fruit can go in the middle of the word aped to make a new word?",
+      "correct_answer": "C",
+      "stated_confidence": 0.73388671875,
+      "logit_gap": 1.53125
+    },
+    {
+      "question": "\u2018The Royal Hunt of the \u2018what\u2019 is a 1964 play by Peter Shaffer?",
+      "correct_answer": "D",
+      "stated_confidence": 0.120849609375,
+      "logit_gap": 0.90625
+    },
+    {
+      "question": "In a famous and popular series of books, what rests on the back of four giant elephants?",
+      "correct_answer": "B",
+      "stated_confidence": 0.140380859375,
+      "logit_gap": 7.484375
+    },
+    {
+      "question": "Who was the male star of the movie The Man of La Mancha?",
+      "correct_answer": "C",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 4.203125
+    },
+    {
+      "question": "St Joseph\u2019s Day is celebrated during which month of the year?",
+      "correct_answer": "C",
+      "stated_confidence": 0.85400390625,
+      "logit_gap": 1.265625
+    },
+    {
+      "question": "In 1968, \u2018The Troubles\u2019 began in which European country between elements of the nationalist community and the unionist community?",
+      "correct_answer": "C",
+      "stated_confidence": 0.70263671875,
+      "logit_gap": 11.265625
+    },
+    {
+      "question": "In the children\u2019s television series \u2018Ivor the Engine\u2019 what is the name of the dragon?",
+      "correct_answer": "D",
+      "stated_confidence": 0.1422119140625,
+      "logit_gap": 2.546875
+    },
+    {
+      "question": "What is the name of the female alter-ego of Turner Prize winner Grayson perry?",
+      "correct_answer": "C",
+      "stated_confidence": 0.72509765625,
+      "logit_gap": 6.421875
+    },
+    {
+      "question": "What is the extra murder weapon in the 1999 50th Anniversary Cluedo game?",
+      "correct_answer": "A",
+      "stated_confidence": 0.1365966796875,
+      "logit_gap": 1.84375
+    },
+    {
+      "question": "Who was the first man to walk on the Moon?",
+      "correct_answer": "B",
+      "stated_confidence": 0.2337646484375,
+      "logit_gap": 10.890625
+    },
+    {
+      "question": "What name links a Labour MP and a professional golfer?",
+      "correct_answer": "A",
+      "stated_confidence": 0.17333984375,
+      "logit_gap": 0.40625
+    },
+    {
+      "question": "Which famous painter's surname was Harmenzoon van Rijn which translated as son of Harmen, of the Rhine?",
+      "correct_answer": "A",
+      "stated_confidence": 0.2069091796875,
+      "logit_gap": 8.6875
+    },
+    {
+      "question": "How many pounds are in a UK (long) ton?",
+      "correct_answer": "C",
+      "stated_confidence": 0.78515625,
+      "logit_gap": 1.46875
+    },
+    {
+      "question": "What is the name of the group of 1,196 islands in the North Indian Ocean, none bigger than five square miles?",
+      "correct_answer": "B",
+      "stated_confidence": 0.77734375,
+      "logit_gap": 6.25
+    },
+    {
+      "question": "\u2018Giovedi\u2019 is the Italian word for which day of the week?",
+      "correct_answer": "C",
+      "stated_confidence": 0.77978515625,
+      "logit_gap": 1.953125
+    },
+    {
+      "question": "On a standard dartboard, which number lies opposite number 4?",
+      "correct_answer": "C",
+      "stated_confidence": 0.2509765625,
+      "logit_gap": 0.4375
+    },
+    {
+      "question": "Who bought Donington Park\u2019s Dunlop Bridge at a memorabilia auction?",
+      "correct_answer": "A",
+      "stated_confidence": 0.71533203125,
+      "logit_gap": 0.28125
+    },
+    {
+      "question": "In 1981, what became the first ever music video to be shown on MTV?",
+      "correct_answer": "C",
+      "stated_confidence": 0.1461181640625,
+      "logit_gap": 8.765625
+    },
+    {
+      "question": "In 1968, who did radical feminist Valerie Solanas shoot and wound as he entered his New York studio?",
+      "correct_answer": "D",
+      "stated_confidence": 0.71875,
+      "logit_gap": 8.421875
+    },
+    {
+      "question": "In fashion, Hobble, Pencil and Dirndl are all types of what?",
+      "correct_answer": "D",
+      "stated_confidence": 0.2254638671875,
+      "logit_gap": 2.171875
+    }
+  ]
+}

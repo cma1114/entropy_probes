@@ -265,6 +265,7 @@ def extract_mc_activations_and_metrics(
             inputs = tokenizer(
                 batch_prompts,
                 return_tensors="pt",
+                add_special_tokens=False,
                 padding=True  # Pad to longest in batch
             )
             input_ids = inputs["input_ids"].to(DEVICE)

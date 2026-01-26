@@ -23,6 +23,7 @@ Configuration is set at the top of the script - no CLI args needed.
 
 from pathlib import Path
 import json
+import random
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -41,7 +42,7 @@ from core.answer_directions import (
 
 # Base name for input files from identify_mc_correlate.py
 # Will load: {INPUT_BASE_NAME}_mc_activations.npz and {INPUT_BASE_NAME}_mc_dataset.json
-INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC_difficulty_filtered"
+INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
 
 # Train/test split (should match identify_mc_correlate.py for consistency)
 TRAIN_SPLIT = 0.8
@@ -239,14 +240,19 @@ def main():
     encoded_answers, answer_mapping = encode_answers(model_answers)
     print(f"  Answer mapping: {answer_mapping}")
 
-    # Create train/test split
-    indices = np.arange(n_samples)
+    indices = np.arange(len(questions))
+    
     train_idx, test_idx = train_test_split(
         indices,
         train_size=TRAIN_SPLIT,
         random_state=SEED,
         shuffle=True
     )
+    
+    # Sort indices for array slicing
+    train_idx = np.sort(train_idx)
+    test_idx = np.sort(test_idx)
+
     print(f"\nTrain/test split: {len(train_idx)}/{len(test_idx)}")
 
     # Find answer directions using both methods

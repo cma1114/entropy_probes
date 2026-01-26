@@ -31,6 +31,7 @@ from tqdm import tqdm
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import train_test_split
 import joblib
+import random
 
 from core import (
     load_model_and_tokenizer,
@@ -77,16 +78,16 @@ from tasks import (
 # Base name for input files from identify_mc_correlate.py
 # Will load: {INPUT_BASE_NAME}_mc_{metric}_probes.joblib and {INPUT_BASE_NAME}_mc_dataset.json
 # The model is inferred from the dataset JSON, so no need to specify MODEL separately.
-INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC"
+INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
 
 # Which metrics to test transfer for
-METRICS = ["entropy", "top_logit"]
+METRICS = ["logit_gap"]
 
 # Optional adapter (must match identify step if used)
 ADAPTER = None
 
 # Meta task to test: "confidence" or "other_confidence" or "delegate"
-META_TASK = "delegate"
+META_TASK = "confidence"
 
 # Processing
 # Delegate task uses longer prompts, so smaller batch size
@@ -112,7 +113,7 @@ LOAD_IN_8BIT = False
 # question_newline: newline after "?"
 # options_newline: newline after last MC option (D: ...)
 # final: last token (current behavior)
-PROBE_POSITIONS = ["question_mark", "question_newline", "options_newline", "final"]
+PROBE_POSITIONS = ["final"]#"question_mark", "question_newline", "options_newline", "final"]
 
 # Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
@@ -1397,6 +1398,20 @@ def main():
         # Get questions
         questions = dataset["questions"]
 
+        # Compute trial_idx mapping to match OLD workflow
+        # OLD workflow (run_introspection_experiment.py:2615-2616) applies a second shuffle:
+        #   random.seed(SEED); random.shuffle(questions)
+        # This affects which trial_idx each question gets, which determines the 1/2 mapping
+        # in delegate prompts. We don't actually shuffle (to preserve alignment with direct
+        # activations), but we compute what trial_idx each question WOULD have in OLD order.
+        indexed_questions = list(enumerate(questions))  # [(orig_idx, question), ...]
+        random.seed(SEED)
+        random.shuffle(indexed_questions)
+        # old_trial_idx[i] = what trial_idx question at position i would have in OLD workflow
+        old_trial_idx = [None] * len(questions)
+        for new_pos, (orig_idx, _) in enumerate(indexed_questions):
+            old_trial_idx[orig_idx] = new_pos
+
         # Get meta task setup
         format_fn = get_meta_format_fn(META_TASK)
         signal_fn = get_meta_signal_fn(META_TASK)
@@ -1430,7 +1445,8 @@ def main():
                 batch_mappings = []
                 batch_positions = []  # List of position dicts per item
                 for i, q in enumerate(batch_questions):
-                    trial_idx = batch_start + i
+                    # Use old_trial_idx to match OLD workflow's 1/2 mapping for delegate prompts
+                    trial_idx = old_trial_idx[batch_start + i]
                     if META_TASK == "delegate":
                         prompt, _, mapping = format_fn(q, tokenizer, trial_index=trial_idx, use_chat_template=use_chat_template)
                         batch_mappings.append(mapping)
