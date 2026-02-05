@@ -1,7 +1,7 @@
 # Guidelines for Claude
 
 ## Do not run tests locally
-This repo runs on a remote machine. Never run `python run_mc_answer_ablation.py` or similar test commands locally - it won't work and wastes time. Rely on static analysis instead.
+This repo runs on a remote machine. Never run `python run_ablation_causality.py` or similar test commands locally - it won't work and wastes time. Rely on static analysis instead.
 
 ## Local outputs directory is not representative
 The `outputs/` directory on the local machine may be empty or stale. The user runs experiments on a remote GPU machine, so:
@@ -87,4 +87,52 @@ This codebase uses **left-padding** (`core/model_utils.py:160`). When extracting
 Difficulty-filtered datasets store options as a dict `{"A": "...", "B": "...", ...}` with letter keys. The loader in `load_and_format_datasets.py` checks for pre-stored options and uses them directly without reshuffling, preserving exact prompt reproducibility.
 
 ### Configuration Pattern
-Scripts use module-level constants (MODEL, DATASET, NUM_QUESTIONS, etc.) rather than CLI args. Edit the constants directly to change behavior.
+Scripts use module-level constants (MODEL, DATASET, NUM_QUESTIONS, etc.) rather than CLI args. Edit the constants directly to change behavior. Constants that must be consistent across scripts are marked `# Must match across scripts` (see Shared Parameters below).
+
+### Shared Parameter Contract
+These constants must be identical across all scripts that use them:
+
+| Parameter | Default | Scripts |
+|-----------|---------|---------|
+| `SEED` | `42` | All |
+| `PROBE_ALPHA` | `1000.0` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset |
+| `PROBE_PCA_COMPONENTS` | `100` | Same as above |
+| `TRAIN_SPLIT` | `0.8` | Same + ablation, steering |
+| `MEAN_DIFF_QUANTILE` | `0.25` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset |
+
+If you change one, grep for that constant name across all root `.py` files and change them all.
+
+### Output File Naming
+Output filenames use `{model_short}_{dataset}` prefix from `get_run_name()`. Stage 2 files use `meta_` prefix (not `transfer_`):
+- `*_meta_{task}_results.json` (not `*_transfer_{task}_results.json`)
+- `*_meta_{task}_activations.npz`
+
+### Quantization in Model Naming
+`get_model_short_name()` in `core/model_utils.py` appends `_4bit` or `_8bit` when quantization is enabled. This flows into `get_run_name()` and all output filenames automatically. When adding new scripts, always use `get_run_name()` for output path construction to ensure quantization is reflected in filenames.
+
+### Confidence Interval Format
+All CIs use `[lo, hi]` format (percentile-based bootstrap), not `±std`. Example: `R²=0.567 [0.521, 0.613]`. When adding new console output, follow this convention.
+
+### Centralized Visualization (`core/plotting.py`)
+All plotting uses helpers from `core/plotting.py`:
+- **Colors**: `METHOD_COLORS` (probe=tab:blue, mean_diff=tab:orange, centroid=tab:orange), `DIRECTION_COLORS`, `TASK_COLORS`, `SIGNIFICANCE_COLORS`, `CONDITION_COLORS`
+- **Constants**: `DPI=300`, `GRID_ALPHA=0.3`, `CI_ALPHA=0.2`, `MARKER_SIZE=4`, `LINE_WIDTH=1.5`
+- **Helpers**: `save_figure(fig, path)` handles tight_layout + savefig + close + print. `plot_layer_metric()`, `mark_significant_layers()`, `format_layer_axis()`, etc.
+
+When writing new plotting code:
+- Import colors/constants from `core.plotting` instead of hardcoding
+- Use `save_figure(fig, path)` instead of `plt.tight_layout(); plt.savefig(); plt.close(); print()`
+- Use `GRID_ALPHA` for `ax.grid(True, alpha=...)` and `CI_ALPHA` for `ax.fill_between(..., alpha=...)`
+- Exception: `test_cross_dataset_transfer.py` defines its own `CI_ALPHA = 0.05` for Fisher-z statistical CIs — do not shadow it with the plotting constant
+
+### JSON Config Metadata
+Every `*_results.json` includes a `config` section produced by `get_config_dict()` from `core/config_utils.py`. This helper adds timestamp, git hash, and quantization automatically. Pass script-specific constants as keyword arguments.
+
+### Script Consolidation
+- `identify_mc_answer_correlate.py` is merged into `identify_mc_correlate.py` (controlled by `FIND_ANSWER_DIRECTIONS` flag)
+- `identify_confidence_correlate.py` is merged into `test_meta_transfer.py` (controlled by `FIND_CONFIDENCE_DIRECTIONS` flag)
+- The standalone scripts remain in `archive/` for reference
+- Pre-modification snapshots are in `archive/originals/`
+
+### Module Docstring Format
+Every active script's docstring includes: purpose, inputs (file patterns loaded), outputs (file patterns produced), shared parameters note, and dependency chain (which scripts must run first).

@@ -1,32 +1,27 @@
 """
-Stage 3. Ablation (necessity) test for uncertainty, answer, or confidence directions.
-Tests whether directions are causally necessary for the model's meta-judgments by
-ablating each direction and measuring degradation in stated confidence correlation.
+Ablation causality test for directions (uncertainty, answer, or confidence).
 
-Supports multiple direction types via DIRECTION_TYPE:
-- "uncertainty": Entropy/logit_gap directions (from identify_mc_correlate.py)
-- "answer": MC answer A/B/C/D directions (from identify_mc_correlate.py with FIND_ANSWER_DIRECTIONS=True)
-- "confidence": Stated confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
+Tests whether directions are causally necessary for the model's meta-judgments.
+If ablating a direction degrades the correlation between stated confidence and
+actual uncertainty, that's evidence the direction is causally involved.
 
-Tests all layers with pooled null distribution + FDR correction.
+Supports multiple direction types:
+- "uncertainty": From identify_mc_correlate.py (entropy, logit_gap, etc.)
+- "answer": From identify_mc_answer_correlate.py (MC answer A/B/C/D)
+- "confidence": From identify_confidence_correlate.py (stated confidence)
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz           Uncertainty directions
-    outputs/{base}_mc_answer_directions.npz              Answer directions (if DIRECTION_TYPE="answer")
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
-    outputs/{base}_mc_dataset.json                       Question metadata + metric values
+Key features:
+- Tests ALL layers by default (no pre-filtering by transfer R²)
+- Tests BOTH probe and mean_diff methods (for uncertainty) or single method (for answer/confidence)
+- Uses pooled null distribution + FDR correction for robust statistics
 
-Outputs:
-    outputs/{base}_ablation_{task}_{metric}_results.json    Ablation effect sizes, p-values
-    outputs/{base}_ablation_{task}_{metric}_results.png     Ablation effect curves
+Usage:
+    python run_ablation_causality.py
 
-    where {base} = {model_short_name}_{dataset}
-
-Shared parameters (must match across scripts):
-    SEED, TRAIN_SPLIT
-
-Run after: identify_mc_correlate.py
-    + test_meta_transfer.py (if using DIRECTION_TYPE="confidence")
+Expects outputs from identification scripts based on DIRECTION_TYPE:
+    For uncertainty: outputs/{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz
+    For answer: outputs/{INPUT_BASE_NAME}_mc_answer_directions.npz
+    For confidence: outputs/{INPUT_BASE_NAME}_{META_TASK}_confidence_directions.npz
 """
 
 import torch
@@ -36,6 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 from scipy.stats import pearsonr, spearmanr, norm
 from sklearn.model_selection import train_test_split
 
@@ -45,8 +42,6 @@ from core.model_utils import (
     get_model_short_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA, CONDITION_COLORS
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
     SteeringExperimentConfig,
@@ -72,34 +67,16 @@ from tasks import (
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
-METRIC = "logit_gap"  # Which metric's directions to test (for DIRECTION_TYPE="uncertainty")
-META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC"
+METRIC = "top_logit"  # Which metric's directions to test (for DIRECTION_TYPE="uncertainty")
+META_TASK = "delegate"  # "confidence", "delegate", or "other_confidence"
 
 # Direction type to ablate:
 # - "uncertainty": Ablate uncertainty directions (from identify_mc_correlate.py)
-# - "answer": Ablate MC answer directions (from identify_mc_correlate.py with FIND_ANSWER_DIRECTIONS=True)
-# - "confidence": Ablate confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
+# - "answer": Ablate MC answer directions (from identify_mc_answer_correlate.py)
+# - "confidence": Ablate confidence directions (from identify_confidence_correlate.py)
 DIRECTION_TYPE = "uncertainty"
-
-# Descriptions for each direction type (used in summary output)
-DIRECTION_DESCRIPTIONS = {
-    "uncertainty": {
-        "trained_on": "logit_gap/entropy from MC task",
-        "interpretation": "Tests if uncertainty signal is necessary for calibrated confidence",
-    },
-    "answer": {
-        "trained_on": "A/B/C/D answer probabilities from MC task",
-        "interpretation": "Tests if answer representation affects confidence-uncertainty correlation",
-    },
-    "confidence": {
-        "trained_on": "stated confidence from meta-task (same output being measured)",
-        "interpretation": "Tests if confidence expression mechanism affects calibration (partially circular)",
-    },
-}
 
 # Confidence signal used as the meta-task output target.
 # - For META_TASK=delegate:
@@ -109,57 +86,63 @@ DIRECTION_DESCRIPTIONS = {
 #   if you set CONFIDENCE_SIGNAL="logit_margin" we fall back to "prob" for that task.
 CONFIDENCE_SIGNAL = "prob"  # "prob" or "logit_margin"
 
-# --- Quantization ---
-LOAD_IN_4BIT = False   # Set True for 70B+ models
-LOAD_IN_8BIT = False
-
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 4
-NUM_QUESTIONS = 100          # How many questions (ignored if USE_TRANSFER_SPLIT=True)
-NUM_CONTROLS = 25            # Random orthogonal directions per layer for null distribution
+# Experiment settings
+NUM_QUESTIONS = 100  # How many questions to test (ignored if USE_TRANSFER_SPLIT=True)
+NUM_CONTROLS = 25    # Random orthogonal directions per layer for null distribution
+BATCH_SIZE = 8
+SEED = 42
 
 # Use same train/test split as transfer analysis (recommended for apples-to-apples comparison)
 # When True: uses the test set from 80/20 split with SEED, ignoring NUM_QUESTIONS
 # When False: uses first NUM_QUESTIONS from dataset (legacy behavior)
 USE_TRANSFER_SPLIT = True
-TRAIN_SPLIT = 0.8            # Must match across scripts
+TRAIN_SPLIT = 0.8  # Must match test_meta_transfer.py
 
-# --- Direction-finding (must match across scripts) ---
-# (No probe training here, but layer selection uses these indirectly)
-
-# --- Script-specific ---
 # Expanded batch target for batched ablation.
 # When ablating k directions (1 primary + NUM_CONTROLS), we expand each base batch by k.
+# This sets the TARGET total expanded batch size (base_batch * directions_per_pass).
 # Higher values = better GPU utilization but more memory.
-EXPANDED_BATCH_TARGET = 96
+# With NUM_CONTROLS=25 (26 total) and EXPANDED_BATCH_TARGET=52, base batch = 2, we do 26 in one pass.
+# Set to None to disable batched ablation (run each direction separately).
+EXPANDED_BATCH_TARGET = 192
 
 # Optional: specify layers to test (None = all layers from directions file)
+# For non-final positions, layers are auto-selected based on transfer R² if None
 LAYERS = None  # e.g., [20, 25, 30] for quick testing
 
-# Optional: specify which direction methods to test (None = all available)
+# Optional: specify which direction methods to test (None = both probe and mean_diff)
 METHODS = ["mean_diff"]  # e.g., ["mean_diff"] or ["probe"] to test just one
 
-# Token positions within the meta-task prompt where we ablate
-PROBE_POSITIONS = ["final"]  # ["question_mark", "question_newline", "options_newline", "final"]
+# Positions to test (multi-position extraction)
+# These are token positions within the meta-task prompt where we can ablate
+PROBE_POSITIONS = ["options_newline"]  # ["question_mark", "question_newline", "options_newline", "final"]
 
-# Extra diagnostics
+# Extra diagnostics: understand cases where transfer is strong but ablation has weak/odd corr effects
 PRINT_DELTA_DIAGNOSTICS = True
 DELTA_DIAGNOSTIC_TOPK = 5  # print this many layers for biggest +Δcorr and biggest -Δcorr
 
-# Bootstrap (over questions) for correlation CIs + bootstrap p-values (BH-FDR across layers)
+# Bootstrap (over questions) for correlation CIs + bootstrap p-values (BH-FDR across layers).
+# Cheap: no extra model forward passes.
 BOOTSTRAP_N = 2000
 BOOTSTRAP_SEED = 12345
 BOOTSTRAP_CI_ALPHA = 0.05  # 95% CI
 
+
 # Layer selection from transfer results (for non-final positions)
+# When LAYERS is None and position != "final", auto-select layers with transfer R² >= threshold
 TRANSFER_R2_THRESHOLD = 0.3  # Layers with R² >= this are tested for non-final positions
 TRANSFER_RESULTS_PATH = None  # Auto-detect from INPUT_BASE_NAME if None
 
 # Control count for non-final positions (final uses NUM_CONTROLS)
+# Fewer controls = faster, but need enough for valid p-values
+# 10 controls × N layers gives pooled null with 10*N samples
 NUM_CONTROLS_NONFINAL = 10
 
-# --- Output ---
+# Quantization (for large models)
+LOAD_IN_4BIT = True
+LOAD_IN_8BIT = False
+
+# Output directory
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -179,7 +162,7 @@ def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
     """
     path = TRANSFER_RESULTS_PATH
     if path is None:
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+        path = OUTPUT_DIR / f"{base_name}_transfer_{meta_task}_results.json"
     else:
         path = Path(path)
 
@@ -273,7 +256,7 @@ def load_directions(
     elif direction_type == "answer":
         path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
     elif direction_type == "confidence":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_directions.npz"
+        path = OUTPUT_DIR / f"{base_name}_{meta_task}_confidence_directions.npz"
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -352,29 +335,21 @@ def load_directions(
                 methods["answer"][layer] = direction
 
     elif direction_type == "confidence":
-        # Keys are like "probe_layer_0", "mean_diff_layer_5" (same format as uncertainty)
+        # Keys are like "layer_0", "layer_1", etc.
+        methods["confidence"] = {}
         for key in data.files:
             if key.startswith("_"):
-                continue  # Skip metadata keys
-
-            parts = key.rsplit("_layer_", 1)
-            if len(parts) != 2:
                 continue
-
-            method_name, layer_str = parts
-            try:
-                layer = int(layer_str)
-            except ValueError:
-                continue
-
-            direction = data[key].astype(np.float32)
-            norm = np.linalg.norm(direction)
-            if norm > 0:
-                direction = direction / norm
-
-            if method_name not in methods:
-                methods[method_name] = {}
-            methods[method_name][layer] = direction
+            if key.startswith("layer_"):
+                try:
+                    layer = int(key.replace("layer_", ""))
+                except ValueError:
+                    continue
+                direction = data[key].astype(np.float32)
+                norm = np.linalg.norm(direction)
+                if norm > 0:
+                    direction = direction / norm
+                methods["confidence"][layer] = direction
 
     return methods
 
@@ -1055,13 +1030,6 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
 
     metric_sign = metric_sign_for_confidence(metric)
 
-    # Determine quantization string
-    quant_str = "4bit" if LOAD_IN_4BIT else ("8bit" if LOAD_IN_8BIT else "none")
-
-    # Extract model short name and dataset name for metadata
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-
     analysis = {
         "confidence_signal": results.get("confidence_signal", CONFIDENCE_SIGNAL),
         "layers": layers,
@@ -1075,11 +1043,6 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
             "ci_alpha": BOOTSTRAP_CI_ALPHA,
         },
         "per_layer": {},
-        # Metadata for reproducibility
-        "direction_type": DIRECTION_TYPE,
-        "model_name": MODEL.split("/")[-1],  # Just the model name, not full path
-        "dataset": dataset_name,
-        "quantization": quant_str,
     }
 
     if not layers:
@@ -1134,7 +1097,7 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
         corr_change = ablated_corr - baseline_corr
 
         # --- Bootstrap CIs (sampling uncertainty) ---
-        boot_ablt = _bootstrap_corr(ablated_conf, ablated_metric, idx)
+        boot_ablt = _bootstrap_corr(ablated_conf, baseline_metric, idx)
         boot_delta = boot_ablt - boot_base
 
         ablt_ci = np.quantile(boot_ablt, [lo, hi]).astype(np.float32)
@@ -1301,13 +1264,11 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
             "p_value_bootstrap_delta": float(ld["p_value_bootstrap_delta"]),
             "p_value_bootstrap_fdr": float(fdr_boot.get(layer, 1.0)),
 
-            # Controls
+            # Controls (legacy)
             "control_correlation_mean": float(ld["control_corr_mean"]),
             "control_correlation_std": float(ld["control_corr_std"]),
             "control_correlation_change_mean": float(ld["control_change_mean"]),
             "control_correlation_change_std": float(ld["control_change_std"]),
-            "control_change_p2.5": float(np.percentile(ld["control_corr_changes"], 2.5)) if ld.get("control_corr_changes") else 0.0,
-            "control_change_p97.5": float(np.percentile(ld["control_corr_changes"], 97.5)) if ld.get("control_corr_changes") else 0.0,
             "p_value_pooled": float(raw_p_controls[layer]),
             "p_value_fdr": float(fdr_controls.get(layer, 1.0)),
             "p_value_parametric": float(ld["p_value_parametric"]),
@@ -1408,177 +1369,123 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
 # =============================================================================
 
 def plot_ablation_results(analysis: Dict, method: str, output_path: Path):
-    """Create 3-panel ablation visualization with actual values, delta, and summary.
+    """Create 3-panel ablation visualization for a single method.
 
-    Panel 1 (top): Actual correlation values (baseline band + ablated line)
-    Panel 2 (middle): Delta with controls (gray band + significance stars)
-    Panel 3 (bottom): Summary statistics and interpretation
+    Uses bootstrap CIs (baseline/ablated/Δcorr) and bootstrap BH-FDR for significance.
+    (Control-based Z stats are retained in JSON but not emphasized in plots.)
     """
     layers = analysis.get("layers", [])
     if not layers:
         print(f"  Skipping plot for {method} - no layers")
         return
 
-    # Extract data
-    per = analysis["per_layer"]
-    real_delta = np.array([per[l]["correlation_change"] for l in layers], dtype=np.float32)
-    ctrl_lo = np.array([per[l].get("control_change_p2.5", 0.0) for l in layers], dtype=np.float32)
-    ctrl_hi = np.array([per[l].get("control_change_p97.5", 0.0) for l in layers], dtype=np.float32)
-    delta_ci_lo = np.array([per[l]["delta_corr_ci95"][0] for l in layers], dtype=np.float32)
-    delta_ci_hi = np.array([per[l]["delta_corr_ci95"][1] for l in layers], dtype=np.float32)
-    p_fdr = np.array([per[l]["p_value_bootstrap_fdr"] for l in layers], dtype=np.float32)
-
-    # Extract actual correlation values for Panel 1
-    baseline_corr_arr = np.array([per[l]["baseline_correlation"] for l in layers], dtype=np.float32)
-    ablated_corr_arr = np.array([per[l]["ablated_correlation"] for l in layers], dtype=np.float32)
-
-    # Use paired CIs for Panel 1: ablated_ci = baseline + delta_ci
-    # This makes Panel 1 and Panel 2 CIs statistically consistent
-    baseline_val = float(baseline_corr_arr[0])  # constant across layers
-    ablated_ci_lo_paired = baseline_val + delta_ci_lo
-    ablated_ci_hi_paired = baseline_val + delta_ci_hi
-
-    # Create figure with 3 vertically stacked panels
-    fig = plt.figure(figsize=(14, 12))
-    gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 0.5], hspace=0.3)
-    ax_actual = fig.add_subplot(gs[0])
-    ax_delta = fig.add_subplot(gs[1])
-    ax_summary = fig.add_subplot(gs[2])
-    ax_summary.axis('off')
+    fig, axes = plt.subplots(3, 1, figsize=(20, 14))
+    fig.suptitle(f"Ablation Results: {method.upper()} directions ({analysis['metric']})", fontsize=14)
 
     x = np.arange(len(layers))
 
-    # ===== Panel 1 (top): Actual correlation values =====
-    # Baseline as horizontal line (no CI - it's the reference point)
-    ax_actual.axhline(baseline_val, color=CONDITION_COLORS["baseline"],
-                      linestyle='-', linewidth=1.5,
-                      label=f'Baseline (r={baseline_val:.2f})')
+    per = analysis["per_layer"]
 
-    # Ablated correlation with paired CI band (derived from delta CI)
-    ax_actual.fill_between(x, ablated_ci_lo_paired, ablated_ci_hi_paired,
-                           color=CONDITION_COLORS["ablated"], alpha=CI_ALPHA)
-    ax_actual.plot(x, ablated_corr_arr, 'o-', color=CONDITION_COLORS["ablated"],
-                   markersize=4, linewidth=1.5, label='Ablated')
+    # Panel 1: Absolute correlations with bootstrap 95% CI bands
+    ax1 = axes[0]
+    baseline_corrs = np.array([per[l]["baseline_correlation"] for l in layers], dtype=np.float32)
+    ablated_corrs = np.array([per[l]["ablated_correlation"] for l in layers], dtype=np.float32)
 
-    ax_actual.set_xticks(x[::2])
-    ax_actual.set_xticklabels([layers[i] for i in range(0, len(layers), 2)])
-    ax_actual.set_xlabel('Layer')
-    ax_actual.set_ylabel('Correlation (r)')
-    ax_actual.set_title('Calibration: Baseline vs Ablated')
-    ax_actual.legend(loc='lower left', fontsize=9)
-    ax_actual.grid(True, alpha=GRID_ALPHA)
+    base_lo = np.array([per[l]["baseline_corr_ci95"][0] for l in layers], dtype=np.float32)
+    base_hi = np.array([per[l]["baseline_corr_ci95"][1] for l in layers], dtype=np.float32)
+    ablt_lo = np.array([per[l]["ablated_corr_ci95"][0] for l in layers], dtype=np.float32)
+    ablt_hi = np.array([per[l]["ablated_corr_ci95"][1] for l in layers], dtype=np.float32)
 
-    # ===== Panel 2 (middle): Delta with controls =====
-    # Control band (gray) - only plot if controls exist
-    has_controls = np.any(ctrl_lo != 0) or np.any(ctrl_hi != 0)
-    if has_controls:
-        ax_delta.fill_between(x, ctrl_lo, ctrl_hi, color='gray', alpha=0.3,
-                              label='Control 2.5-97.5%')
-        # Add annotation explaining the tight control band
-        ctrl_range = float(np.mean(ctrl_hi - ctrl_lo))
-        ax_delta.annotate(f'Random directions: Δr ≈ 0 (95% within ±{ctrl_range/2:.3f})',
-                          xy=(2, float(np.mean(ctrl_hi)) + 0.005),
-                          fontsize=8, color='dimgray', style='italic')
+    ax1.plot(x, baseline_corrs, '-', label='Baseline', color='blue', linewidth=1.5, marker='o', markersize=3)
+    ax1.fill_between(x, base_lo, base_hi, color='blue', alpha=0.15, label='Baseline 95% CI')
 
-    ax_delta.axhline(0, color='black', linestyle='-', linewidth=0.5)
+    ax1.plot(x, ablated_corrs, '-', label=f'{method} ablated', color='red', linewidth=1.5, marker='s', markersize=3)
+    ax1.fill_between(x, ablt_lo, ablt_hi, color='red', alpha=0.15, label='Ablated 95% CI')
 
-    # Real direction with CI band
-    ax_delta.fill_between(x, delta_ci_lo, delta_ci_hi, color=CONDITION_COLORS["ablated"], alpha=CI_ALPHA)
-    ax_delta.plot(x, real_delta, 'o-', color=CONDITION_COLORS["ablated"], markersize=4, linewidth=1.5,
-                  label='Real direction')
+    ax1.axhline(y=0, color='black', linestyle=':', alpha=0.3)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(layers)
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("Correlation (confidence vs metric)")
+    ax1.set_title("Correlation by Condition (bootstrap 95% CI)")
+    ax1.legend(loc='best', fontsize=9)
+    ax1.grid(True, alpha=0.3)
 
-    # Highlight significant layers
-    sig_mask = p_fdr < 0.05
-    if np.any(sig_mask):
-        sig_x = x[sig_mask]
-        sig_y = real_delta[sig_mask]
-        ax_delta.scatter(sig_x, sig_y, color='gold', s=80, marker='*',
-                         zorder=5, edgecolor='black', linewidth=0.5,
-                         label='FDR < 0.05')
+    all_vals = np.concatenate([base_lo, base_hi, ablt_lo, ablt_hi])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if len(all_vals) > 0:
+        ymin, ymax = float(np.min(all_vals)), float(np.max(all_vals))
+        padding = (ymax - ymin) * 0.1 if ymax > ymin else 0.1
+        ax1.set_ylim(ymin - padding, ymax + padding)
 
-    # Annotation on peak effect (most negative)
-    peak_idx = int(np.argmin(real_delta))
-    peak_layer = layers[peak_idx]
-    peak_val = float(real_delta[peak_idx])
+    # Panel 2: Δcorr with bootstrap CI and bootstrap-FDR significance coloring
+    ax2 = axes[1]
+    delta = np.array([per[l]["correlation_change"] for l in layers], dtype=np.float32)
+    d_lo = np.array([per[l]["delta_corr_ci95"][0] for l in layers], dtype=np.float32)
+    d_hi = np.array([per[l]["delta_corr_ci95"][1] for l in layers], dtype=np.float32)
+    yerr = np.vstack([delta - d_lo, d_hi - delta])
 
-    # Position annotation to avoid overlap
-    text_x = peak_idx + 3 if peak_idx < len(layers) - 5 else peak_idx - 8
-    text_y = peak_val - 0.015
-    ax_delta.annotate(f'Layer {peak_layer}: Δr = {peak_val:.3f}',
-                      xy=(peak_idx, peak_val), xytext=(text_x, text_y),
-                      fontsize=9, arrowprops=dict(arrowstyle='->', color='black', lw=0.8),
-                      bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                               edgecolor='gray', alpha=0.9))
+    p_fdr = np.array([per[l]["p_value_bootstrap_fdr"] for l in layers], dtype=np.float32)
+    colors = ['red' if p < 0.05 else 'orange' if p < 0.1 else 'gray' for p in p_fdr]
 
-    ax_delta.set_xticks(x[::2])
-    ax_delta.set_xticklabels([layers[i] for i in range(0, len(layers), 2)])
-    ax_delta.set_xlabel('Layer')
-    ax_delta.set_ylabel('Δ Correlation (ablated − baseline)')
-    ax_delta.set_title('Ablation Effect vs Random Controls')
-    ax_delta.legend(loc='lower left', fontsize=9)
-    ax_delta.grid(True, alpha=GRID_ALPHA)
+    ax2.bar(x, delta, color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    ax2.errorbar(x, delta, yerr=yerr, fmt='none', ecolor='black', capsize=2, alpha=0.5, linewidth=1)
 
-    # ===== Panel 3 (bottom): Summary statistics =====
-    # Build summary statistics
-    baseline_corr = float(np.mean(baseline_corr_arr))
-    baseline_ci_lo_mean = float(np.mean([per[l]["baseline_corr_ci95"][0] for l in layers]))
-    baseline_ci_hi_mean = float(np.mean([per[l]["baseline_corr_ci95"][1] for l in layers]))
-    peak_ci = per[peak_layer]["delta_corr_ci95"]
-    n_sig = int(np.sum(p_fdr < 0.05))
-    ctrl_mean = float(np.mean([per[l]["control_correlation_change_mean"] for l in layers]))
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(layers)
+    ax2.set_xlabel("Layer")
+    ax2.set_ylabel("ΔCorrelation (Ablated - Baseline)")
+    ax2.set_title("Ablation Effect (bootstrap 95% CI; colors by bootstrap BH-FDR)")
+    ax2.grid(True, alpha=0.3, axis='y')
 
-    # Count layers where real effect is outside control band
-    if has_controls:
-        outside_band = int(np.sum((real_delta < ctrl_lo) | (real_delta > ctrl_hi)))
-    else:
-        outside_band = n_sig
+    legend_elements = [
+        Patch(facecolor='red', alpha=0.7, edgecolor='black', label='boot FDR < 0.05'),
+        Patch(facecolor='orange', alpha=0.7, edgecolor='black', label='boot FDR < 0.10'),
+        Patch(facecolor='gray', alpha=0.7, edgecolor='black', label='n.s.'),
+    ]
+    ax2.legend(handles=legend_elements, loc='best', fontsize=9)
 
-    meta_task = analysis.get("meta_task", analysis.get("config", {}).get("meta_task", "unknown"))
-    num_controls = analysis.get("num_controls", 0)
-    bootstrap_n = analysis.get("bootstrap", {}).get("n", 0)
-    conf_signal = analysis.get("confidence_signal", "prob")
+    # Panel 3: Summary text
+    ax3 = axes[2]
+    ax3.axis('off')
 
-    # Extract metadata for reproducibility
-    model_name = analysis.get("model_name", "unknown")
-    dataset = analysis.get("dataset", "unknown")
-    quantization = analysis.get("quantization", "unknown")
-    direction_type = analysis.get("direction_type", "uncertainty")
+    summary = analysis.get("summary", {})
+    baseline_corr_mean = float(np.mean(baseline_corrs))
 
-    # Extract position from output filename if available
-    position = "unknown"
-    fname = output_path.stem if output_path else ""
-    for pos in ["final", "optionsnewline", "questionnewline", "questionmark"]:
-        if pos in fname.lower().replace("_", ""):
-            position = pos.replace("newline", "_newline").replace("mark", "_mark")
-            break
+    best_layer = summary.get("best_layer_abs_delta", summary.get("best_layer"))
+    best_delta = per[best_layer]["correlation_change"]
+    best_ci = per[best_layer]["delta_corr_ci95"]
+    best_p = per[best_layer]["p_value_bootstrap_fdr"]
 
-    # Format quantization for display
-    quant_display = f" ({quantization})" if quantization != "none" else ""
+    summary_text = f"""
+ABLATION ANALYSIS: {method.upper()}
 
-    # Horizontal summary format for full-width panel
-    summary_text = (
-        f"CAUSAL NECESSITY TEST | Model: {model_name}{quant_display} | Dataset: {dataset}\n"
-        f"Direction: {method} {direction_type} ({analysis['metric']}) | Task: {meta_task} | Position: {position}\n"
-        f"N = {analysis['num_questions']} | Controls = {num_controls} | Bootstrap = {bootstrap_n} | Signal = {conf_signal}\n\n"
-        f"BASELINE: r = {baseline_corr:.3f} [{baseline_ci_lo_mean:.2f}, {baseline_ci_hi_mean:.2f}]    |    "
-        f"PEAK EFFECT: Layer {peak_layer}, Δr = {peak_val:.3f} [{peak_ci[0]:.3f}, {peak_ci[1]:.3f}]\n"
-        f"Significant: {n_sig}/{len(layers)} layers (FDR<0.05)    |    "
-        f"Controls: mean Δr ≈ {ctrl_mean:.3f}, outside band: {outside_band} layers\n\n"
-        f"INTERPRETATION: ✓ Ablating {direction_type} direction degrades calibration  "
-        f"✓ Random directions do not  → Direction is causally necessary"
-    )
+Metric: {analysis['metric']}
+Layers tested: {len(layers)}
+Questions: {analysis['num_questions']}
+Bootstrap: n={analysis['bootstrap']['n']} resamples
 
-    ax_summary.text(0.5, 0.5, summary_text, transform=ax_summary.transAxes, fontsize=10,
-                    verticalalignment='center', horizontalalignment='center',
-                    fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor='white',
-                              edgecolor='gray', alpha=0.9))
+Results (bootstrap-FDR):
+  Mean baseline corr: {baseline_corr_mean:.4f}
+  Significant layers (boot FDR<0.05): {summary.get('n_significant_bootstrap_fdr', 0)}
 
-    fig.suptitle(f'Ablation: {method.upper()} direction ({analysis["metric"]})',
-                 fontsize=12, fontweight='bold')
+Largest |Δcorr| layer: {best_layer}
+  Δcorr: {best_delta:+.4f}  CI95: [{best_ci[0]:+.4f}, {best_ci[1]:+.4f}]
+  boot FDR: {best_p:.4g}
 
-    save_figure(fig, output_path)
+Note: Negative Δcorr = ablation decreased correlation
+      Positive Δcorr = ablation increased correlation
+"""
 
+    ax3.text(0.05, 0.95, summary_text, transform=ax3.transAxes, fontsize=10,
+             verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"  Saved {output_path}")
+    plt.close()
 def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     """Comparison plot of different direction methods.
 
@@ -1598,7 +1505,7 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     fig.suptitle("Method Comparison: Ablation Effects (Δcorr)", fontsize=14)
 
     x = np.arange(len(layers))
-    method_colors = METHOD_COLORS
+    method_colors = {"probe": "tab:blue", "mean_diff": "tab:orange"}
 
     # Panel 1: Δcorr with CI bands
     ax1 = axes[0]
@@ -1611,7 +1518,7 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
 
         color = method_colors.get(method, "gray")
         ax1.plot(x, delta, "-", label=method, color=color, linewidth=1.8, alpha=0.85)
-        ax1.fill_between(x, d_lo, d_hi, color=color, alpha=CI_ALPHA)
+        ax1.fill_between(x, d_lo, d_hi, color=color, alpha=0.12)
 
         # Mark significant layers
         sig_x = [i for i, p in enumerate(p_fdr) if p < 0.05]
@@ -1626,7 +1533,7 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     ax1.set_ylabel("ΔCorrelation (Ablated - Baseline)")
     ax1.set_title("Δcorr by Method (filled markers = bootstrap FDR<0.05)")
     ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.grid(True, alpha=0.3)
 
     # Panel 2: Summary
     ax2 = axes[1]
@@ -1660,7 +1567,10 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
         bbox=dict(boxstyle="round", facecolor="lightyellow", edgecolor="gray", alpha=0.9),
     )
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"  Saved {output_path}")
+    plt.close()
 
 
 def print_summary(analyses: Dict[str, Dict]):
@@ -1668,10 +1578,6 @@ def print_summary(analyses: Dict[str, Dict]):
     print("\n" + "=" * 90)
     print("ABLATION CAUSALITY TEST RESULTS")
     print("=" * 90)
-    desc = DIRECTION_DESCRIPTIONS.get(DIRECTION_TYPE, {})
-    print(f"\nDirection type: {DIRECTION_TYPE} (trained on: {desc.get('trained_on', 'unknown')})")
-    print(f"Dependent variable: correlation(stated_confidence, {METRIC})")
-    print(f"Interpretation: {desc.get('interpretation', 'unknown')}")
     print("\nKey question: Does ablating the direction HURT calibration?")
     print("Expected: correlation should DECREASE (negative Δcorr)")
     print("Significance & CIs: bootstrap over questions + BH-FDR across layers")
@@ -1741,13 +1647,9 @@ def main():
     print(f"\nModel: {MODEL}")
     print(f"Input: {INPUT_BASE_NAME}")
     print(f"Direction type: {DIRECTION_TYPE}")
-    desc = DIRECTION_DESCRIPTIONS.get(DIRECTION_TYPE, {})
-    print(f"  Trained on: {desc.get('trained_on', 'unknown')}")
     if DIRECTION_TYPE == "uncertainty":
-        print(f"  Metric: {METRIC}")
+        print(f"Metric: {METRIC}")
     print(f"Meta-task: {META_TASK}")
-    print(f"Dependent variable: correlation(stated_confidence, {METRIC})")
-    print(f"Interpretation: {desc.get('interpretation', 'unknown')}")
     print(f"Questions: {NUM_QUESTIONS}")
     print(f"Controls: {NUM_CONTROLS} (final), {NUM_CONTROLS_NONFINAL} (non-final)")
     print(f"Bootstrap: {BOOTSTRAP_N} resamples (CI={int((1-BOOTSTRAP_CI_ALPHA)*100)}%)")
@@ -1764,17 +1666,9 @@ def main():
     available_methods = list(all_directions.keys())
     print(f"  Found methods: {available_methods}")
 
-    # Filter to requested methods (with name mapping for equivalent methods)
-    # mean_diff and centroid are conceptually equivalent (difference of class means)
-    METHOD_ALIASES = {"mean_diff": "centroid", "centroid": "mean_diff"}
+    # Filter to requested methods
     if METHODS is not None:
-        methods = []
-        for m in METHODS:
-            if m in available_methods:
-                methods.append(m)
-            elif m in METHOD_ALIASES and METHOD_ALIASES[m] in available_methods:
-                methods.append(METHOD_ALIASES[m])
-                print(f"  Note: '{m}' not found, using '{METHOD_ALIASES[m]}' instead")
+        methods = [m for m in METHODS if m in available_methods]
         if not methods:
             raise ValueError(f"No matching methods found. Available: {available_methods}, requested: {METHODS}")
         print(f"  Using methods: {methods}")
@@ -1836,7 +1730,7 @@ def main():
                         else:
                             print(f"  {pos}/{method}: WARNING - no layers found, will use ALL layers")
     else:
-        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_results.json"
+        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_{META_TASK}_results.json"
         print(f"\nNo transfer results found - will use all layers for all positions")
         print(f"  Expected: {expected_path}")
 
@@ -1853,7 +1747,6 @@ def main():
     print("\nLoading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
         MODEL,
-        adapter_path=ADAPTER,
         load_in_4bit=LOAD_IN_4BIT,
         load_in_8bit=LOAD_IN_8BIT,
     )
@@ -1943,32 +1836,22 @@ def main():
             print(f"  Best |Δcorr| layer: {summary.get('best_layer_abs_delta')} (Δ={summary.get('best_abs_delta', 0.0):+.3f})")
 
         # Incremental save after each position completes (crash protection)
-        model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-        # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-        dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
+        model_short = get_model_short_name(MODEL)
         # Include direction type in output name to distinguish different ablation experiments
         dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-        # Include adapter in output name if used
-        if ADAPTER:
-            adapter_short = get_model_short_name(ADAPTER)
-            base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-        else:
-            base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
+        base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_ablation_{META_TASK}_{dir_suffix}"
         checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
         checkpoint_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
-                direction_type=DIRECTION_TYPE,
-                metric=METRIC,
-                meta_task=META_TASK,
-                num_questions=len(questions),
-                use_transfer_split=USE_TRANSFER_SPLIT,
-                seed=SEED,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-                positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_pos[p]],
-            ),
+            "config": {
+                "model": MODEL,
+                "input_base_name": INPUT_BASE_NAME,
+                "direction_type": DIRECTION_TYPE,
+                "metric": METRIC,
+                "meta_task": META_TASK,
+                "num_questions": len(questions),
+                "use_transfer_split": USE_TRANSFER_SPLIT,
+                "positions_completed": [p for p in PROBE_POSITIONS if all_analyses_by_pos[p]],
+            },
             "by_position": {},
         }
         for pos in PROBE_POSITIONS:
@@ -1990,20 +1873,9 @@ def main():
         # Use first available position
         all_analyses = all_analyses_by_pos[PROBE_POSITIONS[0]]
 
-    # Generate output filename (include DIRECTION_TYPE for clarity)
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-    dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-    # Include adapter in output name if used
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-    else:
-        base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-    # Add confidence signal to filename when non-default (for delegate task)
-    if META_TASK == "delegate" and CONFIDENCE_SIGNAL != "prob":
-        base_output += f"_{CONFIDENCE_SIGNAL}"
+    # Generate output filename
+    model_short = get_model_short_name(MODEL)
+    base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_ablation_{META_TASK}_{METRIC}"
 
     # Save JSON results
     print("\nSaving results...")
@@ -2019,23 +1891,19 @@ def main():
             output_json["by_position"] = {}
     else:
         output_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
-                direction_type=DIRECTION_TYPE,
-                metric=METRIC,
-                meta_task=META_TASK,
-                num_questions=len(questions),
-                use_transfer_split=USE_TRANSFER_SPLIT,
-                seed=SEED,
-                num_controls_final=NUM_CONTROLS,
-                num_controls_nonfinal=NUM_CONTROLS_NONFINAL,
-                transfer_r2_threshold=TRANSFER_R2_THRESHOLD,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-                methods_tested=[],
-                positions_tested=[],
-            ),
+            "config": {
+                "model": MODEL,
+                "input_base_name": INPUT_BASE_NAME,
+                "metric": METRIC,
+                "meta_task": META_TASK,
+                "num_questions": len(questions),
+                "use_transfer_split": USE_TRANSFER_SPLIT,
+                "num_controls_final": NUM_CONTROLS,
+                "num_controls_nonfinal": NUM_CONTROLS_NONFINAL,
+                "transfer_r2_threshold": TRANSFER_R2_THRESHOLD,
+                "methods_tested": [],
+                "positions_tested": [],
+            },
             "by_position": {},
         }
 

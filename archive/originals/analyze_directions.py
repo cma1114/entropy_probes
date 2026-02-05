@@ -1,29 +1,31 @@
 """
-Stage 4. Logit lens analysis and pairwise cosine similarity between probe directions
-from different experiments (MC, next-token, introspection, contrastive).
+Analyze and compare probe directions across different experiments.
 
-Loads direction files from various probe experiments, computes pairwise cosine
-similarities, projects directions through the unembedding matrix (logit lens),
-and generates visualizations.
+This script:
+1. Loads direction files from various probe experiments:
+   - Next-token uncertainty probes (entropy, top_prob, margin, logit_gap, top_logit)
+   - MC uncertainty probes (entropy, top_prob, margin, logit_gap, top_logit)
+   - Introspection probes (trained on direct MC prompts, tested on meta prompts)
+   - Contrastive directions
+2. Computes pairwise cosine similarities between directions
+3. Runs logit lens analysis (project directions through unembedding)
+4. Generates visualizations
 
 Direction types and their relationships:
 - mc_{metric}_{dataset}: Trained on MC questions to predict uncertainty metric
 - introspection_{metric}_{dataset}: Also trained on MC questions (direct prompts) to
-  predict the same uncertainty metric. The introspection experiment additionally tests
-  whether these directions transfer to meta-cognition prompts.
+  predict the same uncertainty metric. These should be very similar to mc directions
+  for the same dataset/metric. The introspection experiment additionally tests whether
+  these directions transfer to meta-cognition prompts ("How confident are you...?").
 - nexttoken_{metric}: Trained on diverse next-token prediction to predict uncertainty
 - contrastive: Difference between high/low uncertainty activations (not a probe)
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz         MC uncertainty directions
-    outputs/{base}_nexttoken_{metric}_directions.npz  Next-token uncertainty directions
-
-Outputs:
-    outputs/{base}_direction_analysis.json             Pairwise similarity metrics
-    outputs/{base}_logit_lens.png                      Logit lens projection plots
-    (various additional analysis plots)
-
-Run after: identify_mc_correlate.py, identify_nexttoken_correlate.py
+Usage:
+    python analyze_directions.py                    # Auto-detect directions in outputs/
+    python analyze_directions.py --model-only       # Only load model, skip analysis (for debugging)
+    python analyze_directions.py --layer 15         # Focus on specific layer
+    python analyze_directions.py --skip-logit-lens  # Skip logit lens (faster, no model needed)
+    python analyze_directions.py --metric entropy   # Only analyze entropy directions
 """
 
 import argparse
@@ -43,39 +45,30 @@ from core import (
     DEVICE,
     get_model_short_name,
 )
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, GRID_ALPHA
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Configuration
+BASE_MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+MODEL_NAME = BASE_MODEL_NAME
 
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.3-70B-Instruct"
-ADAPTER = None  # Set to adapter path if using fine-tuned model
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
 
-# --- Quantization ---
-# Must match the setting used when producing the direction files
-LOAD_IN_4BIT = False  # Set True for 70B+ models
-LOAD_IN_8BIT = False
-
-# --- Script-specific ---
+# Analysis config
 TOP_K_TOKENS = 12  # Number of top tokens to show in logit lens
 LAYERS_TO_ANALYZE = None  # None = all layers, or list like [10, 15, 20]
-AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
-# --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Available uncertainty metrics (same as in probe scripts)
+AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
 
 def get_output_prefix() -> str:
     """Generate output filename prefix based on config."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}")
-    return str(OUTPUT_DIR / f"{model_short}")
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}")
+    return str(OUTPUTS_DIR / f"{model_short}")
 
 
 def extract_dataset_from_npz(path: Path) -> Optional[str]:
@@ -702,7 +695,10 @@ def plot_logit_lens_heatmap(
     ax.set_xlabel(f"Top {top_k} Tokens")
     ax.set_ylabel("Layer")
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved logit lens heatmap to {output_path}")
+    plt.close()
 
 
 def plot_similarity_across_layers(
@@ -756,10 +752,13 @@ def plot_similarity_across_layers(
     ax.set_ylabel("Cosine Similarity")
     ax.set_title("Direction Similarity Across Layers")
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.grid(True, alpha=GRID_ALPHA)
+    ax.grid(True, alpha=0.3)
     ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved similarity-across-layers plot to {output_path}")
+    plt.close()
 
 
 def main():
@@ -781,11 +780,11 @@ def main():
         print(f"Metric filter: {args.metric}")
 
     # Find direction files
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    direction_files = find_direction_files(OUTPUT_DIR, model_short, metric_filter=args.metric)
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    direction_files = find_direction_files(OUTPUTS_DIR, model_short, metric_filter=args.metric)
 
     if not direction_files:
-        print(f"No direction files found in {OUTPUT_DIR} for model {model_short}")
+        print(f"No direction files found in {OUTPUTS_DIR} for model {model_short}")
         if args.metric:
             print(f"  (filtered by metric: {args.metric})")
         print("Run one of the probe scripts first:")
@@ -832,9 +831,9 @@ def main():
 
         load_dotenv()
 
-        print(f"\nLoading tokenizer: {MODEL}")
+        print(f"\nLoading tokenizer: {BASE_MODEL_NAME}")
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL,
+            BASE_MODEL_NAME,
             token=os.environ.get("HF_TOKEN")
         )
 
@@ -844,7 +843,7 @@ def main():
 
         # Load lm_head weight and norm weight directly (much faster than loading full model)
         print(f"\nLoading lm_head and norm weights for logit lens...")
-        lm_head_weight, norm_weight = load_lm_head_and_norm(MODEL)
+        lm_head_weight, norm_weight = load_lm_head_and_norm(BASE_MODEL_NAME)
     else:
         print("\nSkipping logit lens analysis (--skip-logit-lens)")
 
@@ -855,75 +854,6 @@ def main():
     for layer_idx in tqdm(layers_to_analyze, desc="Analyzing layers"):
         results = analyze_layer(all_directions, layer_idx, lm_head_weight, tokenizer, TOP_K_TOKENS, norm_weight)
         all_results[layer_idx] = results
-
-    # =========================================================================
-    # Console Summary
-    # =========================================================================
-
-    print("\n" + "="*80)
-    print("DIRECTION ANALYSIS RESULTS")
-    print("="*80)
-
-    # --- Direction Similarity Summary ---
-    pair_similarities = defaultdict(list)  # (name1, name2) -> [(layer, cosine), ...]
-
-    for layer_idx, results in sorted(all_results.items()):
-        for key, sim in results["similarities"].items():
-            parts = key.split("__vs__")
-            if len(parts) == 2:
-                n1, n2 = parts
-                if n1 < n2:  # Avoid duplicates
-                    pair_similarities[(n1, n2)].append((layer_idx, sim))
-
-    if pair_similarities:
-        print(f"\nDIRECTION SIMILARITY ({len(pair_similarities)} pair(s) across {len(layers_to_analyze)} layers):")
-        print(f"  {'Pair':<60s}  {'Mean |cos|':>10s}  {'Max |cos|':>10s}  {'Max Layer':>10s}")
-        print(f"  {'-'*60}  {'-'*10}  {'-'*10}  {'-'*10}")
-
-        for (n1, n2), layer_sims in sorted(pair_similarities.items()):
-            abs_sims = [abs(s) for _, s in layer_sims]
-            mean_abs = np.mean(abs_sims)
-            max_idx = int(np.argmax(abs_sims))
-            max_abs = abs_sims[max_idx]
-            max_layer = layer_sims[max_idx][0]
-
-            pair_label = f"{n1} vs {n2}"
-            if len(pair_label) > 60:
-                pair_label = pair_label[:57] + "..."
-
-            print(f"  {pair_label:<60s}  {mean_abs:>10.3f}  {max_abs:>10.3f}  {'L' + str(max_layer):>10s}")
-    else:
-        print("\nNo direction pairs found for similarity analysis.")
-
-    # --- Logit Lens Summary ---
-    if lm_head_weight is not None:
-        # Pick representative layers: ~5 evenly spaced
-        if len(layers_to_analyze) <= 5:
-            repr_layers = list(layers_to_analyze)
-        else:
-            indices = np.linspace(0, len(layers_to_analyze) - 1, 5, dtype=int)
-            repr_layers = [layers_to_analyze[i] for i in indices]
-
-        # Collect all direction type names
-        direction_types = set()
-        for layer_idx, results in all_results.items():
-            direction_types.update(results.get("logit_lens", {}).keys())
-
-        if direction_types:
-            print(f"\nLOGIT LENS (top-5 tokens at representative layers):")
-
-            for dir_name in sorted(direction_types):
-                print(f"\n  {dir_name}:")
-                for layer_idx in repr_layers:
-                    if layer_idx in all_results:
-                        lens_data = all_results[layer_idx].get("logit_lens", {}).get(dir_name)
-                        if lens_data:
-                            top5_tokens = lens_data["tokens"][:5]
-                            top5_probs = lens_data["probs"][:5]
-                            token_strs = [f'"{clean_token_str(t)}" ({p:.3f})' for t, p in zip(top5_tokens, top5_probs)]
-                            print(f"    L{layer_idx:<3d}: {', '.join(token_strs)}")
-    else:
-        print("\nLogit lens skipped (no model weights loaded).")
 
     # Save results
     results_path = Path(f"{output_prefix}_direction_analysis.json")
@@ -944,40 +874,8 @@ def main():
             return [convert_for_json(v) for v in obj]
         return obj
 
-    # Build output with config
-    output_data = {
-        "config": get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-            top_k_tokens=TOP_K_TOKENS,
-            layers_analyzed=len(layers_to_analyze),
-            direction_files={k: str(v) for k, v in direction_files.items()},
-            skip_logit_lens=args.skip_logit_lens,
-        ),
-        "per_layer": all_results,
-    }
-
-    # Add similarity summary to output
-    if pair_similarities:
-        sim_summary = {}
-        for (n1, n2), layer_sims in sorted(pair_similarities.items()):
-            abs_sims = [abs(s) for _, s in layer_sims]
-            mean_abs = float(np.mean(abs_sims))
-            max_idx = int(np.argmax(abs_sims))
-            max_abs = float(abs_sims[max_idx])
-            max_layer = layer_sims[max_idx][0]
-            pair_key = f"{n1}__vs__{n2}"
-            sim_summary[pair_key] = {
-                "mean_abs_cosine": mean_abs,
-                "max_abs_cosine": max_abs,
-                "max_abs_layer": max_layer,
-            }
-        output_data["similarity_summary"] = sim_summary
-
     with open(results_path, "w") as f:
-        json.dump(convert_for_json(output_data), f, indent=2)
+        json.dump(convert_for_json(all_results), f, indent=2)
     print(f"\nSaved analysis results to {results_path}")
 
     # Generate plots

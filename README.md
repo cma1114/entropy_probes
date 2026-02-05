@@ -8,233 +8,219 @@ Test the hypothesis that LLMs genuinely introspect on their uncertainty rather t
 
 1. **Identify**: Find internal correlates of output uncertainty (entropy, logit_gap, etc.)
 2. **Transfer**: Test whether these correlates appear during meta-judgment tasks (confidence reports, delegation decisions)
-3. **Causality**: Verify the relationship is causal via ablation (and steering, future)
-4. **Interpret**: Understand what the uncertainty direction represents (future)
+3. **Causality**: Verify the relationship is causal via ablation and steering
+4. **Interpret**: Understand what the uncertainty direction represents (logit lens, direction similarity)
+
+## Quick Start
+
+Edit the `MODEL`, `DATASET`, and `META_TASK` constants at the top of each script, then run the stages in order:
+
+```bash
+# Stage 1: Find uncertainty + answer directions
+python identify_mc_correlate.py
+
+# Stage 2: Test transfer to meta-task + find confidence directions
+python test_meta_transfer.py
+
+# Stage 3: Causal tests
+python run_ablation_causality.py
+python run_steering_causality.py
+
+# Stage 4: Interpret directions
+python analyze_directions.py
+python compare_direction_types.py
+
+# Summary: Cross-stage consolidated view
+python summarize_results.py
+```
+
+Each script prints comprehensive results to console and saves JSON + PNG outputs.
 
 ## Workflow
 
-### Step 0: Establish that uncertainty is encoded
+### Stage 1: Identify uncertainty directions
 
-Before testing transfer, verify that activations encode uncertainty at all.
+Find directions in activation space that correlate with output uncertainty.
 
 **MC task** (multiple choice questions):
-```
+```bash
 python identify_mc_correlate.py
 ```
 
+Finds both uncertainty directions (probe + mean_diff methods) and optionally answer directions (A/B/C/D classification). 
+
 **Next-token task** (diverse text):
-```
+```bash
 python identify_nexttoken_correlate.py
 ```
 
-Both scripts:
-- Extract activations from all layers
-- Compute uncertainty metrics (entropy, logit_gap, etc.)
-- Find directions using two methods:
-  - `probe`: Ridge regression to predict metric
-  - `mean_diff`: Simple centroid difference (mean of high - mean of low)
-- Compare methods and report R² per layer
+Requires a stratified dataset from `build_nexttoken_dataset.py`. Finds uncertainty directions and optionally output token directions (which token the model selected). 
 
-### Step 1: Test meta-transfer
+Both scripts extract activations, compute uncertainty metrics, find directions using two methods (probe and mean_diff), and report per-layer R² with bootstrap 95% CIs.
 
-Test whether directions found on direct tasks transfer to meta-judgment:
+### Stage 2: Test meta-transfer
 
-```
+Test whether directions found on the direct task transfer to meta-judgments:
+
+```bash
 python test_meta_transfer.py
 ```
 
-This loads directions from Step 0 and tests how well they predict the original metric when applied to activations from a meta-task (confidence rating or delegation game).
+Loads directions from Stage 1 and tests how well they predict uncertainty from meta-task activations (confidence rating or delegation game). Reports:
+- Behavioral correlation (stated confidence vs actual uncertainty) with bootstrap CIs
+- D→D and D→M R² per layer with CIs
+- Transfer ratio (best D→M / best D→D) with introspection strength interpretation
+- Answer direction analysis
 
-### Step 2: Test causality via ablation
+Optionally finds confidence directions from meta-task activations (`FIND_CONFIDENCE_DIRECTIONS = True`).
 
-Test whether directions are causally necessary for meta-judgments:
+### Stage 3: Causal tests
 
-```
+**Ablation** (necessity):
+```bash
 python run_ablation_causality.py
 ```
 
-This ablates directions during meta-task inference and measures if the correlation between stated confidence and actual uncertainty degrades. Control ablations (random orthogonal directions) establish a null distribution.
+Ablates directions during meta-task inference and measures if calibration degrades. Tests all layers with FDR correction and bootstrap CIs on effect sizes.
 
-**Configuration**:
-```python
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_SimpleMC"
-METRIC = "entropy"
-META_TASK = "confidence"  # or "delegate"
-NUM_QUESTIONS = 100
-NUM_CONTROLS = 25  # random directions per layer for null distribution
-```
-
-**Key design choices**:
-- Tests ALL layers (no pre-filtering by transfer R²—let ablation determine what matters)
-- Tests BOTH probe and mean_diff methods in a single run
-- Pooled null distribution + FDR correction for robust statistics
-
-**Outputs**:
-```
-outputs/
-├── {model}_{dataset}_ablation_{task}_{metric}_results.json
-├── {model}_{dataset}_ablation_{task}_{metric}_probe.png
-├── {model}_{dataset}_ablation_{task}_{metric}_mean_diff.png
-└── {model}_{dataset}_ablation_{task}_{metric}_comparison.png
-```
-
-## Additional Direction Types
-
-Beyond uncertainty directions, the workflow supports finding and analyzing other direction types.
-
-### MC Answer Directions
-
-Find directions that predict which answer (A/B/C/D) the model chose:
-
+**Steering** (sufficiency):
 ```bash
-python identify_mc_answer_correlate.py
+python run_steering_causality.py
 ```
 
-Reuses cached activations from `identify_mc_correlate.py`. Outputs:
-- `*_mc_answer_directions.npz` - Directions (classifier + centroid methods)
-- `*_mc_answer_probes.joblib` - 4-class probes (scaler, pca, clf per layer)
-- `*_mc_answer_results.json` - Per-layer accuracy
+Steers along directions at graded magnitudes and measures dose-response. Significant slopes with correct sign indicate causal sufficiency.
 
-When answer classifiers exist, `test_meta_transfer.py` automatically tests answer D2M transfer.
-
-### Confidence Directions
-
-Find directions that predict stated confidence from meta-task activations:
-
+**Activation patching** (full activation):
 ```bash
-python identify_confidence_correlate.py
+python run_activation_patching.py
 ```
 
-Reuses cached activations from `test_meta_transfer.py`. Configuration:
-```python
-INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC_difficulty_filtered"
-META_TASK = "delegate"  # or "confidence" or "other_confidence"
-```
+Pairs questions by metric value in MC tasks (e.g., low-entropy source ↔ high-entropy target) and swaps complete activation vectors between them during meta task inference. At each tested layer, the source question's hidden state is replaced with the target's activations. If the source's behavior shifts toward the target's uncertainty profile, this demonstrates that full activations (not just a 1D direction) causally encode uncertainty.
 
-### Other-Confidence Meta-Task
+Both ablation and steering test probe and mean_diff methods, and support `DIRECTION_TYPE = "uncertainty"`, `"answer"`, or `"confidence"`.
 
-The `other_confidence` meta-task asks about estimated human difficulty rather than self-confidence:
-
+**Cross-direction causality** (internal effects):
 ```bash
-python test_meta_transfer.py  # META_TASK = "other_confidence"
+python run_cross_direction_causality.py
 ```
 
-### Compare Direction Types
+Tests whether ablating one direction type affects the activation projection onto other direction types. For example: does ablating answer directions reduce the projection onto uncertainty directions? This measures internal representational causality rather than behavioral output effects. Reports effect matrix with bootstrap CIs and FDR correction.
 
-Compare uncertainty, answer, and confidence directions:
+**Visualize single ablation effect:**
+```bash
+python plot_ablation_effect.py uncertainty confidence 14
+```
 
+Creates a two-panel figure showing the effect of ablating one direction on another:
+- Panel 1: Raw projection trajectories across layers (baseline vs post-ablation)
+- Panel 2: Delta with error bars (significance indicator - bars not crossing zero = significant)
+
+Useful for examining specific ablation effects in detail after running cross-direction causality.
+
+### Stage 4: Interpret
+
+**Logit lens + direction analysis:**
+```bash
+python analyze_directions.py
+```
+
+Projects directions through the unembedding matrix to see what tokens they correspond to. Reports direction similarity across experiment types.
+
+**Direction type comparison:**
 ```bash
 python compare_direction_types.py
 ```
 
-Outputs cosine similarities between direction types per layer.
+Compares uncertainty, answer, and confidence directions via cosine similarity. Reports bootstrap CIs on mean cosine.
 
-### Ablation with Different Direction Types
-
-```bash
-python run_ablation_causality.py  # DIRECTION_TYPE = "uncertainty" (default)
-python run_ablation_causality.py  # DIRECTION_TYPE = "answer"
-python run_ablation_causality.py  # DIRECTION_TYPE = "confidence"
-```
-
-### Full Pipeline with All Direction Types
+### Cross-stage summary
 
 ```bash
-# Phase 1: Direct task
-python identify_mc_correlate.py           # Extracts activations, finds uncertainty directions
-python identify_mc_answer_correlate.py    # Finds answer directions (reuses activations)
-
-# Phase 2: Meta-tasks
-python test_meta_transfer.py              # META_TASK="delegate"
-python test_meta_transfer.py              # META_TASK="other_confidence"
-python identify_confidence_correlate.py   # META_TASK="delegate"
-python identify_confidence_correlate.py   # META_TASK="other_confidence"
-
-# Phase 3: Analysis
-python compare_direction_types.py
-python run_ablation_causality.py          # DIRECTION_TYPE="uncertainty"
-python run_ablation_causality.py          # DIRECTION_TYPE="answer"
+python summarize_results.py
 ```
+
+Reads all `*_results.json` files for a given model/dataset and produces a compact cross-stage console summary plus a unified `*_summary.json`.
 
 ## Direction-Finding Methods
 
-Two fundamentally different approaches:
+Two fundamentally different approaches, with variants for continuous vs categorical targets:
+
+### Continuous targets (uncertainty metrics, confidence)
 
 | Method | How it works | Strengths |
 |--------|--------------|-----------|
-| `probe` | Ridge regression: find direction that best predicts target | Optimized for prediction accuracy |
-| `mean_diff` | `mean(top 25%) - mean(bottom 25%)` | Simple, interpretable, robust |
+| `probe` | Ridge regression: find direction `w` minimizing `\|\|Xw - y\|\|²` | Optimized for prediction; uses all data points |
+| `mean_diff` | `mean(top 25%) - mean(bottom 25%)` | Simple, interpretable; focuses on extremes |
 
-Both are computed automatically and compared.
+### Categorical targets (answer prediction: A/B/C/D)
 
-## Experiments
+| Method | How it works | Strengths |
+|--------|--------------|-----------|
+| `probe` | Logistic regression classifier | Optimized for classification accuracy |
+| `centroid` | Per-class centroids; classify by nearest centroid | Simple, interpretable; no optimization |
 
-### identify_mc_correlate.py
+The `centroid` method computes the mean activation for each answer class (A, B, C, D) and classifies test samples by which centroid they're closest to. It's the categorical analogue of `mean_diff`—both are non-optimized methods based on group means.
 
-Find internal correlates on MC question answering.
+### Interpretation
 
-**Configuration** (top of script):
-```python
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-DATASET = "SimpleMC"  # or "TriviaMC", "GPQA", etc.
-METRICS = ["entropy", "logit_gap"]  # which metrics to probe
-NUM_QUESTIONS = 500
-SEED = 42
-```
+When comparing directions across tasks (e.g., "do confidence directions align with uncertainty directions?"):
+- Comparing `probe↔probe` or `mean_diff↔mean_diff` is apples-to-apples (same method, different tasks)
+- Comparing `probe↔mean_diff` for the *same* task tells you whether both methods found the same structure
+- Low agreement between methods suggests the target doesn't have a single clean linear direction
 
-**Outputs**:
-```
-outputs/
-├── {model}_{dataset}_mc_activations.npz         # Reusable activations (all layers)
-├── {model}_{dataset}_mc_dataset.json            # Full question metadata + all metrics
-├── {model}_{dataset}_mc_entropy_distribution.png
-├── {model}_{dataset}_mc_{metric}_directions.npz # Directions per metric (for transfer)
-├── {model}_{dataset}_mc_{metric}_results.json   # Stats per metric (R², MAE, bootstrap CIs)
-└── {model}_{dataset}_mc_{metric}_results.png    # R² curves per method
-```
+Both methods are computed automatically and compared in every stage.
 
-### identify_nexttoken_correlate.py
+## Shared Parameters
 
-Find internal correlates on general next-token prediction.
+These constants must match across scripts for consistent results:
 
-**Configuration**:
-```python
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-DATASET_PATH = None  # auto-detects from model name
-METRICS = ["entropy", "logit_gap"]
-```
+| Parameter | Default | Used by |
+|-----------|---------|---------|
+| `SEED` | `42` | All scripts |
+| `PROBE_ALPHA` | `1000.0` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset |
+| `PROBE_PCA_COMPONENTS` | `100` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset |
+| `TRAIN_SPLIT` | `0.8` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset, ablation, steering |
+| `MEAN_DIFF_QUANTILE` | `0.25` | identify_mc, identify_nexttoken, test_meta, test_cross_dataset |
 
-**Requires**: Stratified dataset from `build_nexttoken_dataset.py`
+These are marked with `# Must match across scripts` in each file's constant block.
 
-**Outputs**:
-```
-outputs/
-├── {model}_nexttoken_activations.npz         # Reusable activations (all layers)
-├── {model}_nexttoken_dataset.json            # Full sample metadata + all metrics
-├── {model}_nexttoken_entropy_distribution.png
-├── {model}_nexttoken_{metric}_directions.npz # Directions per metric (for transfer)
-├── {model}_nexttoken_{metric}_results.json   # Stats per metric (R², MAE, bootstrap CIs)
-└── {model}_nexttoken_{metric}_results.png    # R² curves per method
-```
+## Output Naming Convention
 
-### test_meta_transfer.py
+All outputs use the prefix `{model_short}_{dataset}` where `model_short` is derived from the HuggingFace model name (e.g., `Llama-3.1-8B-Instruct`). When quantization is enabled, a suffix is appended (e.g., `Llama-3.1-8B-Instruct_4bit`).
 
-Test transfer from direct task to meta-judgment.
-
-**Configuration**:
-```python
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_SimpleMC"  # Loads _directions.npz + _dataset.json
-META_TASK = "confidence"  # or "delegate"
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-METRICS = ["entropy", "logit_gap"]
-```
-
-**Output**: `outputs/{model}_{dataset}_transfer_{meta_task}.npz`
-
-Contains:
-- Transfer R² for each metric × method × layer
-- Behavioral correlation (stated confidence vs actual uncertainty)
-- Comparison of which method transfers best
+| Stage | File pattern | Description |
+|-------|-------------|-------------|
+| **Identify** | `*_mc_activations.npz` | Reusable activations (all layers) |
+| | `*_mc_dataset.json` | Question metadata + all metrics |
+| | `*_mc_{metric}_directions.npz` | Directions per metric (for transfer) |
+| | `*_mc_{metric}_probes.joblib` | Trained probes per layer |
+| | `*_mc_{metric}_results.json` | Per-layer R², MAE, bootstrap CIs |
+| | `*_mc_answer_directions.npz` | Answer directions (classifier + centroid) |
+| | `*_mc_answer_probes.joblib` | 4-class answer probes per layer |
+| | `*_mc_answer_results.json` | Per-layer answer accuracy |
+| | `*_mc_distributions.png` | Metric distributions (one row per metric) |
+| | `*_mc_directions.png` | 4-panel directions summary |
+| **Identify (next-token)** | `*_nexttoken_activations.npz` | Reusable activations (all layers) |
+| | `*_nexttoken_dataset.json` | Sample metadata + metric values |
+| | `*_nexttoken_{metric}_directions.npz` | Directions per metric |
+| | `*_nexttoken_{metric}_results.json` | Per-layer R², CIs |
+| | `*_nexttoken_{metric}_results.png` | R² curves per method |
+| | `*_nexttoken_token_results.json` | Token prediction accuracy |
+| **Meta-task** | `*_meta_{task}_activations.npz` | Meta-task activations |
+| | `*_meta_{task}_results.json` | Transfer R², behavioral analysis |
+| | `*_meta_{task}_results.png` | Transfer plots |
+| | `*_meta_{task}_confidence_directions.npz` | Confidence directions |
+| **Causality** | `*_ablation_{task}_{metric}_results.json` | Ablation effects + FDR |
+| | `*_ablation_{task}_{metric}_results.png` | Ablation plots |
+| | `*_steering_{task}_{metric}_results.json` | Steering dose-response |
+| | `*_steering_{task}_{metric}_results.png` | Steering plots |
+| | `*_cross_direction_{metric}_results.json` | Cross-direction effects |
+| | `*_cross_direction_{metric}_results.png` | Cross-direction heatmaps |
+| | `*_cross_direction_{metric}_ablation_effect.png` | Single ablation trajectory plot |
+| **Interpret** | `*_direction_analysis.json` | Logit lens + similarity |
+| | `*_direction_comparison.json` | Direction type comparison |
+| | `*_direction_comparison.png` | Comparison plots |
+| **Summary** | `*_summary.json` | Cross-stage aggregation |
 
 ## Metrics
 
@@ -250,43 +236,73 @@ All computed automatically:
 
 Linear metrics (logit_gap, top_logit) are generally better targets for linear probes.
 
-## Core Library
-
-The `core/` directory provides reusable utilities:
-
-- `model_utils.py`: Model loading, quantization support
-- `extraction.py`: Batched activation extraction
-- `metrics.py`: Uncertainty metric computation
-- `directions.py`: Uncertainty direction finding (probe, mean_diff)
-- `answer_directions.py`: MC answer direction finding (4-class classification)
-- `confidence_directions.py`: Confidence direction finding from meta-task activations
-- `steering.py`: Activation intervention hooks
-
-## Key Files
+## Project Layout
 
 ```
 entropy_probes/
-├── identify_mc_correlate.py          # Find uncertainty directions (MC task)
-├── identify_nexttoken_correlate.py   # Find uncertainty directions (next-token task)
-├── identify_mc_answer_correlate.py   # Find MC answer directions
-├── identify_confidence_correlate.py  # Find confidence directions from meta-task
-├── test_meta_transfer.py             # Test D2M transfer
-├── compare_direction_types.py        # Compare direction types
-├── run_ablation_causality.py         # Ablation causality test
-├── core/
-│   ├── metrics.py                    # Metric computation
-│   ├── directions.py                 # Uncertainty direction finding
-│   ├── answer_directions.py          # MC answer direction finding
-│   ├── confidence_directions.py      # Confidence direction finding
-│   ├── extraction.py                 # Activation extraction
-│   ├── steering.py                   # Activation intervention hooks
-│   ├── steering_experiments.py       # Ablation experiment utilities
-│   └── model_utils.py                # Model loading
-├── tasks.py                          # Prompt templates
-├── filter_by_difficulty.py           # Filter by model correctness
-├── outputs/                          # Results
-└── data/                             # Question datasets (see below)
+  # Stage 1: Identify directions
+  identify_mc_correlate.py           # MC uncertainty + answer directions
+  identify_nexttoken_correlate.py    # Next-token uncertainty directions
+
+  # Stage 2: Transfer to meta-task
+  test_meta_transfer.py              # D→M transfer + confidence directions
+  test_cross_dataset_transfer.py     # Cross-dataset generalization
+
+  # Stage 3: Causal tests
+  run_ablation_causality.py          # Ablation (uncertainty/answer/confidence)
+  run_steering_causality.py          # Steering dose-response
+  run_activation_patching.py         # Full activation patching
+  run_cross_direction_causality.py   # Cross-direction causal effects
+  plot_ablation_effect.py            # Visualize single cross-direction ablation
+
+  # Stage 4: Interpretation
+  analyze_directions.py              # Logit lens + direction similarity
+  compare_direction_types.py         # Uncertainty vs answer vs confidence
+  act_oracles.py                     # Activation oracle interpretation
+  ao_interpreter.py                  # AO library
+
+  # Cross-stage
+  summarize_results.py               # Cross-stage consolidation
+  cross_predict_confidence.py        # Self vs other-confidence cross-prediction
+  synthesize_causal_results.py       # Synthesize ablation + steering results
+
+  # Utilities
+  filter_by_difficulty.py            # Create balanced datasets
+  build_nexttoken_dataset.py         # Stratified next-token dataset
+
+  # Support modules
+  tasks.py                           # Prompt templates
+  load_and_format_datasets.py        # Dataset loaders
+
+  # Library
+  core/
+    model_utils.py                   # Model loading, quantization
+    extraction.py                    # Batched activation extraction
+    metrics.py                       # Uncertainty metric computation
+    directions.py                    # Uncertainty direction finding (probe, mean_diff)
+    answer_directions.py             # MC answer direction finding
+    confidence_directions.py         # Confidence direction finding
+    probes.py                        # Probe training utilities
+    questions.py                     # Question handling utilities
+    steering.py                      # Activation intervention hooks
+    steering_experiments.py          # Ablation/steering experiment utilities
+    config_utils.py                  # get_config_dict() for JSON metadata
+    plotting.py                      # Centralized visualization helpers
+
+  # Archived
+  archive/                           # 22 legacy/debug/one-off scripts
+  archive/originals/                 # Pre-modification snapshots
 ```
+
+## Visualization
+
+All plotting uses centralized helpers from `core/plotting.py`. Colors, figure sizes, DPI, grid style, CI band opacity, and marker styles are defined once and used by all scripts. To change how plots look:
+
+- **Colors**: Edit `METHOD_COLORS`, `DIRECTION_COLORS`, `TASK_COLORS`, `SIGNIFICANCE_COLORS`, `CONDITION_COLORS`
+- **Figure sizes**: Edit `SINGLE_PANEL`, `TWO_PANEL_WIDE`, `THREE_PANEL_WIDE`, etc.
+- **Styling**: Edit `DPI`, `GRID_ALPHA`, `CI_ALPHA`, `MARKER_SIZE`, `LINE_WIDTH`
+
+Scripts compose figures using helpers like `plot_layer_metric()`, `mark_significant_layers()`, `save_figure()`, etc.
 
 ## Datasets
 
@@ -315,13 +331,6 @@ Creates `data/TriviaMC_difficulty_filtered.jsonl` with 250 correct + 250 incorre
 DATASET = "TriviaMC_difficulty_filtered"
 ```
 
-The filtered dataset plugs directly into the existing pipeline.
+## Archive
 
-## Legacy Scripts
-
-The original experiment scripts remain in the root directory for reference:
-- `run_introspection_experiment.py` - Original monolithic experiment
-- `mc_entropy_probe.py` - Original MC probe training
-- `nexttoken_entropy_probe.py` - Original next-token probe training
-
-These are superseded by the cleaner scripts but kept for backwards compatibility.
+Legacy, debug, and one-off scripts are in `archive/` with an `archive/README.md` explaining their provenance. Pre-modification snapshots of scripts changed during the consolidation are in `archive/originals/`.

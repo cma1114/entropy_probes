@@ -1,19 +1,21 @@
 """
-Stage 4. Compares uncertainty vs answer vs confidence directions to test whether
-D2M transfer is confounded by answer encoding, and whether confidence directions
-are aligned with uncertainty directions or specific to self vs other.
+Compare different direction types: uncertainty, answer, and confidence.
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz                  Uncertainty directions
-    outputs/{base}_mc_answer_directions.npz                    Answer directions
-    outputs/{base}_meta_{task}_confidence_directions.npz       Confidence directions
+This script provides unified comparison of all direction types to test:
+1. Is D2M transfer confounded by answer encoding?
+2. Are confidence directions aligned with uncertainty directions?
+3. Is transfer specific to self-confidence vs other-confidence?
+
+Loads from:
+- {base}_mc_{metric}_directions.npz: Uncertainty directions from identify_mc_correlate.py
+- {base}_mc_answer_directions.npz: Answer directions from identify_mc_answer_correlate.py
+- {base}_{META_TASK}_confidence_directions.npz: Confidence directions from identify_confidence_correlate.py
 
 Outputs:
-    outputs/{base}_direction_comparison.json    Full comparison metrics
-    outputs/{base}_direction_comparison.png     Multi-panel comparison visualization
+- {base}_direction_comparison.json: Full comparison metrics
+- {base}_direction_comparison.png: Multi-panel comparison visualization
 
-Run after: identify_mc_correlate.py (with FIND_ANSWER_DIRECTIONS=True),
-           test_meta_transfer.py (with FIND_CONFIDENCE_DIRECTIONS=True)
+Configuration is set at the top of the script - no CLI args needed.
 """
 
 from pathlib import Path
@@ -22,23 +24,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Optional, List
 
-from core.plotting import save_figure, GRID_ALPHA
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
+# Base name for input files
 INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC_difficulty_filtered"
-UNCERTAINTY_METRIC = "logit_gap"  # Which uncertainty metric to compare
 
-# --- Script-specific ---
+# Which uncertainty metric to compare (from identify_mc_correlate.py)
+UNCERTAINTY_METRIC = "logit_gap"  # or "entropy"
+
 # Which confidence task(s) to compare
 # Options: "delegate", "confidence", "other_confidence"
 # If multiple, will compare self vs other
 CONFIDENCE_TASKS = ["delegate", "other_confidence"]
 
-# --- Output ---
+# Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 
 
@@ -356,14 +357,17 @@ def plot_comparison_results(
         title = comp_name.replace("_", " ").title()
         ax.set_title(f"{title}\nmean={mean_cos:.3f}, max|cos|={max_abs:.3f} (L{max_layer})", fontsize=9)
 
-        ax.grid(True, alpha=GRID_ALPHA)
+        ax.grid(True, alpha=0.3)
 
     # Hide empty subplots
     for idx in range(n_comparisons, n_rows * n_cols):
         row, col = divmod(idx, n_cols)
         axes[row, col].axis('off')
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 def print_summary(results: Dict):
@@ -383,17 +387,7 @@ def print_summary(results: Dict):
 
         summary = comp_data["summary"]
         print(f"\n{comp_name.replace('_', ' ').upper()}:")
-        # Bootstrap CI on mean |cosine| by resampling per-layer values
-        by_layer = comp_data.get("by_layer", {})
-        if by_layer:
-            abs_cos_values = np.array([v["abs_cosine_similarity"] for v in by_layer.values()])
-            rng = np.random.RandomState(42)
-            boot_means = [np.mean(rng.choice(abs_cos_values, size=len(abs_cos_values), replace=True))
-                          for _ in range(2000)]
-            ci_lo, ci_hi = np.percentile(boot_means, [2.5, 97.5])
-            print(f"  Mean |cosine|: {summary['mean_abs_cosine']:.3f} [95% CI: {ci_lo:.3f}, {ci_hi:.3f}]")
-        else:
-            print(f"  Mean cosine similarity: {summary['mean_cosine']:.3f} (std={summary['std_cosine']:.3f})")
+        print(f"  Mean cosine similarity: {summary['mean_cosine']:.3f} ± {summary['std_cosine']:.3f}")
         print(f"  Max |cosine|: {summary['max_abs_cosine']:.3f} at layer {summary['max_abs_cosine_layer']}")
 
     # Interpretations

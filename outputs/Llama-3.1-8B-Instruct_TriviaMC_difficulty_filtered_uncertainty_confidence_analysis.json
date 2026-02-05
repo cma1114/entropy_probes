@@ -1,0 +1,1022 @@
+{
+  "config": {
+    "input_base": "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered",
+    "meta_task": "confidence",
+    "metric": "logit_gap",
+    "method": "mean_diff",
+    "focus_layers": [
+      13,
+      14,
+      15,
+      16,
+      17
+    ],
+    "bootstrap_n": 2000,
+    "timestamp": "2026-02-04T02:51:33.707381",
+    "git_hash": "unknown"
+  },
+  "projection_correlations": {
+    "0": {
+      "mc_task": {
+        "correlation": -0.0019261965062469244,
+        "p_value": 0.9657310157751953,
+        "ci_low": -0.08397023379802704,
+        "ci_high": 0.08141979575157166,
+        "n_samples": 500,
+        "unc_proj_mean": 0.03714649751782417,
+        "unc_proj_std": 0.009538909420371056,
+        "conf_proj_mean": -0.054360758513212204,
+        "conf_proj_std": 0.01143397856503725,
+        "interpretation": "NEAR ZERO: Directions are approximately orthogonal"
+      }
+    },
+    "1": {
+      "mc_task": {
+        "correlation": 0.23217257857322693,
+        "p_value": 1.51722651375063e-07,
+        "ci_low": 0.14263011515140533,
+        "ci_high": 0.3136080801486969,
+        "n_samples": 500,
+        "unc_proj_mean": -0.0670425295829773,
+        "unc_proj_std": 0.013846478424966335,
+        "conf_proj_mean": -0.020816588774323463,
+        "conf_proj_std": 0.019575797021389008,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "2": {
+      "mc_task": {
+        "correlation": 0.09026876837015152,
+        "p_value": 0.04363933182200799,
+        "ci_low": 0.004629341419786215,
+        "ci_high": 0.17331737279891968,
+        "n_samples": 500,
+        "unc_proj_mean": 0.08468951284885406,
+        "unc_proj_std": 0.019176101312041283,
+        "conf_proj_mean": 0.07782793790102005,
+        "conf_proj_std": 0.026195663958787918,
+        "interpretation": "NEAR ZERO: Directions are approximately orthogonal"
+      }
+    },
+    "3": {
+      "mc_task": {
+        "correlation": -0.170962393283844,
+        "p_value": 0.00012224272564565842,
+        "ci_low": -0.2544148564338684,
+        "ci_high": -0.08693765848875046,
+        "n_samples": 500,
+        "unc_proj_mean": 0.20275063812732697,
+        "unc_proj_std": 0.03502575308084488,
+        "conf_proj_mean": -0.09090837836265564,
+        "conf_proj_std": 0.03288833051919937,
+        "interpretation": "NEGATIVE: Supports inhibition hypothesis - uncertainty suppresses confidence"
+      }
+    },
+    "4": {
+      "mc_task": {
+        "correlation": -0.09020993113517761,
+        "p_value": 0.043777004011575374,
+        "ci_low": -0.1726405769586563,
+        "ci_high": -0.006892153061926365,
+        "n_samples": 500,
+        "unc_proj_mean": 0.20887768268585205,
+        "unc_proj_std": 0.04826248437166214,
+        "conf_proj_mean": -0.03436218947172165,
+        "conf_proj_std": 0.034344274550676346,
+        "interpretation": "NEAR ZERO: Directions are approximately orthogonal"
+      }
+    },
+    "5": {
+      "mc_task": {
+        "correlation": 0.10935066640377045,
+        "p_value": 0.014430054036424897,
+        "ci_low": 0.029788218438625336,
+        "ci_high": 0.19070927798748016,
+        "n_samples": 500,
+        "unc_proj_mean": 0.7009924054145813,
+        "unc_proj_std": 0.06044287234544754,
+        "conf_proj_mean": -0.01098692324012518,
+        "conf_proj_std": 0.029232705011963844,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "6": {
+      "mc_task": {
+        "correlation": 0.09444022923707962,
+        "p_value": 0.03475662110291982,
+        "ci_low": 0.009544868022203445,
+        "ci_high": 0.17913943529129028,
+        "n_samples": 500,
+        "unc_proj_mean": 0.44666439294815063,
+        "unc_proj_std": 0.06752368807792664,
+        "conf_proj_mean": 0.2108919322490692,
+        "conf_proj_std": 0.030624639242887497,
+        "interpretation": "NEAR ZERO: Directions are approximately orthogonal"
+      }
+    },
+    "7": {
+      "mc_task": {
+        "correlation": 0.2149849683046341,
+        "p_value": 1.22205896574145e-06,
+        "ci_low": 0.12938573956489563,
+        "ci_high": 0.29595914483070374,
+        "n_samples": 500,
+        "unc_proj_mean": 0.39372140169143677,
+        "unc_proj_std": 0.07296507060527802,
+        "conf_proj_mean": 0.2520769238471985,
+        "conf_proj_std": 0.029808932915329933,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "8": {
+      "mc_task": {
+        "correlation": 0.28064778447151184,
+        "p_value": 1.674064311319198e-10,
+        "ci_low": 0.20269078016281128,
+        "ci_high": 0.3547596335411072,
+        "n_samples": 500,
+        "unc_proj_mean": 0.42562419176101685,
+        "unc_proj_std": 0.08322340995073318,
+        "conf_proj_mean": 0.25896668434143066,
+        "conf_proj_std": 0.04176635295152664,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "9": {
+      "mc_task": {
+        "correlation": 0.23447750508785248,
+        "p_value": 1.1324559329789512e-07,
+        "ci_low": 0.154374897480011,
+        "ci_high": 0.30915284156799316,
+        "n_samples": 500,
+        "unc_proj_mean": 0.4930357038974762,
+        "unc_proj_std": 0.12215382605791092,
+        "conf_proj_mean": 0.2973332405090332,
+        "conf_proj_std": 0.05375588685274124,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "10": {
+      "mc_task": {
+        "correlation": 0.3995895981788635,
+        "p_value": 1.3640227808760462e-20,
+        "ci_low": 0.3248835802078247,
+        "ci_high": 0.4669376611709595,
+        "n_samples": 500,
+        "unc_proj_mean": 0.4877440333366394,
+        "unc_proj_std": 0.14769579470157623,
+        "conf_proj_mean": 1.0449039936065674,
+        "conf_proj_std": 0.04757952317595482,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "11": {
+      "mc_task": {
+        "correlation": 0.32443884015083313,
+        "p_value": 1.0170244421462145e-13,
+        "ci_low": 0.2455923855304718,
+        "ci_high": 0.3989110291004181,
+        "n_samples": 500,
+        "unc_proj_mean": 0.9879129528999329,
+        "unc_proj_std": 0.1686970740556717,
+        "conf_proj_mean": 0.08759231865406036,
+        "conf_proj_std": 0.045340023934841156,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "12": {
+      "mc_task": {
+        "correlation": 0.790848433971405,
+        "p_value": 2.8902561045829574e-108,
+        "ci_low": 0.7577240467071533,
+        "ci_high": 0.8221417665481567,
+        "n_samples": 500,
+        "unc_proj_mean": 0.3775755763053894,
+        "unc_proj_std": 0.24403303861618042,
+        "conf_proj_mean": -0.3805543780326843,
+        "conf_proj_std": 0.12057130038738251,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "13": {
+      "mc_task": {
+        "correlation": 0.9614370465278625,
+        "p_value": 2.3861636864710576e-281,
+        "ci_low": 0.9558060765266418,
+        "ci_high": 0.966873824596405,
+        "n_samples": 500,
+        "unc_proj_mean": 0.8202528953552246,
+        "unc_proj_std": 0.6486078500747681,
+        "conf_proj_mean": 1.0944722890853882,
+        "conf_proj_std": 0.4154292047023773,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "14": {
+      "mc_task": {
+        "correlation": 0.9541072249412537,
+        "p_value": 6.219740606420796e-263,
+        "ci_low": 0.9476779103279114,
+        "ci_high": 0.9603051543235779,
+        "n_samples": 500,
+        "unc_proj_mean": -0.08973247557878494,
+        "unc_proj_std": 0.9492951035499573,
+        "conf_proj_mean": 0.34476181864738464,
+        "conf_proj_std": 0.5708693861961365,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "15": {
+      "mc_task": {
+        "correlation": 0.9051445126533508,
+        "p_value": 3.8624978753281187e-187,
+        "ci_low": 0.8870262503623962,
+        "ci_high": 0.9198576211929321,
+        "n_samples": 500,
+        "unc_proj_mean": -0.6711617112159729,
+        "unc_proj_std": 1.1497360467910767,
+        "conf_proj_mean": 0.23309768736362457,
+        "conf_proj_std": 0.5609886646270752,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "16": {
+      "mc_task": {
+        "correlation": 0.8997073173522949,
+        "p_value": 2.0315704018029988e-181,
+        "ci_low": 0.8729536533355713,
+        "ci_high": 0.9226022958755493,
+        "n_samples": 500,
+        "unc_proj_mean": 0.4709036350250244,
+        "unc_proj_std": 1.334946632385254,
+        "conf_proj_mean": 0.4626219868659973,
+        "conf_proj_std": 0.6551790237426758,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "17": {
+      "mc_task": {
+        "correlation": 0.7903217673301697,
+        "p_value": 5.02783697836989e-108,
+        "ci_low": 0.7613183856010437,
+        "ci_high": 0.817110538482666,
+        "n_samples": 500,
+        "unc_proj_mean": -0.1422034651041031,
+        "unc_proj_std": 1.5716997385025024,
+        "conf_proj_mean": 0.481925904750824,
+        "conf_proj_std": 0.5971190333366394,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "18": {
+      "mc_task": {
+        "correlation": 0.806827187538147,
+        "p_value": 6.586499727328023e-116,
+        "ci_low": 0.778163731098175,
+        "ci_high": 0.8332102298736572,
+        "n_samples": 500,
+        "unc_proj_mean": -0.06965481489896774,
+        "unc_proj_std": 1.7512178421020508,
+        "conf_proj_mean": 0.5776807069778442,
+        "conf_proj_std": 0.6001912951469421,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "19": {
+      "mc_task": {
+        "correlation": 0.7922563552856445,
+        "p_value": 6.527832210707209e-109,
+        "ci_low": 0.7603509426116943,
+        "ci_high": 0.8227044939994812,
+        "n_samples": 500,
+        "unc_proj_mean": 0.3829434812068939,
+        "unc_proj_std": 1.8372468948364258,
+        "conf_proj_mean": 1.2565268278121948,
+        "conf_proj_std": 0.6363222002983093,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "20": {
+      "mc_task": {
+        "correlation": 0.7855909466743469,
+        "p_value": 6.770936954932622e-106,
+        "ci_low": 0.7513232231140137,
+        "ci_high": 0.819118320941925,
+        "n_samples": 500,
+        "unc_proj_mean": 0.3123987913131714,
+        "unc_proj_std": 1.9797401428222656,
+        "conf_proj_mean": 1.4054884910583496,
+        "conf_proj_std": 0.6021230816841125,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "21": {
+      "mc_task": {
+        "correlation": 0.7065735459327698,
+        "p_value": 8.119806869235584e-77,
+        "ci_low": 0.6647608280181885,
+        "ci_high": 0.7498418092727661,
+        "n_samples": 500,
+        "unc_proj_mean": -0.15133987367153168,
+        "unc_proj_std": 2.0903279781341553,
+        "conf_proj_mean": 2.0406744480133057,
+        "conf_proj_std": 0.6054404973983765,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "22": {
+      "mc_task": {
+        "correlation": 0.695052981376648,
+        "p_value": 2.2318992002461306e-73,
+        "ci_low": 0.6520799398422241,
+        "ci_high": 0.737825870513916,
+        "n_samples": 500,
+        "unc_proj_mean": -1.0928078889846802,
+        "unc_proj_std": 2.285342216491699,
+        "conf_proj_mean": 1.7012592554092407,
+        "conf_proj_std": 0.5979099869728088,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "23": {
+      "mc_task": {
+        "correlation": 0.7154349684715271,
+        "p_value": 1.406324344098574e-79,
+        "ci_low": 0.6745583415031433,
+        "ci_high": 0.7560685873031616,
+        "n_samples": 500,
+        "unc_proj_mean": -2.0316836833953857,
+        "unc_proj_std": 2.4247097969055176,
+        "conf_proj_mean": 1.5800341367721558,
+        "conf_proj_std": 0.6254369020462036,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "24": {
+      "mc_task": {
+        "correlation": 0.7243272066116333,
+        "p_value": 1.8568311926522937e-82,
+        "ci_low": 0.6847308278083801,
+        "ci_high": 0.7640686631202698,
+        "n_samples": 500,
+        "unc_proj_mean": -2.593733787536621,
+        "unc_proj_std": 2.7564022541046143,
+        "conf_proj_mean": 1.1787519454956055,
+        "conf_proj_std": 0.6386113166809082,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "25": {
+      "mc_task": {
+        "correlation": 0.7316007018089294,
+        "p_value": 6.731550119702296e-85,
+        "ci_low": 0.6931148767471313,
+        "ci_high": 0.7688215374946594,
+        "n_samples": 500,
+        "unc_proj_mean": -1.6554893255233765,
+        "unc_proj_std": 2.9669923782348633,
+        "conf_proj_mean": 1.3792129755020142,
+        "conf_proj_std": 0.7033371329307556,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "26": {
+      "mc_task": {
+        "correlation": 0.7294265627861023,
+        "p_value": 3.681109702232115e-84,
+        "ci_low": 0.6928989291191101,
+        "ci_high": 0.7652773261070251,
+        "n_samples": 500,
+        "unc_proj_mean": -2.9857425689697266,
+        "unc_proj_std": 3.3270089626312256,
+        "conf_proj_mean": 0.8882222175598145,
+        "conf_proj_std": 0.7897729277610779,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "27": {
+      "mc_task": {
+        "correlation": 0.6995351910591125,
+        "p_value": 1.072096449524028e-74,
+        "ci_low": 0.662326991558075,
+        "ci_high": 0.736684262752533,
+        "n_samples": 500,
+        "unc_proj_mean": -3.306849718093872,
+        "unc_proj_std": 3.706242799758911,
+        "conf_proj_mean": 2.1964921951293945,
+        "conf_proj_std": 0.815352737903595,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "28": {
+      "mc_task": {
+        "correlation": 0.7629067301750183,
+        "p_value": 2.167617934685369e-96,
+        "ci_low": 0.7314861416816711,
+        "ci_high": 0.7932808995246887,
+        "n_samples": 500,
+        "unc_proj_mean": -2.271702527999878,
+        "unc_proj_std": 4.095167636871338,
+        "conf_proj_mean": 1.0999587774276733,
+        "conf_proj_std": 0.9227510094642639,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "29": {
+      "mc_task": {
+        "correlation": 0.755454421043396,
+        "p_value": 1.6937223320909748e-93,
+        "ci_low": 0.725679337978363,
+        "ci_high": 0.7860081791877747,
+        "n_samples": 500,
+        "unc_proj_mean": -2.2452805042266846,
+        "unc_proj_std": 4.620349884033203,
+        "conf_proj_mean": 1.9964669942855835,
+        "conf_proj_std": 0.9625925421714783,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "30": {
+      "mc_task": {
+        "correlation": 0.5409737825393677,
+        "p_value": 2.3790794406100334e-39,
+        "ci_low": 0.4936738610267639,
+        "ci_high": 0.5901185870170593,
+        "n_samples": 500,
+        "unc_proj_mean": -4.524293422698975,
+        "unc_proj_std": 5.628417491912842,
+        "conf_proj_mean": 2.954784393310547,
+        "conf_proj_std": 1.0406328439712524,
+        "interpretation": "POSITIVE: Against inhibition hypothesis - uncertainty tracks with confidence"
+      }
+    },
+    "31": {
+      "mc_task": {
+        "correlation": -0.5363008975982666,
+        "p_value": 1.4027999328193618e-38,
+        "ci_low": -0.5990262031555176,
+        "ci_high": -0.4696180522441864,
+        "n_samples": 500,
+        "unc_proj_mean": -30.315418243408203,
+        "unc_proj_std": 9.461196899414062,
+        "conf_proj_mean": 3.1307191848754883,
+        "conf_proj_std": 2.056428909301758,
+        "interpretation": "NEGATIVE: Supports inhibition hypothesis - uncertainty suppresses confidence"
+      }
+    }
+  },
+  "direction_decomposition": {
+    "0": {
+      "cosine_similarity": 0.35778096318244934,
+      "variance_explained_by_uncertainty": 0.12800721761576117,
+      "orthogonal_component_norm": 0.933805525302887,
+      "null_distribution": {
+        "mean": 0.0005635950859868899,
+        "std": 0.015450019904999479,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 23.12083546124561,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.358, z=23.1\n  12.8% of confidence direction is along +uncertainty"
+    },
+    "1": {
+      "cosine_similarity": 0.34453433752059937,
+      "variance_explained_by_uncertainty": 0.11870390973075828,
+      "orthogonal_component_norm": 0.9387738704681396,
+      "null_distribution": {
+        "mean": -1.6215265030041336e-05,
+        "std": 0.015898581421192312,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 21.67177961716473,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.345, z=21.7\n  11.9% of confidence direction is along +uncertainty"
+    },
+    "2": {
+      "cosine_similarity": 0.3390378952026367,
+      "variance_explained_by_uncertainty": 0.11494669438343408,
+      "orthogonal_component_norm": 0.9407727122306824,
+      "null_distribution": {
+        "mean": -0.000593183066113852,
+        "std": 0.015743855757776898,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 21.572293566077995,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.339, z=21.6\n  11.5% of confidence direction is along +uncertainty"
+    },
+    "3": {
+      "cosine_similarity": 0.30502694845199585,
+      "variance_explained_by_uncertainty": 0.09304143928193653,
+      "orthogonal_component_norm": 0.9523438215255737,
+      "null_distribution": {
+        "mean": -0.00023497392842546105,
+        "std": 0.015460661613859342,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 19.744428149619196,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.305, z=19.7\n  9.3% of confidence direction is along +uncertainty"
+    },
+    "4": {
+      "cosine_similarity": 0.30052638053894043,
+      "variance_explained_by_uncertainty": 0.09031610539983603,
+      "orthogonal_component_norm": 0.9537734985351562,
+      "null_distribution": {
+        "mean": -0.0006783927757060156,
+        "std": 0.015937274475576923,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 18.899390468315502,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.301, z=18.9\n  9.0% of confidence direction is along +uncertainty"
+    },
+    "5": {
+      "cosine_similarity": 0.24567188322544098,
+      "variance_explained_by_uncertainty": 0.06035467420753471,
+      "orthogonal_component_norm": 0.9693531394004822,
+      "null_distribution": {
+        "mean": -0.00032987816468812525,
+        "std": 0.015334202962399205,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 16.042683274334294,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.246, z=16.0\n  6.0% of confidence direction is along +uncertainty"
+    },
+    "6": {
+      "cosine_similarity": 0.21285071969032288,
+      "variance_explained_by_uncertainty": 0.0453054288726884,
+      "orthogonal_component_norm": 0.977084755897522,
+      "null_distribution": {
+        "mean": -0.0005602733606938273,
+        "std": 0.015147172518081486,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 14.089163690204472,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.213, z=14.1\n  4.5% of confidence direction is along +uncertainty"
+    },
+    "7": {
+      "cosine_similarity": 0.187102809548378,
+      "variance_explained_by_uncertainty": 0.035007461340896606,
+      "orthogonal_component_norm": 0.9823403358459473,
+      "null_distribution": {
+        "mean": -0.00017886663367971777,
+        "std": 0.015610254768805221,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 11.997349111579675,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.187, z=12.0\n  3.5% of confidence direction is along +uncertainty"
+    },
+    "8": {
+      "cosine_similarity": 0.17359255254268646,
+      "variance_explained_by_uncertainty": 0.03013437429828536,
+      "orthogonal_component_norm": 0.9848176836967468,
+      "null_distribution": {
+        "mean": 0.00010796509392093867,
+        "std": 0.015480827613297278,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 11.206415560092582,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.174, z=11.2\n  3.0% of confidence direction is along +uncertainty"
+    },
+    "9": {
+      "cosine_similarity": 0.18682900071144104,
+      "variance_explained_by_uncertainty": 0.03490507550683564,
+      "orthogonal_component_norm": 0.982392430305481,
+      "null_distribution": {
+        "mean": -0.00026824442413635554,
+        "std": 0.015191313745753648,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 12.31606747559116,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.187, z=12.3\n  3.5% of confidence direction is along +uncertainty"
+    },
+    "10": {
+      "cosine_similarity": 0.14519193768501282,
+      "variance_explained_by_uncertainty": 0.021080698768728645,
+      "orthogonal_component_norm": 0.9894036054611206,
+      "null_distribution": {
+        "mean": -0.0006839966906700283,
+        "std": 0.015603958776233466,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 9.348649049103349,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.145, z=9.3\n  2.1% of confidence direction is along +uncertainty"
+    },
+    "11": {
+      "cosine_similarity": 0.11415383219718933,
+      "variance_explained_by_uncertainty": 0.01303109740530406,
+      "orthogonal_component_norm": 0.9934631586074829,
+      "null_distribution": {
+        "mean": -0.0009970743604935705,
+        "std": 0.015572813099860484,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 7.394354881117435,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.114, z=7.4\n  1.3% of confidence direction is along +uncertainty"
+    },
+    "12": {
+      "cosine_similarity": 0.37146419286727905,
+      "variance_explained_by_uncertainty": 0.1379856465825391,
+      "orthogonal_component_norm": 0.9284473657608032,
+      "null_distribution": {
+        "mean": -0.0003130375802284107,
+        "std": 0.016230328111291378,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 22.906328688996958,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.371, z=22.9\n  13.8% of confidence direction is along +uncertainty"
+    },
+    "13": {
+      "cosine_similarity": 0.5732797384262085,
+      "variance_explained_by_uncertainty": 0.32864965849002203,
+      "orthogonal_component_norm": 0.8193597793579102,
+      "null_distribution": {
+        "mean": 0.0005681161904940382,
+        "std": 0.015919957069606337,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 35.974445140251646,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.573, z=36.0\n  32.9% of confidence direction is along +uncertainty"
+    },
+    "14": {
+      "cosine_similarity": 0.5515152215957642,
+      "variance_explained_by_uncertainty": 0.30416903965182485,
+      "orthogonal_component_norm": 0.8341649174690247,
+      "null_distribution": {
+        "mean": 0.0002772207910893485,
+        "std": 0.01499265567814225,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 36.767202064696455,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.552, z=36.8\n  30.4% of confidence direction is along +uncertainty"
+    },
+    "15": {
+      "cosine_similarity": 0.41587933897972107,
+      "variance_explained_by_uncertainty": 0.17295562459020974,
+      "orthogonal_component_norm": 0.9094197750091553,
+      "null_distribution": {
+        "mean": -1.733305910602212e-05,
+        "std": 0.015077713458302769,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 27.583537330708946,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.416, z=27.6\n  17.3% of confidence direction is along +uncertainty"
+    },
+    "16": {
+      "cosine_similarity": 0.41097158193588257,
+      "variance_explained_by_uncertainty": 0.16889764115888184,
+      "orthogonal_component_norm": 0.911648154258728,
+      "null_distribution": {
+        "mean": -0.0003747491703834385,
+        "std": 0.01512608789470702,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 27.19449562700253,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.411, z=27.2\n  16.9% of confidence direction is along +uncertainty"
+    },
+    "17": {
+      "cosine_similarity": 0.27098390460014343,
+      "variance_explained_by_uncertainty": 0.07343227655233964,
+      "orthogonal_component_norm": 0.9625838994979858,
+      "null_distribution": {
+        "mean": -0.0007461523414822296,
+        "std": 0.015467734065694815,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 17.567541295158637,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.271, z=17.6\n  7.3% of confidence direction is along +uncertainty"
+    },
+    "18": {
+      "cosine_similarity": 0.25082898139953613,
+      "variance_explained_by_uncertainty": 0.06291517790992884,
+      "orthogonal_component_norm": 0.9680314660072327,
+      "null_distribution": {
+        "mean": -0.00030004586360882966,
+        "std": 0.01564969013903759,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 16.046900931074195,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.251, z=16.0\n  6.3% of confidence direction is along +uncertainty"
+    },
+    "19": {
+      "cosine_similarity": 0.24438604712486267,
+      "variance_explained_by_uncertainty": 0.0597245400293156,
+      "orthogonal_component_norm": 0.9696780443191528,
+      "null_distribution": {
+        "mean": -1.4114471152424813e-05,
+        "std": 0.015340289762756826,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 15.931912980507715,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.244, z=15.9\n  6.0% of confidence direction is along +uncertainty"
+    },
+    "20": {
+      "cosine_similarity": 0.2117397040128708,
+      "variance_explained_by_uncertainty": 0.04483370225545813,
+      "orthogonal_component_norm": 0.9773262143135071,
+      "null_distribution": {
+        "mean": -0.00042054047016426923,
+        "std": 0.015416900576544728,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 13.76153679072275,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.212, z=13.8\n  4.5% of confidence direction is along +uncertainty"
+    },
+    "21": {
+      "cosine_similarity": 0.17838512361049652,
+      "variance_explained_by_uncertainty": 0.03182125232553212,
+      "orthogonal_component_norm": 0.9839606881141663,
+      "null_distribution": {
+        "mean": -0.00037411980493925513,
+        "std": 0.015562887848795136,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 11.48625146902123,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.178, z=11.5\n  3.2% of confidence direction is along +uncertainty"
+    },
+    "22": {
+      "cosine_similarity": 0.157632976770401,
+      "variance_explained_by_uncertainty": 0.02484815536549778,
+      "orthogonal_component_norm": 0.9874977469444275,
+      "null_distribution": {
+        "mean": -0.00046908597997389733,
+        "std": 0.015670520745227505,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 10.089139047821703,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.158, z=10.1\n  2.5% of confidence direction is along +uncertainty"
+    },
+    "23": {
+      "cosine_similarity": 0.15822778642177582,
+      "variance_explained_by_uncertainty": 0.025036032395935104,
+      "orthogonal_component_norm": 0.9874026775360107,
+      "null_distribution": {
+        "mean": -0.00037665955792181194,
+        "std": 0.015311073256385904,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 10.35880655286835,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.158, z=10.4\n  2.5% of confidence direction is along +uncertainty"
+    },
+    "24": {
+      "cosine_similarity": 0.14671656489372253,
+      "variance_explained_by_uncertainty": 0.021525750414213896,
+      "orthogonal_component_norm": 0.9891785383224487,
+      "null_distribution": {
+        "mean": -0.0003440153057454154,
+        "std": 0.015156252473938158,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 9.702964532449236,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.147, z=9.7\n  2.2% of confidence direction is along +uncertainty"
+    },
+    "25": {
+      "cosine_similarity": 0.15052799880504608,
+      "variance_explained_by_uncertainty": 0.022658678424251955,
+      "orthogonal_component_norm": 0.988605797290802,
+      "null_distribution": {
+        "mean": -0.0003405863353982568,
+        "std": 0.015454907848180165,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 9.761856015091627,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.151, z=9.8\n  2.3% of confidence direction is along +uncertainty"
+    },
+    "26": {
+      "cosine_similarity": 0.15259510278701782,
+      "variance_explained_by_uncertainty": 0.023285265394580534,
+      "orthogonal_component_norm": 0.9882888197898865,
+      "null_distribution": {
+        "mean": -0.0003717351543018594,
+        "std": 0.015463136058310433,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 9.892355429357417,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.153, z=9.9\n  2.3% of confidence direction is along +uncertainty"
+    },
+    "27": {
+      "cosine_similarity": 0.1355915367603302,
+      "variance_explained_by_uncertainty": 0.018385064841027976,
+      "orthogonal_component_norm": 0.9907649159431458,
+      "null_distribution": {
+        "mean": -0.00021484773699194192,
+        "std": 0.015525946021356981,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 8.74706019913449,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.136, z=8.7\n  1.8% of confidence direction is along +uncertainty"
+    },
+    "28": {
+      "cosine_similarity": 0.1530715823173523,
+      "variance_explained_by_uncertainty": 0.02343090931313796,
+      "orthogonal_component_norm": 0.9882151484489441,
+      "null_distribution": {
+        "mean": -0.00021127766999416052,
+        "std": 0.015435527068751648,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 9.930523221177133,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.153, z=9.9\n  2.3% of confidence direction is along +uncertainty"
+    },
+    "29": {
+      "cosine_similarity": 0.1380457878112793,
+      "variance_explained_by_uncertainty": 0.019056639532436748,
+      "orthogonal_component_norm": 0.9904258847236633,
+      "null_distribution": {
+        "mean": -0.00013425557216396555,
+        "std": 0.015591535491111957,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 8.862503854236394,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.138, z=8.9\n  1.9% of confidence direction is along +uncertainty"
+    },
+    "30": {
+      "cosine_similarity": 0.08722622692584991,
+      "variance_explained_by_uncertainty": 0.007608414663719865,
+      "orthogonal_component_norm": 0.9961885809898376,
+      "null_distribution": {
+        "mean": -2.884390647523105e-05,
+        "std": 0.015584905729326519,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": 5.598690960840079,
+      "interpretation": "SIGNIFICANTLY ALIGNED: cosine=0.087, z=5.6\n  0.8% of confidence direction is along +uncertainty"
+    },
+    "31": {
+      "cosine_similarity": -0.09220567345619202,
+      "variance_explained_by_uncertainty": 0.008501886217509913,
+      "orthogonal_component_norm": 0.9957400560379028,
+      "null_distribution": {
+        "mean": 0.00010380581091158093,
+        "std": 0.015098751185423196,
+        "expected_for_d": "~1/sqrt(4096) = 0.0156"
+      },
+      "z_score": -6.113716169865892,
+      "interpretation": "SIGNIFICANTLY ANTI-ALIGNED: cosine=-0.092, z=-6.1\n  0.9% of confidence direction is along -uncertainty\n  (SUPPORTS inhibition hypothesis)"
+    }
+  },
+  "trial_level_analysis": {
+    "L13_to_L14": {
+      "error": "No result for uncertainty_L13_to_confidence_L14",
+      "guidance": "Run run_cross_direction_causality.py with SAVE_SAMPLE_LEVEL=True"
+    },
+    "L13_to_L15": {
+      "error": "No result for uncertainty_L13_to_confidence_L15",
+      "guidance": "Run run_cross_direction_causality.py with SAVE_SAMPLE_LEVEL=True"
+    },
+    "L13_to_L16": {
+      "error": "No result for uncertainty_L13_to_confidence_L16",
+      "guidance": "Run run_cross_direction_causality.py with SAVE_SAMPLE_LEVEL=True"
+    },
+    "L13_to_L17": {
+      "error": "No result for uncertainty_L13_to_confidence_L17",
+      "guidance": "Run run_cross_direction_causality.py with SAVE_SAMPLE_LEVEL=True"
+    },
+    "L14_to_L15": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.014839190989732742,
+      "aggregate_ci": [
+        0.013224581256508827,
+        0.0165766142308712
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    },
+    "L14_to_L16": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.04725633189082146,
+      "aggregate_ci": [
+        0.04430873319506645,
+        0.05032157525420189
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    },
+    "L14_to_L17": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.05333424732089043,
+      "aggregate_ci": [
+        0.05027031898498535,
+        0.05637320876121521
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    },
+    "L15_to_L16": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.015456345863640308,
+      "aggregate_ci": [
+        0.013552187941968441,
+        0.01728319562971592
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    },
+    "L15_to_L17": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.02662336640059948,
+      "aggregate_ci": [
+        0.02313750423491001,
+        0.02987946756184101
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    },
+    "L16_to_L17": {
+      "error": "Sample-level data not saved in cross-direction results",
+      "aggregate_delta": 0.004248008597642183,
+      "aggregate_ci": [
+        0.000653345079626888,
+        0.007286600302904844
+      ],
+      "guidance": "To test the inhibition hypothesis at sample level:\n1. Modify run_cross_direction_causality.py to save per-sample projections\n2. Correlate baseline_uncertainty_proj with delta_confidence_proj\n3. Positive correlation = inhibition model supported"
+    }
+  },
+  "steering_conventions": {
+    "metric": "logit_gap",
+    "metric_meaning": "Higher = more confident",
+    "direction_meaning": "+direction = toward higher metric = more confident",
+    "steering_effect": "+steering should INCREASE stated confidence",
+    "ablation_effect": "Removing direction should make model LESS confident (if causal)"
+  },
+  "synthesis": {
+    "hypothesis_tested": "Inhibition model: Uncertainty acts as an inhibitory signal on confidence. The confidence direction learned 'absence of uncertainty' = high confidence. Thus ablating uncertainty removes suppression, increasing confidence projection.",
+    "evidence": [
+      "L1: AGAINST - Sample projections are positively correlated (r=0.232, MC)",
+      "L7: AGAINST - Sample projections are positively correlated (r=0.215, MC)",
+      "L8: AGAINST - Sample projections are positively correlated (r=0.281, MC)",
+      "L9: AGAINST - Sample projections are positively correlated (r=0.234, MC)",
+      "L10: AGAINST - Sample projections are positively correlated (r=0.400, MC)",
+      "L11: AGAINST - Sample projections are positively correlated (r=0.324, MC)",
+      "L12: AGAINST - Sample projections are positively correlated (r=0.791, MC)",
+      "L13: AGAINST - Sample projections are positively correlated (r=0.961, MC)",
+      "L14: AGAINST - Sample projections are positively correlated (r=0.954, MC)",
+      "L15: AGAINST - Sample projections are positively correlated (r=0.905, MC)",
+      "L16: AGAINST - Sample projections are positively correlated (r=0.900, MC)",
+      "L17: AGAINST - Sample projections are positively correlated (r=0.790, MC)",
+      "L18: AGAINST - Sample projections are positively correlated (r=0.807, MC)",
+      "L19: AGAINST - Sample projections are positively correlated (r=0.792, MC)",
+      "L20: AGAINST - Sample projections are positively correlated (r=0.786, MC)",
+      "L21: AGAINST - Sample projections are positively correlated (r=0.707, MC)",
+      "L22: AGAINST - Sample projections are positively correlated (r=0.695, MC)",
+      "L23: AGAINST - Sample projections are positively correlated (r=0.715, MC)",
+      "L24: AGAINST - Sample projections are positively correlated (r=0.724, MC)",
+      "L25: AGAINST - Sample projections are positively correlated (r=0.732, MC)",
+      "L26: AGAINST - Sample projections are positively correlated (r=0.729, MC)",
+      "L27: AGAINST - Sample projections are positively correlated (r=0.700, MC)",
+      "L28: AGAINST - Sample projections are positively correlated (r=0.763, MC)",
+      "L29: AGAINST - Sample projections are positively correlated (r=0.755, MC)",
+      "L30: AGAINST - Sample projections are positively correlated (r=0.541, MC)",
+      "L31: SUPPORTS - Sample projections are negatively correlated (r=-0.536, MC)",
+      "L0: MIXED - Confidence direction significantly aligned (cos=0.358, z=23.1)",
+      "L1: MIXED - Confidence direction significantly aligned (cos=0.345, z=21.7)",
+      "L2: MIXED - Confidence direction significantly aligned (cos=0.339, z=21.6)",
+      "L3: MIXED - Confidence direction significantly aligned (cos=0.305, z=19.7)",
+      "L4: MIXED - Confidence direction significantly aligned (cos=0.301, z=18.9)",
+      "L5: MIXED - Confidence direction significantly aligned (cos=0.246, z=16.0)",
+      "L6: MIXED - Confidence direction significantly aligned (cos=0.213, z=14.1)",
+      "L7: MIXED - Confidence direction significantly aligned (cos=0.187, z=12.0)",
+      "L8: MIXED - Confidence direction significantly aligned (cos=0.174, z=11.2)",
+      "L9: MIXED - Confidence direction significantly aligned (cos=0.187, z=12.3)",
+      "L10: MIXED - Confidence direction significantly aligned (cos=0.145, z=9.3)",
+      "L11: MIXED - Confidence direction significantly aligned (cos=0.114, z=7.4)",
+      "L12: MIXED - Confidence direction significantly aligned (cos=0.371, z=22.9)",
+      "L13: MIXED - Confidence direction significantly aligned (cos=0.573, z=36.0)",
+      "L14: MIXED - Confidence direction significantly aligned (cos=0.552, z=36.8)",
+      "L15: MIXED - Confidence direction significantly aligned (cos=0.416, z=27.6)",
+      "L16: MIXED - Confidence direction significantly aligned (cos=0.411, z=27.2)",
+      "L17: MIXED - Confidence direction significantly aligned (cos=0.271, z=17.6)",
+      "L18: MIXED - Confidence direction significantly aligned (cos=0.251, z=16.0)",
+      "L19: MIXED - Confidence direction significantly aligned (cos=0.244, z=15.9)",
+      "L20: MIXED - Confidence direction significantly aligned (cos=0.212, z=13.8)",
+      "L21: MIXED - Confidence direction significantly aligned (cos=0.178, z=11.5)",
+      "L22: MIXED - Confidence direction significantly aligned (cos=0.158, z=10.1)",
+      "L23: MIXED - Confidence direction significantly aligned (cos=0.158, z=10.4)",
+      "L24: MIXED - Confidence direction significantly aligned (cos=0.147, z=9.7)",
+      "L25: MIXED - Confidence direction significantly aligned (cos=0.151, z=9.8)",
+      "L26: MIXED - Confidence direction significantly aligned (cos=0.153, z=9.9)",
+      "L27: MIXED - Confidence direction significantly aligned (cos=0.136, z=8.7)",
+      "L28: MIXED - Confidence direction significantly aligned (cos=0.153, z=9.9)",
+      "L29: MIXED - Confidence direction significantly aligned (cos=0.138, z=8.9)",
+      "L30: MIXED - Confidence direction significantly aligned (cos=0.087, z=5.6)",
+      "L31: SUPPORTS - Confidence direction significantly anti-aligned (cos=-0.092, z=-6.1)",
+      "uncertainty_L14_to_confidence_L17: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.053)",
+      "uncertainty_L14_to_confidence_L18: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.068)",
+      "uncertainty_L14_to_confidence_L19: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.073)",
+      "uncertainty_L14_to_confidence_L20: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.074)",
+      "uncertainty_L14_to_confidence_L21: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.075)",
+      "uncertainty_L14_to_confidence_L22: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.083)",
+      "uncertainty_L14_to_confidence_L23: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.093)",
+      "uncertainty_L14_to_confidence_L24: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.099)",
+      "uncertainty_L14_to_confidence_L25: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.102)",
+      "uncertainty_L14_to_confidence_L26: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.123)",
+      "uncertainty_L14_to_confidence_L27: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.135)",
+      "uncertainty_L14_to_confidence_L28: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.154)",
+      "uncertainty_L14_to_confidence_L29: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.165)",
+      "uncertainty_L14_to_confidence_L30: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.174)",
+      "uncertainty_L14_to_confidence_L31: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.239)",
+      "uncertainty_L15_to_confidence_L24: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.052)",
+      "uncertainty_L15_to_confidence_L25: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.053)",
+      "uncertainty_L15_to_confidence_L26: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.061)",
+      "uncertainty_L15_to_confidence_L27: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.067)",
+      "uncertainty_L15_to_confidence_L28: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.072)",
+      "uncertainty_L15_to_confidence_L29: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.087)",
+      "uncertainty_L15_to_confidence_L30: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.098)",
+      "uncertainty_L15_to_confidence_L31: SUPPORTS - Ablating uncertainty INCREASES confidence (\u0394=0.122)",
+      "uncertainty_L17_to_confidence_L31: AGAINST - Ablating uncertainty DECREASES confidence (\u0394=-0.073)",
+      "Steering: +logit_gap direction -> higher confidence (by convention)"
+    ],
+    "interpretation": "EVIDENCE AGAINST INHIBITION MODEL (25 supporting, 26 against):\nThe relationship between uncertainty and confidence directions suggests they capture related but distinct information. The ablation effect may be due to shared variance rather than direct inhibition."
+  }
+}

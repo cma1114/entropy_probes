@@ -1,28 +1,26 @@
 """
-Stage 3. Steering (sufficiency) test for uncertainty directions. Tests whether
-directions are causally sufficient for the model's meta-judgments by steering
-along each direction and measuring whether stated confidence shifts in the
-expected direction. Complements ablation (run_ablation_causality.py) which
-tests necessity.
+Steering causality test for uncertainty directions.
 
-Tests all layers with both probe and mean_diff methods, using pooled null
-distribution + FDR correction. Uses KV cache optimization and batched
-multiplier sweeps for efficiency.
+Tests whether directions from identify_mc_correlate.py are causally SUFFICIENT
+for the model's meta-judgments. If steering along the direction shifts stated
+confidence in the expected direction, that's evidence the direction captures
+information the model uses for introspection.
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz          Uncertainty directions (from Stage 1)
-    outputs/{base}_mc_dataset.json                     Question metadata + metric values
+Complements ablation (run_ablation_causality.py) which tests NECESSITY.
 
-Outputs:
-    outputs/{base}_steering_{task}_{metric}_results.json   Steering slopes, p-values
-    outputs/{base}_steering_{task}_{metric}_results.png    Steering effect curves
+Key features:
+- Tests ALL layers by default (no pre-filtering by transfer R²)
+- Tests BOTH probe and mean_diff methods in a single run for comparison
+- Uses pooled null distribution + FDR correction for robust statistics
+- KV cache optimization for efficiency
+- Batched multiplier sweeps
 
-    where {base} = {model_short_name}_{dataset}
+Usage:
+    python run_steering_causality.py
 
-Shared parameters (must match across scripts):
-    SEED, TRAIN_SPLIT
-
-Run after: identify_mc_correlate.py
+Expects outputs from identify_mc_correlate.py:
+    outputs/{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz
+    outputs/{INPUT_BASE_NAME}_mc_dataset.json
 """
 
 import torch
@@ -42,8 +40,6 @@ from core.model_utils import (
     get_model_short_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA, SIGNIFICANCE_COLORS
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
     SteeringExperimentConfig,
@@ -68,51 +64,52 @@ from tasks import (
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
-METRIC = "logit_gap"  # Which metric's directions to test
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC"
+METRIC = "entropy"  # Which metric's directions to test
 META_TASK = "confidence"  # "confidence" or "delegate"
 
-# --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
-LOAD_IN_8BIT = False
-
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 4
-NUM_QUESTIONS = 100          # How many questions (ignored if USE_TRANSFER_SPLIT=True)
-NUM_CONTROLS = 25            # Random orthogonal directions per layer for null distribution
+# Experiment settings
 STEERING_MULTIPLIERS = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+NUM_QUESTIONS = 100  # How many questions to test (ignored if USE_TRANSFER_SPLIT=True)
+NUM_CONTROLS = 25    # Random orthogonal directions per layer for null distribution
+BATCH_SIZE = 8
+SEED = 42
 
 # Use same train/test split as transfer analysis (recommended for apples-to-apples comparison)
 # When True: uses the test set from 80/20 split with SEED, ignoring NUM_QUESTIONS
 # When False: uses first NUM_QUESTIONS from dataset (legacy behavior)
 USE_TRANSFER_SPLIT = True
-TRAIN_SPLIT = 0.8            # Must match across scripts
+TRAIN_SPLIT = 0.8  # Must match test_meta_transfer.py
 
-# --- Script-specific ---
-# Expanded batch target for batched steering
+# Expanded batch target for batched steering.
+# When steering with k multipliers (excluding 0), we expand each base batch by k.
+# This sets the TARGET total expanded batch size.
 EXPANDED_BATCH_TARGET = 48
 
 # Optional: specify layers to test (None = all layers from directions file)
 LAYERS = None  # e.g., [20, 25, 30] for quick testing
 
 # Optional: specify which direction methods to test (None = both probe and mean_diff)
-METHODS = ["mean_diff"]  # e.g., ["mean_diff"] or ["probe"] to test just one
+METHODS = None  # e.g., ["mean_diff"] or ["probe"] to test just one
 
 # Token positions to test (matching test_meta_transfer.py)
-PROBE_POSITIONS = ["final"]#["question_mark", "question_newline", "options_newline", "final"]
+PROBE_POSITIONS = ["question_mark", "question_newline", "options_newline", "final"]
 
 # Layer selection from transfer results (for non-final positions)
-TRANSFER_R2_THRESHOLD = 0.3  # Layers with R² >= this are tested for non-final positions
+# When LAYERS is None and position != "final", auto-select layers with transfer R² >= threshold
+TRANSFER_R2_THRESHOLD = 0.5  # Layers with R² >= this are tested for non-final positions
 TRANSFER_RESULTS_PATH = None  # Auto-detect from INPUT_BASE_NAME if None
 
 # Control count for non-final positions (final uses NUM_CONTROLS)
+# Fewer controls = faster, but need enough for valid p-values
 NUM_CONTROLS_NONFINAL = 10
 
-# --- Output ---
+# Quantization (for large models)
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+
+# Output directory
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -132,7 +129,7 @@ def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
     """
     path = TRANSFER_RESULTS_PATH
     if path is None:
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+        path = OUTPUT_DIR / f"{base_name}_transfer_{meta_task}_results.json"
     else:
         path = Path(path)
 
@@ -375,12 +372,10 @@ def run_steering_for_method(
         position_indices.append(pos_idx)
 
     # Warn if some positions weren't found (will fall back to final token)
-    # Skip warning for "final" position since -1 is the correct/expected value
-    if position != "final":
-        n_valid = sum(1 for idx in position_indices if idx >= 0)
-        n_total = len(position_indices)
-        if n_valid < n_total:
-            print(f"  Warning: {position} position found for {n_valid}/{n_total} prompts (others fall back to final)")
+    n_valid = sum(1 for idx in position_indices if idx >= 0)
+    n_total = len(position_indices)
+    if n_valid < n_total:
+        print(f"  Warning: {position} position found for {n_valid}/{n_total} prompts (others fall back to final)")
 
     # Determine whether we can use KV cache optimization
     use_kv_cache = (position == "final")
@@ -904,7 +899,7 @@ def plot_steering_results(analysis: Dict, method: str, output_path: Path):
 
     # Plot control band
     ax1.fill_between(x, ctrl_slopes - ctrl_stds, ctrl_slopes + ctrl_stds,
-                     color='gray', alpha=CI_ALPHA, label='Control ±1σ')
+                     color='gray', alpha=0.2, label='Control ±1σ')
     ax1.plot(x, ctrl_slopes, '--', color='gray', linewidth=1, alpha=0.8, label='Control mean')
 
     # Plot introspection line
@@ -928,7 +923,7 @@ def plot_steering_results(analysis: Dict, method: str, output_path: Path):
     ax1.set_ylabel("Confidence Slope (Δconf / Δmult)")
     ax1.set_title(f"Confidence Slope by Layer (expected slope: {sign_str})")
     ax1.legend(loc='best', fontsize=9)
-    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.grid(True, alpha=0.3)
 
     # Panel 2: Confidence vs multiplier for all significant layers (sorted by effect size)
     ax2 = axes[1]
@@ -966,7 +961,7 @@ def plot_steering_results(analysis: Dict, method: str, output_path: Path):
         ax2.set_ylabel("Mean Confidence")
         ax2.set_title(f"Confidence vs Multiplier - {len(sig_layers_sorted)} Significant Layers (sorted by |Z|)")
         ax2.legend(loc='best', fontsize=8, ncol=2 if len(sig_layers_sorted) > 6 else 1)
-        ax2.grid(True, alpha=GRID_ALPHA)
+        ax2.grid(True, alpha=0.3)
     else:
         ax2.text(0.5, 0.5, "No significant layers found", ha='center', va='center', fontsize=12)
         ax2.set_title("Confidence vs Multiplier - No Significant Layers")
@@ -1028,7 +1023,10 @@ Interpretation:
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"  Saved {output_path}")
+    plt.close()
 
 
 def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
@@ -1048,7 +1046,7 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     fig.suptitle("Method Comparison: Steering Effects", fontsize=14)
 
     x = np.arange(len(layers))
-    colors = METHOD_COLORS
+    colors = {'probe': 'tab:blue', 'mean_diff': 'tab:orange'}
 
     # Panel 1: Slope curves by layer (line plot)
     ax1 = axes[0]
@@ -1072,7 +1070,7 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     ax1.set_ylabel("Confidence Slope")
     ax1.set_title("Confidence Slope by Method (filled markers = pooled p<0.05)")
     ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.grid(True, alpha=0.3)
 
     # Panel 2: Summary comparison
     ax2 = axes[1]
@@ -1102,7 +1100,10 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='lightyellow', edgecolor='gray', alpha=0.9))
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"  Saved {output_path}")
+    plt.close()
 
 
 def print_summary(analyses: Dict[str, Dict]):
@@ -1213,7 +1214,7 @@ def main():
                         else:
                             print(f"  {pos}/{method}: WARNING - no layers found, will use ALL layers")
     else:
-        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_results.json"
+        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_{META_TASK}_results.json"
         print(f"\nNo transfer results found - will use all layers for all positions")
         print(f"  Expected: {expected_path}")
 
@@ -1230,7 +1231,6 @@ def main():
     print("\nLoading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
         MODEL,
-        adapter_path=ADAPTER,
         load_in_4bit=LOAD_IN_4BIT,
         load_in_8bit=LOAD_IN_8BIT,
     )
@@ -1321,30 +1321,20 @@ def main():
             print(f"  Best layer: {summary['best_layer']} (slope={summary['best_slope']:.4f})")
 
         # Incremental save after each position completes (crash protection)
-        model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-        # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-        dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-        # Include adapter in output name if used
-        if ADAPTER:
-            adapter_short = get_model_short_name(ADAPTER)
-            base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-        else:
-            base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
+        model_short = get_model_short_name(MODEL)
+        base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_steering_{META_TASK}_{METRIC}"
         checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
         checkpoint_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
-                metric=METRIC,
-                meta_task=META_TASK,
-                seed=SEED,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-                num_questions=len(questions),
-                use_transfer_split=USE_TRANSFER_SPLIT,
-                multipliers=STEERING_MULTIPLIERS,
-                positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_position.get(p)],
-            ),
+            "config": {
+                "model": MODEL,
+                "input_base_name": INPUT_BASE_NAME,
+                "metric": METRIC,
+                "meta_task": META_TASK,
+                "num_questions": len(questions),
+                "use_transfer_split": USE_TRANSFER_SPLIT,
+                "multipliers": STEERING_MULTIPLIERS,
+                "positions_completed": [p for p in PROBE_POSITIONS if all_analyses_by_position.get(p)],
+            },
             "by_position": {},
         }
         for pos in PROBE_POSITIONS:
@@ -1360,39 +1350,28 @@ def main():
         print(f"  Checkpoint saved: {checkpoint_path.name}")
 
     # Generate output filename
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-    # Include adapter in output name if used
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-    else:
-        base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
+    model_short = get_model_short_name(MODEL)
+    base_output = f"{model_short}_{INPUT_BASE_NAME.split('_')[-1]}_steering_{META_TASK}_{METRIC}"
 
     # Save JSON results
     print("\nSaving results...")
     results_path = OUTPUT_DIR / f"{base_output}_results.json"
 
     output_json = {
-        "config": get_config_dict(
-            model=MODEL,
-            input_base_name=INPUT_BASE_NAME,
-            metric=METRIC,
-            meta_task=META_TASK,
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-            num_questions=len(questions),
-            use_transfer_split=USE_TRANSFER_SPLIT,
-            train_split=TRAIN_SPLIT,
-            num_controls_final=NUM_CONTROLS,
-            num_controls_nonfinal=NUM_CONTROLS_NONFINAL,
-            transfer_r2_threshold=TRANSFER_R2_THRESHOLD,
-            multipliers=STEERING_MULTIPLIERS,
-            methods_tested=methods,
-            positions_tested=PROBE_POSITIONS,
-        ),
+        "config": {
+            "model": MODEL,
+            "input_base_name": INPUT_BASE_NAME,
+            "metric": METRIC,
+            "meta_task": META_TASK,
+            "num_questions": len(questions),
+            "use_transfer_split": USE_TRANSFER_SPLIT,
+            "num_controls_final": NUM_CONTROLS,
+            "num_controls_nonfinal": NUM_CONTROLS_NONFINAL,
+            "transfer_r2_threshold": TRANSFER_R2_THRESHOLD,
+            "multipliers": STEERING_MULTIPLIERS,
+            "methods_tested": methods,
+            "positions_tested": PROBE_POSITIONS,
+        },
     }
 
     # Per-position results

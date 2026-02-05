@@ -1,32 +1,18 @@
 """
-Stage 1. Find MC uncertainty and answer directions from model activations during
-multiple-choice question answering. Tests whether activations encode uncertainty
-metrics (entropy, logit_gap, etc.) using both probe and mean_diff methods, and
-optionally finds answer (A/B/C/D) directions.
+Identify internal correlates of uncertainty in MC question answering.
 
-Inputs:
-    data/{dataset}.jsonl                               Raw MC questions
-    data/{dataset}_difficulty_filtered.jsonl            (alternative) Filtered MC questions
+Tests whether model activations encode uncertainty metrics (entropy, logit_gap, etc.)
+using both probe and mean_diff direction-finding methods.
 
 Outputs:
-    outputs/{base}_mc_activations.npz                  Cached activations + metrics
-    outputs/{base}_mc_dataset.json                     Question metadata + metric values
-    outputs/{base}_mc_{metric}_directions.npz          Direction vectors per metric
-    outputs/{base}_mc_{metric}_probes.joblib           Trained probe objects per metric
-    outputs/{base}_mc_{metric}_results.json            Per-layer R², CIs, statistics
-    outputs/{base}_mc_answer_directions.npz            Answer directions (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_answer_probes.joblib             Answer probe objects (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_answer_results.json              Answer accuracy (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_distributions.png                Metric distributions (one row per metric)
-    outputs/{base}_mc_directions.png                   4-panel directions summary
+- {model}_{dataset}_mc_activations.npz: Reusable activations and metrics
+- {model}_{dataset}_mc_dataset.json: Full question metadata
+- {model}_{dataset}_mc_entropy_distribution.png: Entropy distribution plot
+- {model}_{dataset}_mc_{metric}_directions.npz: Direction vectors per metric
+- {model}_{dataset}_mc_{metric}_results.json: Statistics per metric
+- {model}_{dataset}_mc_{metric}_results.png: R² curves per metric
 
-    where {base} = {model_short_name}_{dataset}
-
-Shared parameters (must match across scripts):
-    SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
-
-Run after: (none -- this is the first stage)
-    Optionally filter_by_difficulty.py to produce difficulty-filtered datasets.
+Configuration is set at the top of the script - no CLI args needed.
 """
 
 import random
@@ -34,9 +20,9 @@ import numpy as np
 from pathlib import Path
 import json
 import torch
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import joblib
-from sklearn.model_selection import train_test_split
 
 from core import (
     load_model_and_tokenizer,
@@ -48,51 +34,167 @@ from core import (
     METRIC_INFO,
 )
 from core.directions import probe_direction  # For saving probe objects
-from core.config_utils import get_config_dict
-from core.plotting import plot_metric_distributions, plot_directions_summary
 from core.questions import load_questions
-from core.answer_directions import (
-    find_answer_directions_both_methods,
-    encode_answers,
-)
 from tasks import format_direct_prompt
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter
 DATASET = "TriviaMC_difficulty_filtered"
 METRICS = ["logit_gap"]  # Which metrics to analyze
 NUM_QUESTIONS = 500
+SEED = 42
+BATCH_SIZE = 8
 
-# --- Quantization ---
+# Quantization (for large models like 70B)
 LOAD_IN_4BIT = False  # Set True for 70B+ models
 LOAD_IN_8BIT = False
 
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 8
-N_BOOTSTRAP = 100            # Bootstrap iterations for confidence intervals
+# Direction-finding parameters
+PROBE_ALPHA = 1000.0
+PROBE_PCA_COMPONENTS = 100
+PROBE_N_BOOTSTRAP = 100  # Bootstrap iterations for confidence intervals
+PROBE_TRAIN_SPLIT = 0.8
+MEAN_DIFF_QUANTILE = 0.25
 
-# --- Direction-finding (must match across scripts) ---
-PROBE_ALPHA = 1000.0         # Must match across scripts
-PROBE_PCA_COMPONENTS = 100   # Must match across scripts
-TRAIN_SPLIT = 0.8            # Must match across scripts
-MEAN_DIFF_QUANTILE = 0.25    # Must match across scripts
-
-# --- Answer directions ---
-FIND_ANSWER_DIRECTIONS = True   # Find answer (A/B/C/D) directions from MC activations
-ANSWER_PCA_COMPONENTS = 256     # More components for 4-class classification
-
-# --- Output ---
+# Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 
 # =============================================================================
-# DIAGNOSTIC PRINTING
+# VISUALIZATION FUNCTIONS
 # =============================================================================
+
+
+def plot_entropy_distribution(
+    entropies: np.ndarray,
+    metadata: list,
+    output_path: Path
+):
+    """Plot entropy distribution with accuracy breakdown."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # 1. Overall entropy histogram (percentage)
+    ax1 = axes[0]
+    ax1.hist(entropies, bins=30, edgecolor='black', alpha=0.7,
+             weights=np.ones(len(entropies)) / len(entropies) * 100)
+    ax1.axvline(entropies.mean(), color='red', linestyle='--',
+                label=f'Mean: {entropies.mean():.3f}')
+    ax1.axvline(np.median(entropies), color='orange', linestyle='--',
+                label=f'Median: {np.median(entropies):.3f}')
+    ax1.set_xlabel('Entropy')
+    ax1.set_ylabel('Percentage')
+    ax1.set_title(f'MC Entropy Distribution (n={len(entropies)})')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Entropy by correctness (percentage within each group)
+    ax2 = axes[1]
+    correct_entropies = [m["entropy"] for m in metadata if m["is_correct"]]
+    incorrect_entropies = [m["entropy"] for m in metadata if not m["is_correct"]]
+
+    if correct_entropies:
+        ax2.hist(correct_entropies, bins=20, alpha=0.6,
+                 label=f'Correct (n={len(correct_entropies)})',
+                 color='green',
+                 weights=np.ones(len(correct_entropies)) / len(correct_entropies) * 100)
+    if incorrect_entropies:
+        ax2.hist(incorrect_entropies, bins=20, alpha=0.6,
+                 label=f'Incorrect (n={len(incorrect_entropies)})',
+                 color='red',
+                 weights=np.ones(len(incorrect_entropies)) / len(incorrect_entropies) * 100)
+    ax2.set_xlabel('Entropy')
+    ax2.set_ylabel('Percentage')
+    ax2.set_title('Entropy by Correctness')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Accuracy vs entropy bins
+    ax3 = axes[2]
+    n_bins = 10
+    entropy_bins = np.linspace(entropies.min(), entropies.max(), n_bins + 1)
+    bin_accuracies = []
+    bin_centers = []
+    bin_counts = []
+
+    for i in range(n_bins):
+        bin_mask = (entropies >= entropy_bins[i]) & (entropies < entropy_bins[i + 1])
+        if i == n_bins - 1:
+            bin_mask = (entropies >= entropy_bins[i]) & (entropies <= entropy_bins[i + 1])
+
+        bin_items = [m for j, m in enumerate(metadata) if bin_mask[j]]
+        if len(bin_items) > 0:
+            acc = sum(1 for m in bin_items if m["is_correct"]) / len(bin_items)
+            bin_accuracies.append(acc)
+            bin_centers.append((entropy_bins[i] + entropy_bins[i + 1]) / 2)
+            bin_counts.append(len(bin_items))
+
+    ax3.bar(bin_centers, bin_accuracies, width=(entropy_bins[1] - entropy_bins[0]) * 0.8,
+            alpha=0.7, edgecolor='black')
+    ax3.set_xlabel('Entropy')
+    ax3.set_ylabel('Accuracy')
+    ax3.set_title('Accuracy vs Entropy')
+    ax3.set_ylim(0, 1)
+    ax3.grid(True, alpha=0.3)
+
+    for x, y, c in zip(bin_centers, bin_accuracies, bin_counts):
+        ax3.text(x, y + 0.02, f'n={c}', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
+def plot_results(
+    all_results: dict,
+    metric: str,
+    output_path: Path
+):
+    """Plot R² across layers for both methods with confidence intervals."""
+    colors = {'probe': 'tab:blue', 'mean_diff': 'tab:orange'}
+
+    results = all_results[metric]
+    layers = sorted(results["fits"]["probe"].keys())
+
+    # Single panel - just the R² curves
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for method in ["probe", "mean_diff"]:
+        fits = results["fits"][method]
+        r2_values = [fits[l]["r2"] for l in layers]
+
+        # Check for std (bootstrap)
+        has_std = "r2_std" in fits[layers[0]]
+        if has_std:
+            r2_std = [fits[l]["r2_std"] for l in layers]
+            ax.fill_between(
+                layers,
+                np.array(r2_values) - np.array(r2_std),
+                np.array(r2_values) + np.array(r2_std),
+                alpha=0.2, color=colors[method]
+            )
+
+        # Find best layer for this method
+        best_layer = max(layers, key=lambda l: fits[l]["r2"])
+        best_r2 = fits[best_layer]["r2"]
+        label = f'{method} (best: L{best_layer}, R²={best_r2:.3f})'
+
+        ax.plot(layers, r2_values, 'o-', label=label, color=colors[method], markersize=4)
+
+    ax.set_xlabel('Layer Index')
+    ax.set_ylabel('R² Score')
+    ax.set_title(f'{metric} Predictability by Layer')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: int):
@@ -137,7 +239,7 @@ def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    model_short = get_model_short_name(MODEL)
     if ADAPTER:
         adapter_short = get_model_short_name(ADAPTER)
         base_name = f"{model_short}_adapter-{adapter_short}_{DATASET}"
@@ -150,7 +252,7 @@ def main():
     print(f"Dataset: {DATASET}")
     print(f"Metrics: {METRICS}")
     print(f"Questions: {NUM_QUESTIONS}")
-    print(f"Bootstrap iterations: {N_BOOTSTRAP}")
+    print(f"Bootstrap iterations: {PROBE_N_BOOTSTRAP}")
     print(f"Output base: {base_name}")
     print()
 
@@ -255,26 +357,10 @@ def main():
         metadata.append(item)
 
     accuracy = correct_count / len(questions)
-    print(f"\nMC ACCURACY: {correct_count}/{len(questions)} correct ({accuracy:.1%})")
+    print(f"\nAccuracy: {accuracy:.1%} ({correct_count}/{len(questions)})")
 
-    # Per-position accuracy breakdown
-    position_correct = {}
-    position_total = {}
-    for item in metadata:
-        ans = item["correct_answer"]
-        position_total[ans] = position_total.get(ans, 0) + 1
-        if item["is_correct"]:
-            position_correct[ans] = position_correct.get(ans, 0) + 1
-    per_pos_strs = []
-    for pos in sorted(position_total.keys()):
-        pos_acc = position_correct.get(pos, 0) / position_total[pos]
-        per_pos_strs.append(f"{pos}={pos_acc:.0%}")
-    print(f"  Per-position: {', '.join(per_pos_strs)}")
-
-    print(f"\nMETRIC DISTRIBUTIONS:")
     for metric, values in all_metrics.items():
-        print(f"  {metric}: mean={values.mean():.3f}, std={values.std():.3f}, "
-              f"range=[{values.min():.3f}, {values.max():.3f}]")
+        print(f"  {metric}: mean={values.mean():.3f}, std={values.std():.3f}")
 
     # Save activations file
     activations_path = OUTPUT_DIR / f"{base_name}_mc_activations.npz"
@@ -288,23 +374,17 @@ def main():
     dataset_path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
     print(f"Saving dataset to {dataset_path}...")
     dataset_json = {
-        "config": get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            dataset=DATASET,
-            num_questions=len(questions),
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-        ),
+        "config": {
+            "dataset": DATASET,
+            "num_questions": len(questions),
+            "base_model": MODEL,
+            "adapter": ADAPTER,
+            "seed": SEED,
+        },
         "stats": {
             "accuracy": accuracy,
             "correct_count": correct_count,
             "total_count": len(questions),
-            "per_position_accuracy": {
-                pos: position_correct.get(pos, 0) / position_total[pos]
-                for pos in sorted(position_total.keys())
-            },
         },
         "data": metadata,
     }
@@ -316,6 +396,12 @@ def main():
     with open(dataset_path, "w") as f:
         json.dump(dataset_json, f, indent=2)
 
+    # Plot entropy distribution
+    if "entropy" in all_metrics:
+        entropy_plot_path = OUTPUT_DIR / f"{base_name}_mc_entropy_distribution.png"
+        print(f"\nPlotting entropy distribution...")
+        plot_entropy_distribution(all_metrics["entropy"], metadata, entropy_plot_path)
+
     # Find directions for each metric
     print("\n" + "=" * 60)
     print("FINDING DIRECTIONS")
@@ -325,7 +411,7 @@ def main():
     all_results = {}
 
     for metric in METRICS:
-        print(f"\n--- {metric.upper()} ({N_BOOTSTRAP} bootstrap iterations) ---")
+        print(f"\n--- {metric.upper()} ({PROBE_N_BOOTSTRAP} bootstrap iterations) ---")
         target_values = metrics_to_analyze[metric]
 
         # Step 1: Run parallel direction finding WITH bootstrap for R² confidence intervals
@@ -336,8 +422,8 @@ def main():
             methods=["probe", "mean_diff"],
             probe_alpha=PROBE_ALPHA,
             probe_pca_components=PROBE_PCA_COMPONENTS,
-            probe_n_bootstrap=N_BOOTSTRAP,
-            probe_train_split=TRAIN_SPLIT,
+            probe_n_bootstrap=PROBE_N_BOOTSTRAP,
+            probe_train_split=PROBE_TRAIN_SPLIT,
             mean_diff_quantile=MEAN_DIFF_QUANTILE,
             seed=SEED,
             return_scaler=True,  # Save scaler info (fast, parallelizable)
@@ -352,15 +438,13 @@ def main():
             best_r2 = fits[best_layer]["r2"]
             best_corr = fits[best_layer]["corr"]
 
-            # Use [lo, hi] CI if available, fall back to ±std
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                ci_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_str = f" [{best_r2 - 1.96*fits[best_layer]['r2_std']:.3f}, {best_r2 + 1.96*fits[best_layer]['r2_std']:.3f}]"
-            else:
-                ci_str = ""
+            r2_std_str = ""
+            if "r2_std" in fits[best_layer]:
+                r2_std_str = f" ± {fits[best_layer]['r2_std']:.3f}"
 
-            print(f"  {method:12s}: best L{best_layer:2d} R²={best_r2:.3f}{ci_str}, r={best_corr:.3f}")
+            avg_r2 = np.mean([f["r2"] for f in fits.values()])
+
+            print(f"  {method:12s}: best layer={best_layer:2d} (R²={best_r2:.3f}{r2_std_str}, r={best_corr:.3f}), avg R²={avg_r2:.3f}")
 
         # Method comparison
         if results["comparison"]:
@@ -417,20 +501,15 @@ def main():
         # Save results JSON for this metric
         results_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_results.json"
         results_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                dataset=DATASET,
-                metric=metric,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                probe_alpha=PROBE_ALPHA,
-                pca_components=PROBE_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
+            "config": {
+                "train_split": PROBE_TRAIN_SPLIT,
+                "probe_alpha": PROBE_ALPHA,
+                "use_pca": True,
+                "pca_components": PROBE_PCA_COMPONENTS,
+                "n_bootstrap": PROBE_N_BOOTSTRAP,
+                "mean_diff_quantile": MEAN_DIFF_QUANTILE,
+                "seed": SEED,
+            },
             "metric_stats": {
                 "mean": float(target_values.mean()),
                 "std": float(target_values.std()),
@@ -463,170 +542,12 @@ def main():
             json.dump(results_json, f, indent=2)
         print(f"  Saved results: {results_path}")
 
+        # Plot results for this metric
+        plot_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_results.png"
+        plot_results(all_results, metric, plot_path)
+
     # Diagnostic summary
     print_diagnostic_summary(metrics_to_analyze, all_results, num_layers)
-
-    # =========================================================================
-    # ANSWER DIRECTIONS
-    # =========================================================================
-    answer_results = None
-    if FIND_ANSWER_DIRECTIONS:
-        print("\n" + "=" * 60)
-        print("FINDING ANSWER DIRECTIONS")
-        print("=" * 60)
-
-        # Extract model answers from already-available metadata
-        model_answers = [q["predicted_answer"] for q in metadata]
-        print(f"\n  Answer distribution: {dict(zip(*np.unique(model_answers, return_counts=True)))}")
-
-        # Encode answers to integers
-        encoded_answers, answer_mapping = encode_answers(model_answers)
-        print(f"  Answer mapping: {answer_mapping}")
-
-        # Create train/test split (same seed and split ratio as uncertainty directions)
-        indices = np.arange(len(metadata))
-        train_idx, test_idx = train_test_split(
-            indices,
-            train_size=TRAIN_SPLIT,
-            random_state=SEED,
-            shuffle=True
-        )
-        train_idx = np.sort(train_idx)
-        test_idx = np.sort(test_idx)
-        print(f"  Train/test split: {len(train_idx)}/{len(test_idx)}")
-
-        # Find answer directions using both methods
-        print(f"\n  Training MC answer classifiers ({N_BOOTSTRAP} bootstrap iterations)...")
-        answer_results = find_answer_directions_both_methods(
-            activations_by_layer,
-            encoded_answers,
-            train_idx,
-            test_idx,
-            n_components=ANSWER_PCA_COMPONENTS,
-            random_state=SEED,
-            n_bootstrap=N_BOOTSTRAP,
-            train_split=TRAIN_SPLIT,
-        )
-
-        # Save directions
-        answer_dir_path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
-        print(f"\n  Saving answer directions to {answer_dir_path}...")
-        dir_save = {
-            "_metadata_input_base": base_name,
-            "_metadata_n_classes": len(answer_mapping),
-            "_metadata_answer_mapping": json.dumps(answer_mapping),
-        }
-        for method in ["probe", "centroid"]:
-            for layer in range(num_layers):
-                dir_save[f"{method}_layer_{layer}"] = answer_results["directions"][method][layer]
-        np.savez(answer_dir_path, **dir_save)
-
-        # Save probe objects
-        answer_probes_path = OUTPUT_DIR / f"{base_name}_mc_answer_probes.joblib"
-        print(f"  Saving answer probes to {answer_probes_path}...")
-        probe_save = {
-            "metadata": {
-                "input_base": base_name,
-                "n_classes": len(answer_mapping),
-                "answer_mapping": answer_mapping,
-                "train_split": TRAIN_SPLIT,
-                "n_pca_components": ANSWER_PCA_COMPONENTS,
-                "seed": SEED,
-            },
-            "probes": answer_results["probes"],
-        }
-        joblib.dump(probe_save, answer_probes_path)
-
-        # Save results JSON
-        answer_results_path = OUTPUT_DIR / f"{base_name}_mc_answer_results.json"
-        print(f"  Saving answer results to {answer_results_path}...")
-        answer_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                dataset=DATASET,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                n_pca_components=ANSWER_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                n_classes=len(answer_mapping),
-                answer_mapping=answer_mapping,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
-            "stats": {
-                "n_samples": len(metadata),
-                "n_train": len(train_idx),
-                "n_test": len(test_idx),
-                "answer_distribution": {k: int(v) for k, v in zip(*np.unique(model_answers, return_counts=True))},
-            },
-            "results": {},
-            "comparison": {},
-        }
-        for method in ["probe", "centroid"]:
-            answer_json["results"][method] = {}
-            for layer in range(num_layers):
-                layer_info = {}
-                for k, v in answer_results["fits"][method][layer].items():
-                    if isinstance(v, np.floating):
-                        layer_info[k] = float(v)
-                    elif isinstance(v, np.integer):
-                        layer_info[k] = int(v)
-                    else:
-                        layer_info[k] = v
-                answer_json["results"][method][layer] = layer_info
-        for layer in range(num_layers):
-            answer_json["comparison"][layer] = {
-                "cosine_sim": float(answer_results["comparison"][layer]["cosine_sim"])
-            }
-        with open(answer_results_path, "w") as f:
-            json.dump(answer_json, f, indent=2)
-
-        # Summary
-        fits = answer_results["fits"]
-        for method in ["probe", "centroid"]:
-            method_fits = fits[method]
-            layers = sorted(method_fits.keys())
-            best_layer = max(layers, key=lambda l: method_fits[l]["test_accuracy"])
-            best_acc = method_fits[best_layer]["test_accuracy"]
-            std_str = ""
-            if "test_accuracy_std" in method_fits[best_layer]:
-                std_str = f" +/- {method_fits[best_layer]['test_accuracy_std']:.1%}"
-            print(f"  {method}: best L{best_layer}, accuracy={best_acc:.1%}{std_str} (chance=25%)")
-
-    # =========================================================================
-    # CONSOLIDATED PLOTS
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("GENERATING CONSOLIDATED PLOTS")
-    print("=" * 60)
-
-    # Figure 1: Metric distributions (one row per metric in METRICS)
-    metrics_to_plot = {m: all_metrics[m] for m in METRICS}
-    metric_info_map = {m: METRIC_INFO[m] for m in METRICS}
-
-    distributions_path = OUTPUT_DIR / f"{base_name}_mc_distributions.png"
-    print(f"\nPlotting metric distributions...")
-    plot_metric_distributions(
-        metrics_to_plot,
-        metadata,
-        metric_info_map,
-        distributions_path,
-        title_prefix="MC",
-    )
-
-    # Figure 2: Directions summary (4-panel)
-    directions_path = OUTPUT_DIR / f"{base_name}_mc_directions.png"
-    print(f"Plotting directions summary...")
-    plot_directions_summary(
-        all_results,
-        answer_results,
-        metrics_to_plot,
-        metadata,
-        metric_info_map,
-        directions_path,
-        title_prefix="MC",
-    )
 
     # Final summary
     print("\n" + "=" * 60)
@@ -642,28 +563,21 @@ def main():
             fits = all_results[metric]["fits"][method]
             best_layer = max(fits.keys(), key=lambda l: fits[l]["r2"])
             best_r2 = fits[best_layer]["r2"]
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                ci_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_str = f" [{best_r2 - 1.96*fits[best_layer]['r2_std']:.3f}, {best_r2 + 1.96*fits[best_layer]['r2_std']:.3f}]"
-            else:
-                ci_str = ""
-            corr_str = f", r={fits[best_layer]['corr']:.3f}" if "corr" in fits[best_layer] else ""
-            print(f"  {method:12s}: best L{best_layer:2d} R²={best_r2:.3f}{ci_str}{corr_str}")
+            mae_str = ""
+            if "mae" in fits[best_layer]:
+                mae_str = f", MAE={fits[best_layer]['mae']:.3f}"
+            print(f"  {method}: best R²={best_r2:.3f}{mae_str} at layer {best_layer}")
 
     print("\nOutput files:")
     print(f"  {base_name}_mc_activations.npz")
     print(f"  {base_name}_mc_dataset.json")
+    if "entropy" in all_metrics:
+        print(f"  {base_name}_mc_entropy_distribution.png")
     for metric in METRICS:
         print(f"  {base_name}_mc_{metric}_directions.npz")
         print(f"  {base_name}_mc_{metric}_probes.joblib")
         print(f"  {base_name}_mc_{metric}_results.json")
-    if FIND_ANSWER_DIRECTIONS:
-        print(f"  {base_name}_mc_answer_directions.npz")
-        print(f"  {base_name}_mc_answer_probes.joblib")
-        print(f"  {base_name}_mc_answer_results.json")
-    print(f"  {base_name}_mc_distributions.png")
-    print(f"  {base_name}_mc_directions.png")
+        print(f"  {base_name}_mc_{metric}_results.png")
 
 
 if __name__ == "__main__":

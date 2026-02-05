@@ -3,7 +3,14 @@
     "allow": [
       "Bash(ls:*)",
       "Bash(mkdir:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(sort:*)",
+      "Bash(find:*)",
+      "Bash(xargs cat:*)",
+      "Bash(grep:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(cat:*)",
+      "Bash(head:*)"
     ]
   },
   "enableAllProjectMcpServers": false

@@ -1,23 +1,18 @@
 """
-Cross-prediction analysis between self-confidence and other-confidence probes.
+Analysis. Tests whether self-confidence probes are specific to self-confidence or
+also predict other-confidence equally well, determining if the model has genuinely
+distinct representations for "how confident am I?" vs "how hard is this for others?"
 
-Tests whether self-confidence probes are specific to self, or also predict other-confidence
-equally well. This helps determine if the model has genuinely distinct representations
-for "how confident am I?" vs "how hard is this for others?"
-
-Loads from identify_confidence_correlate.py outputs:
-- {base}_confidence_confidence_probes.joblib: Self-confidence probes
-- {base}_other_confidence_confidence_probes.joblib: Other-confidence probes
-
-Loads from test_meta_transfer.py outputs:
-- {base}_transfer_confidence_activations.npz: Self-confidence activations
-- {base}_transfer_other_confidence_activations.npz: Other-confidence activations
+Inputs:
+    outputs/{base}_meta_{task}_confidence_directions.npz      Confidence directions (self and other)
+    outputs/{base}_meta_{task}_activations.npz                Activations for confidence tasks
 
 Outputs:
-- {base}_confidence_cross_prediction.json: Full metrics per layer
-- {base}_confidence_cross_prediction.png: Multi-panel visualization
+    outputs/{base}_cross_confidence_results.json    Full cross-prediction metrics per layer
+    outputs/{base}_cross_confidence_results.png     Multi-panel visualization
 
-Configuration is set at the top of the script - no CLI args needed.
+Run after: test_meta_transfer.py (with FIND_CONFIDENCE_DIRECTIONS=True for both
+           self and other tasks)
 """
 
 from pathlib import Path
@@ -28,6 +23,8 @@ from sklearn.model_selection import train_test_split
 import joblib
 
 from core.directions import apply_probe_centered
+from core.config_utils import get_config_dict
+from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
 # CONFIGURATION
@@ -160,7 +157,7 @@ def plot_cross_prediction_results(results: dict, num_layers: int, output_path: P
     ax1.set_ylabel("Pearson r")
     ax1.set_ylim(-1.1, 1.1)
     ax1.legend(loc='lower right')
-    ax1.grid(True, alpha=0.3)
+    ax1.grid(True, alpha=GRID_ALPHA)
 
     # Panel 2: Transfer matrix heatmap at best layer (top-right)
     ax2 = axes[0, 1]
@@ -219,7 +216,7 @@ def plot_cross_prediction_results(results: dict, num_layers: int, output_path: P
     ax3.set_ylabel("Specificity Ratio (|within| / |cross|)")
     ax3.set_ylim(0, max(5, np.nanmax(self_spec + other_spec) * 1.1) if self_spec or other_spec else 5)
     ax3.legend(loc='upper right')
-    ax3.grid(True, alpha=0.3)
+    ax3.grid(True, alpha=GRID_ALPHA)
 
     # Panel 4: Summary text (bottom-right)
     ax4 = axes[1, 1]
@@ -251,10 +248,7 @@ INTERPRETATION: {interpretation}
              fontsize=10, family='monospace', verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_path}")
+    save_figure(fig, output_path)
 
 
 # =============================================================================
@@ -273,8 +267,8 @@ def main():
     # Construct file paths
     self_probes_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_confidence_confidence_probes.joblib"
     other_probes_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_other_confidence_confidence_probes.joblib"
-    self_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_confidence_activations.npz"
-    other_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_other_confidence_activations.npz"
+    self_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_confidence_activations.npz"
+    other_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_other_confidence_activations.npz"
 
     # Check all required files exist
     missing = []
@@ -461,17 +455,17 @@ def main():
 
     # Compile full results
     results = {
-        "config": {
-            "input_base": INPUT_BASE_NAME,
-            "train_split": TRAIN_SPLIT,
-            "n_bootstrap": N_BOOTSTRAP,
-            "seed": SEED,
-            "n_self_samples": int(n_self),
-            "n_other_samples": int(n_other),
-            "n_self_test": int(len(test_idx_self)),
-            "n_other_test": int(len(test_idx_other)),
-            "num_layers": int(num_layers),
-        },
+        "config": get_config_dict(
+            input_base=INPUT_BASE_NAME,
+            train_split=TRAIN_SPLIT,
+            n_bootstrap=N_BOOTSTRAP,
+            seed=SEED,
+            n_self_samples=int(n_self),
+            n_other_samples=int(n_other),
+            n_self_test=int(len(test_idx_self)),
+            n_other_test=int(len(test_idx_other)),
+            num_layers=int(num_layers),
+        ),
         "by_layer": results_by_layer,
         "summary": summary,
         "interpretation": interpretation,

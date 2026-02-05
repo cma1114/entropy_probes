@@ -1,32 +1,25 @@
 """
-Stage 3. Full activation patching to test the causal role of complete activation
-patterns, as opposed to steering along a 1D direction.
+Activation patching experiments: Test causal role of full activations.
 
 Unlike steering (which adds a 1D direction), patching swaps the complete
-activation pattern from one example into another. For each question pair
-(source=low metric, target=high metric), it patches target's activations
-into source's forward pass and measures whether source's confidence shifts
-toward target's. This is more robust than steering to non-linear encodings:
-if uncertainty is encoded categorically, steering won't work but patching will.
+activation pattern from one example into another. This tests whether the
+full activation (not just a linear projection) causally determines behavior.
 
-Inputs:
-    outputs/{base}_mc_dataset.json                   MC dataset with scored questions
+For each question pair (source=low metric, target=high metric):
+1. Run source question normally → baseline confidence
+2. Run source question with target's activations patched at layer L → patched confidence
+3. Measure: Does patching shift source's confidence toward target's confidence?
 
-Outputs:
-    outputs/{base}_activation_patching_results.json   Per-layer patching effect sizes
-    outputs/{base}_activation_patching_results.png    Visualization of patching effects
+If patching B's activations into A makes A behave like B, then layer L's
+full activation pattern is causally involved in determining confidence.
 
-Configuration:
-    INTERVENTION_POSITION - Token position for patching intervention:
-        - "final": Last token (default, most common)
-        - "question_mark": "?" at end of embedded question
-        - "question_newline": Newline after question text
-        - "options_newline": Newline after last MC option
+This is more robust than steering to non-linear encodings. If uncertainty
+is encoded categorically (e.g., low=[1,0,0], mid=[0,1,0], high=[0,0,1]),
+steering along a probe direction won't work, but patching will.
 
-Shared parameters (must match across scripts):
-    SEED
-
-Run after: identify_mc_correlate.py (for dataset)
+Usage:
+    python run_activation_patching.py --metric logit_gap
+    python run_activation_patching.py --metric entropy --n-pairs 200
 """
 
 import argparse
@@ -45,8 +38,6 @@ from core.model_utils import (
     get_model_short_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 from core.steering import (
     BatchPatchingHook,
     generate_orthogonal_directions,
@@ -62,38 +53,35 @@ from tasks import (
     OTHER_CONFIDENCE_OPTIONS,
     format_other_confidence_prompt,
     get_other_confidence_signal,
-    # Position finding for multi-position patching
-    find_mc_positions,
 )
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Set to adapter path if using fine-tuned model
+BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_NAME = BASE_MODEL_NAME
 DATASET_NAME = "SimpleMC"
-META_TASK = "confidence"  # "confidence" or "delegate"
-METRIC = "logit_gap"  # Metric for selecting pairs
-AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
-# --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
-LOAD_IN_8BIT = False
+# Meta-judgment task: "confidence" or "delegate"
+META_TASK = "confidence"
 
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 8
-NUM_PATCH_PAIRS = 100        # Number of source->target pairs to test per layer
+# Patching configuration
+NUM_PATCH_PAIRS = 100  # Number of source→target pairs to test per layer
 PAIRING_METHOD = "extremes"  # "extremes", "random", or "quartile"
-PATCHING_LAYERS = None       # None = auto-select based on probe transfer
-INTERVENTION_POSITION = "final"  # "final", "question_mark", "question_newline", "options_newline"
+BATCH_SIZE = 8  # Forward pass batch size
 
-# --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Layer selection
+PATCHING_LAYERS = None  # None = auto-select based on probe transfer
 
+# Metric to use for selecting pairs
+AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+METRIC = "logit_gap"
+
+# Output directory
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
+
+SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 random.seed(SEED)
@@ -116,12 +104,12 @@ def initialize_token_cache(tokenizer):
 
 def get_output_prefix() -> str:
     """Generate output filename prefix."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    model_short = get_model_short_name(BASE_MODEL_NAME)
     task_suffix = "_delegate" if META_TASK == "delegate" else ""
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_patching{task_suffix}")
-    return str(OUTPUT_DIR / f"{model_short}_{DATASET_NAME}_patching{task_suffix}")
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_patching{task_suffix}")
+    return str(OUTPUTS_DIR / f"{model_short}_{DATASET_NAME}_patching{task_suffix}")
 
 
 # =============================================================================
@@ -365,19 +353,6 @@ def run_patching_experiment(
         all_prompts.append(prompt)
         all_mappings.append(mapping)
 
-    # Find intervention positions for non-final modes
-    position_indices = []
-    for i, q in enumerate(questions):
-        if INTERVENTION_POSITION == "final":
-            position_indices.append(-1)
-        else:
-            positions = find_mc_positions(all_prompts[i], tokenizer, q)
-            pos = positions.get(INTERVENTION_POSITION, -1)
-            if pos == -1 and INTERVENTION_POSITION != "final":
-                import warnings
-                warnings.warn(f"Position '{INTERVENTION_POSITION}' not found for question {i}, using final")
-            position_indices.append(pos)
-
     # Batch compute baselines
     all_baseline_confidences = []
     for batch_start in tqdm(range(0, len(questions), batch_size), desc="Baselines"):
@@ -437,27 +412,8 @@ def run_patching_experiment(
             # Tokenize batch
             inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(DEVICE)
 
-            # Build position indices for this batch (adjusted for left-padding)
-            if INTERVENTION_POSITION == "final":
-                hook = BatchPatchingHook(batch_target_acts, position="last")
-            else:
-                seq_len = inputs["input_ids"].shape[1]
-                batch_pos_indices = []
-                for i, (source_idx, target_idx) in enumerate(batch_pairs):
-                    pos = position_indices[source_idx]
-                    if pos >= 0:
-                        # Adjust for left-padding
-                        actual_len = int(inputs["attention_mask"][i].sum())
-                        pad_offset = seq_len - actual_len
-                        adjusted_pos = pos + pad_offset
-                    else:
-                        adjusted_pos = seq_len - 1  # fallback to final
-                    batch_pos_indices.append(adjusted_pos)
-                batch_pos_tensor = torch.tensor(batch_pos_indices, dtype=torch.long, device=DEVICE)
-                hook = BatchPatchingHook(batch_target_acts, position="indexed")
-                hook.set_position_indices(batch_pos_tensor)
-
             # Register patching hook
+            hook = BatchPatchingHook(batch_target_acts, position="last")
             handle = model_layers[layer_idx].register_forward_hook(hook)
 
             try:
@@ -563,19 +519,6 @@ def run_other_confidence_patching(
         prompt = format_other_meta_prompt(q, tokenizer, use_chat_template)
         all_prompts.append(prompt)
 
-    # Find intervention positions for non-final modes
-    position_indices = []
-    for i, q in enumerate(questions):
-        if INTERVENTION_POSITION == "final":
-            position_indices.append(-1)
-        else:
-            positions = find_mc_positions(all_prompts[i], tokenizer, q)
-            pos = positions.get(INTERVENTION_POSITION, -1)
-            if pos == -1 and INTERVENTION_POSITION != "final":
-                import warnings
-                warnings.warn(f"Position '{INTERVENTION_POSITION}' not found for question {i}, using final")
-            position_indices.append(pos)
-
     # Batch compute baselines (no patching)
     print("Computing other-confidence baselines...")
     all_baseline_signals = []
@@ -626,26 +569,7 @@ def run_other_confidence_patching(
             batch_target_acts = torch.tensor(np.array(batch_target_acts), dtype=torch.float32)
             inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(DEVICE)
 
-            # Build position indices for this batch (adjusted for left-padding)
-            if INTERVENTION_POSITION == "final":
-                hook = BatchPatchingHook(batch_target_acts, position="last")
-            else:
-                seq_len = inputs["input_ids"].shape[1]
-                batch_pos_indices = []
-                for i, (source_idx, target_idx) in enumerate(batch_pairs):
-                    pos = position_indices[source_idx]
-                    if pos >= 0:
-                        # Adjust for left-padding
-                        actual_len = int(inputs["attention_mask"][i].sum())
-                        pad_offset = seq_len - actual_len
-                        adjusted_pos = pos + pad_offset
-                    else:
-                        adjusted_pos = seq_len - 1  # fallback to final
-                    batch_pos_indices.append(adjusted_pos)
-                batch_pos_tensor = torch.tensor(batch_pos_indices, dtype=torch.long, device=DEVICE)
-                hook = BatchPatchingHook(batch_target_acts, position="indexed")
-                hook.set_position_indices(batch_pos_tensor)
-
+            hook = BatchPatchingHook(batch_target_acts, position="last")
             handle = model_layers[layer_idx].register_forward_hook(hook)
 
             try:
@@ -953,7 +877,7 @@ def plot_results(analysis: Dict, results: Dict, output_path: str):
     ax1.set_title("Patching Effect by Layer")
     ax1.axhline(y=0, color='k', linestyle='-', alpha=0.5, linewidth=1.5)
     ax1.axhline(y=0.3, color='green', linestyle='--', alpha=0.4, label='Strong effect')
-    ax1.grid(True, alpha=GRID_ALPHA, axis='y')
+    ax1.grid(True, alpha=0.3, axis='y')
 
     # Plot 2: Distribution of normalized shifts for best layer
     ax2 = axes[1]
@@ -976,7 +900,7 @@ def plot_results(analysis: Dict, results: Dict, output_path: str):
     ax2.set_ylabel("Density")
     ax2.set_title(f"Layer {best_layer}: Distribution of Effects")
     ax2.legend(loc='upper right', fontsize=8)
-    ax2.grid(True, alpha=GRID_ALPHA)
+    ax2.grid(True, alpha=0.3)
 
     # Add text showing fraction positive
     frac_positive = sum(1 for s in norm_shifts if s > 0) / len(norm_shifts)
@@ -1029,7 +953,9 @@ Interpretation:
     ax3.text(0.05, 0.95, summary, transform=ax3.transAxes, fontsize=9,
              verticalalignment='top', fontfamily='monospace')
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\nPlot saved to {output_path}")
 
 
 def print_bidirectional_summary(all_analyses: Dict[str, Dict]):
@@ -1189,7 +1115,7 @@ def plot_bidirectional_results(all_analyses: Dict[str, Dict], all_results: Dict[
     ax1.axhline(y=0, color='k', linestyle='-', alpha=0.5)
     ax1.axhline(y=EFFECT_THRESHOLD, color='green', linestyle='--', alpha=0.3)
     ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA, axis='y')
+    ax1.grid(True, alpha=0.3, axis='y')
 
     # Plot 2: Bidirectional score by layer (minimum of the two effects)
     ax2 = axes[1]
@@ -1208,7 +1134,7 @@ def plot_bidirectional_results(all_analyses: Dict[str, Dict], all_results: Dict[
     ax2.set_xticklabels(layers)
     ax2.axhline(y=0, color='k', linestyle='-', alpha=0.5)
     ax2.axhline(y=EFFECT_THRESHOLD, color='green', linestyle='--', alpha=0.4, label='Threshold')
-    ax2.grid(True, alpha=GRID_ALPHA, axis='y')
+    ax2.grid(True, alpha=0.3, axis='y')
 
     # Add text explanation
     ax2.text(0.02, 0.98, "Green = both directions\nshow positive shift",
@@ -1276,7 +1202,9 @@ Pattern Analysis:
     ax3.text(0.05, 0.95, summary, transform=ax3.transAxes, fontsize=9,
              verticalalignment='top', fontfamily='monospace')
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\nBidirectional plot saved to {output_path}")
 
 
 def plot_other_confidence_comparison(
@@ -1353,7 +1281,7 @@ def plot_other_confidence_comparison(
     ax1.set_xticks(x)
     ax1.set_xticklabels(layers)
     ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA, axis='y')
+    ax1.grid(True, alpha=0.3, axis='y')
 
     # Mark significant layers
     for i, l in enumerate(layers):
@@ -1396,7 +1324,7 @@ def plot_other_confidence_comparison(
         ax2.set_title("Self > Other? (Significant Layers Only)")
         ax2.set_xticks(sig_x)
         ax2.set_xticklabels(sig_layers)
-        ax2.grid(True, alpha=GRID_ALPHA, axis='y')
+        ax2.grid(True, alpha=0.3, axis='y')
 
         # Add ratio annotations
         for i, l in enumerate(sig_layers):
@@ -1481,7 +1409,10 @@ All Layers Summary:
     ax_summary.text(0.05, 0.95, summary, transform=ax_summary.transAxes, fontsize=9,
                     verticalalignment='top', fontfamily='monospace')
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved other-confidence comparison plot to {output_path}")
+    plt.close()
 
 
 # =============================================================================
@@ -1518,7 +1449,7 @@ def main():
 
     # Paths for input data
     # We load from run_introspection_experiment.py outputs
-    introspection_prefix = str(OUTPUT_DIR / f"{get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)}_{DATASET_NAME}_introspection")
+    introspection_prefix = str(OUTPUTS_DIR / f"{get_model_short_name(BASE_MODEL_NAME)}_{DATASET_NAME}_introspection")
     if META_TASK == "delegate":
         introspection_prefix += "_delegate"
 
@@ -1580,12 +1511,10 @@ def main():
     # Load model
     print("\nLoading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
-        MODEL,
-        adapter_path=ADAPTER,
-        load_in_4bit=LOAD_IN_4BIT,
-        load_in_8bit=LOAD_IN_8BIT,
+        BASE_MODEL_NAME,
+        MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
     )
-    use_chat_template = should_use_chat_template(MODEL, tokenizer)
+    use_chat_template = should_use_chat_template(BASE_MODEL_NAME, tokenizer)
     initialize_token_cache(tokenizer)
 
     def json_serializer(obj):
@@ -1630,20 +1559,6 @@ def main():
             layers, patch_pairs, use_chat_template, BATCH_SIZE
         )
         results["direction"] = direction
-        results["config"] = get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            dataset=DATASET_NAME,
-            meta_task=META_TASK,
-            metric=METRIC,
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-            batch_size=BATCH_SIZE,
-            num_patch_pairs=NUM_PATCH_PAIRS,
-            pairing_method=PAIRING_METHOD,
-            direction=direction,
-        )
 
         all_results[direction] = results
 
@@ -1823,18 +1738,6 @@ def main():
         other_conf_path = f"{output_prefix}_{METRIC}_patching_other_confidence.json"
         with open(other_conf_path, "w") as f:
             json.dump({
-                "config": get_config_dict(
-                    model=MODEL,
-                    adapter=ADAPTER,
-                    dataset=DATASET_NAME,
-                    meta_task=META_TASK,
-                    metric=METRIC,
-                    seed=SEED,
-                    load_in_4bit=LOAD_IN_4BIT,
-                    load_in_8bit=LOAD_IN_8BIT,
-                    num_patch_pairs=NUM_PATCH_PAIRS,
-                    pairing_method=PAIRING_METHOD,
-                ),
                 "results": other_confidence_results,
                 "analyses": other_confidence_analyses,
                 "significant_layers": significant_layers,

@@ -1,3 +1,20 @@
+"""
+Dataset loading and formatting utilities for MC question datasets.
+Provides a unified interface to load, shuffle, and format questions from multiple
+sources (GPQA, MMLU, TruthfulQA, TriviaQA, etc.) into a common schema.
+
+Inputs:
+    data/*.jsonl                                Pre-built dataset files (for local datasets)
+
+Outputs:
+    (none -- library module, imported by other scripts)
+
+Shared parameters (must match across scripts):
+    (none)
+
+Run after: n/a (imported by other scripts)
+"""
+
 from datasets import load_dataset
 import random
 import os

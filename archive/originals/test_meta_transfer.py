@@ -1,35 +1,25 @@
 """
-Stage 2. Test direct-to-meta (D->M) transfer of uncertainty directions, and
-optionally find confidence directions from meta-task activations. Tests the core
-introspection hypothesis: does the same uncertainty representation appear when
-the model reports its confidence?
+Test whether probes trained on direct MC task transfer to meta-tasks.
 
-Uses two scaling approaches for D->M transfer:
+This tests the core introspection hypothesis: if the model encodes uncertainty
+during direct MC answering, does the same representation appear when the model
+reports its confidence?
+
+Approach (matching run_introspection_experiment.py):
+1. Create train/test split (same indices for both tasks)
+2. Train probes on direct_train activations → direct metric values
+3. Test D→D on direct_test (sanity check)
+4. Test D→M on meta_test (the transfer test)
+
+Loads from identify_mc_correlate.py outputs:
+- {model}_{dataset}_mc_activations.npz: Direct task activations
+- {model}_{dataset}_mc_dataset.json: Questions and metric values
+
+Uses TWO scaling approaches for D→M (matching run_introspection_experiment.py):
 1. Centered Scaler (Rigorous): Center meta with own mean, scale with direct's std
-2. Separate Scaler (Upper Bound): Refit scaler on meta data (domain adaptation)
+2. Separate Scaler (Upper Bound): Refit scaler on meta data - domain adaptation
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz          Uncertainty directions (from Stage 1)
-    outputs/{base}_mc_dataset.json                     Question metadata + metric values
-    outputs/{base}_mc_answer_directions.npz            Answer directions (optional)
-
-Outputs:
-    outputs/{base}_meta_{task}_activations.npz         Meta-task cached activations
-    outputs/{base}_meta_{task}_results.json            Transfer R², CIs, statistics
-    outputs/{base}_meta_{task}_results.npz             Raw numpy arrays (predictions, targets)
-    outputs/{base}_meta_{task}_transfer_{pos}.png      Combined transfer plot (probe+mean-diff+answer)
-    outputs/{base}_meta_{task}_position_comparison.png Position comparison (only if >1 position)
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz  Meta-confidence directions (if FIND_CONFIDENCE_DIRECTIONS)
-    outputs/{base}_meta_{task}_metaconfdir_probes.joblib   Meta-confidence probes (if FIND_CONFIDENCE_DIRECTIONS)
-    outputs/{base}_meta_{task}_metaconfdir_results.json    Meta-confidence R² (if FIND_CONFIDENCE_DIRECTIONS)
-    outputs/{base}_meta_{task}_metaconfdir_results.png     Meta-confidence plot (if FIND_CONFIDENCE_DIRECTIONS)
-
-    where {base} = {model_short_name}_{dataset}
-
-Shared parameters (must match across scripts):
-    SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
-
-Run after: identify_mc_correlate.py
+Configuration is set at the top of the script - no CLI args needed.
 """
 
 from pathlib import Path
@@ -54,16 +44,10 @@ from core import (
     metric_sign_for_confidence,
 )
 from core.directions import probe_direction
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA
 from core.answer_directions import (
     apply_answer_classifier_centered,
     apply_answer_classifier_separate,
     encode_answers,
-)
-from core.confidence_directions import (
-    find_confidence_directions_both_methods,
-    compare_confidence_to_uncertainty,
 )
 from tasks import (
     format_stated_confidence_prompt,
@@ -83,7 +67,7 @@ from tasks import (
 # =============================================================================
 #
 # CACHING WARNING: Meta-task activations and P(Answer)/confidence values are
-# cached at: outputs/{INPUT_BASE_NAME}_meta_{META_TASK}_activations.npz
+# cached at: outputs/{INPUT_BASE_NAME}_transfer_{META_TASK}_activations.npz
 #
 # If you modify the prompts in tasks.py (e.g., teammate performance), you MUST
 # delete the cache file to force re-extraction. Otherwise the script will
@@ -91,43 +75,47 @@ from tasks import (
 #
 # =============================================================================
 
-# --- Model & Data ---
 # Base name for input files from identify_mc_correlate.py
 # Will load: {INPUT_BASE_NAME}_mc_{metric}_probes.joblib and {INPUT_BASE_NAME}_mc_dataset.json
 # The model is inferred from the dataset JSON, so no need to specify MODEL separately.
 INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
-ADAPTER = None  # Optional: must match identify step if used
-METRICS = ["logit_gap"]  # Which metrics to test transfer for
-META_TASK = "confidence"  # "confidence", "other_confidence", or "delegate"
 
-# --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
+# Which metrics to test transfer for
+METRICS = ["logit_gap"]
+
+# Optional adapter (must match identify step if used)
+ADAPTER = None
+
+# Meta task to test: "confidence" or "other_confidence" or "delegate"
+META_TASK = "confidence"
+
+# Processing
+# Delegate task uses longer prompts, so smaller batch size
+BATCH_SIZE = 4 if META_TASK == "delegate" else 8
+
+# Bootstrap for confidence intervals
+N_BOOTSTRAP = 100
+
+# Train/test split (must match original for fair comparison)
+TRAIN_SPLIT = 0.8
+SEED = 42
+
+# Probe training parameters (should match identify_mc_correlate.py)
+PROBE_ALPHA = 1000.0
+PROBE_PCA_COMPONENTS = 100
+
+# Quantization (auto-detected from model name, but can override)
+LOAD_IN_4BIT = False #True if "70B" in model_name else False
 LOAD_IN_8BIT = False
 
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 4 if META_TASK == "delegate" else 8  # Delegate uses longer prompts
-N_BOOTSTRAP = 100            # Bootstrap iterations for confidence intervals
-
-# --- Direction-finding (must match across scripts) ---
-PROBE_ALPHA = 1000.0         # Must match across scripts
-PROBE_PCA_COMPONENTS = 100   # Must match across scripts
-TRAIN_SPLIT = 0.8            # Must match across scripts
-
-# --- Confidence directions (optional, merged from identify_confidence_correlate.py) ---
-FIND_CONFIDENCE_DIRECTIONS = True  # Train probes on stated confidence from meta activations
-MEAN_DIFF_QUANTILE = 0.25          # Must match across scripts
-COMPARE_UNCERTAINTY_METRIC = METRICS[0]  # Compare confidence vs uncertainty dirs (None to skip)
-
-# --- Script-specific ---
 # Token positions to probe for transfer
 # question_mark: "?" at end of embedded MC question
 # question_newline: newline after "?"
 # options_newline: newline after last MC option (D: ...)
 # final: last token (current behavior)
-PROBE_POSITIONS = ["final"]  # ["question_mark", "question_newline", "options_newline", "final"]
+PROBE_POSITIONS = ["final"]#"question_mark", "question_newline", "options_newline", "final"]
 
-# --- Output ---
+# Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 
 # =============================================================================
@@ -493,50 +481,251 @@ def get_meta_options(meta_task: str):
         raise ValueError(f"Unknown meta task: {meta_task}. Valid options: confidence, delegate, other_confidence")
 
 
-def plot_combined_transfer_results(
-    probe_results: dict,
-    probe_direct_r2: dict,
-    probe_direct_r2_std: dict,
-    mean_diff_results: dict,
-    mean_diff_direct_r2: dict,
-    mean_diff_direct_r2_std: dict,
+def plot_transfer_results(
+    transfer_results: dict,
+    direct_r2: dict,
+    direct_r2_std: dict,  # CIs from training (loaded from results JSON)
     behavioral: dict,
     num_layers: int,
     output_path: Path,
     meta_task: str,
-    metric: str,
-    position: str,
-    answer_d2d: dict = None,
-    answer_d2m: dict = None,
+    title_prefix: str = "Transfer Analysis",
 ):
     """
-    Combined transfer plot with probe (blue), mean-diff (orange), and answer (black).
+    Plot transfer R² across layers for all metrics.
 
-    2x2 grid:
-    - Panel 1: Transferred signal → stated confidence (Pearson r)
-    - Panel 2: Probe Transfer (D→D vs D→M R²)
-    - Panel 3: Mean-diff Transfer (D→D vs D→M R²)
-    - Panel 4: Transfer Ratio (D→M / D→D)
+    2x2 grid matching run_introspection_experiment.py:
+    - Panel 1: Transferred predictions → stated confidence
+    - Panel 2: Centered Scaler (Rigorous)
+    - Panel 3: Pearson Correlation (Shift-Invariant)
+    - Panel 4: Normalized timecourse comparison
 
-    Colors by method (not metric):
-    - probe = blue (solid for D→M, dotted for D→D)
-    - mean_diff = orange (solid for D→M, dotted for D→D)
-    - answer = black (solid for D→M, dotted for D→D)
+    Each panel shows D→D (from training), D→M (transfer), and chance baseline (0).
+    Shaded bands show ±1 std confidence intervals.
     """
-    # Validate metric is present in probe results
-    if not probe_results or metric not in probe_results:
-        print(f"  No data for metric {metric} at {position}")
+    metrics = list(transfer_results.keys())
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"{title_prefix}: {meta_task}", fontsize=14, fontweight='bold')
+
+    layers = list(range(num_layers))
+    colors = {'entropy': 'tab:blue', 'top_logit': 'tab:orange', 'logit_gap': 'tab:green'}
+
+    # For display only: prevent a few extreme negative R² values from blowing out the y-axis.
+    # Raw values are still saved to JSON/NPZ.
+    R2_PLOT_FLOOR = -0.5
+    def _clip_r2_for_plot(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=float)
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+        return np.clip(arr, R2_PLOT_FLOOR, 1.0)
+
+    # Panel 1: Does the transferred signal explain stated confidence?
+    ax1 = axes[0, 0]
+    ax1.set_title("Method 1: Transferred signal → stated confidence\nPearson r(sign·ŷ(meta), confidence)", fontsize=10)
+
+    # We'll show three kinds of horizontal reference lines:
+    #  - r=0 (gray)
+    #  - behavioral metric↔confidence correlations (colored, dashed)
+    # The behavioral lines are *not* "zero" baselines; they’re just an anchor for
+    # how strongly the *raw metric values* relate to stated confidence.
+
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
+
+        vals = np.array(
+            [transfer_results[metric][l]["centered"].get("pred_conf_pearson", np.nan) for l in layers],
+            dtype=float,
+        )
+
+        # Pick best layer by absolute correlation, ignoring NaNs
+        finite = np.isfinite(vals)
+        if finite.any():
+            best_layer = int(np.argmax(np.abs(vals[finite])))
+            best_layer = int(np.array(layers)[finite][best_layer])
+            best_r = float(vals[best_layer])
+        else:
+            best_layer = 0
+            best_r = float("nan")
+
+        ax1.plot(
+            layers,
+            vals,
+            '-',
+            label=f'{metric} (best L{best_layer}: {best_r:.3f})' if np.isfinite(best_r) else f'{metric}',
+            color=color,
+            linewidth=2,
+        )
+
+        # CI band (cheap bootstrap over test indices, stored in pred_conf_pearson_std)
+        stds = np.array(
+            [transfer_results[metric][l]["centered"].get("pred_conf_pearson_std", 0.0) for l in layers],
+            dtype=float,
+        )
+        if np.any(stds > 0):
+            ax1.fill_between(
+                layers,
+                vals - stds,
+                vals + stds,
+                color=color,
+                alpha=0.15,
+                linewidth=0,
+            )
+    ax1.set_xlabel('Layer Index')
+    ax1.set_ylabel('Corr with confidence (r)')
+    ax1.legend(loc='upper left', fontsize=7)
+    ax1.grid(True, alpha=0.3)
+
+# Panel 2: Centered Scaler (Rigorous)
+    ax2 = axes[0, 1]
+    ax2.set_title("Method 2: Centered Scaler (Rigorous)\n(Geometry Check)", fontsize=10)
+
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
+
+        # D→D (from training)
+        if metric in direct_r2:
+            d2d_r2 = _clip_r2_for_plot(np.array([direct_r2[metric].get(l, 0) for l in layers]))
+            ax2.plot(layers, d2d_r2, '-', label=f'{metric} D→D',
+                     color=color, linewidth=2, alpha=0.4)
+            # D→D CI
+            if metric in direct_r2_std:
+                d2d_std = np.array([direct_r2_std[metric].get(l, 0) for l in layers])
+                ax2.fill_between(layers, _clip_r2_for_plot(d2d_r2 - d2d_std), _clip_r2_for_plot(d2d_r2 + d2d_std),
+                                 color=color, alpha=0.18)
+
+        # D→M centered
+        centered_r2 = np.array([transfer_results[metric][l]["centered"]["r2"] for l in layers], dtype=float)
+        centered_std = np.array([transfer_results[metric][l]["centered"].get("r2_std", 0) for l in layers])
+        best_layer = max(layers, key=lambda l: transfer_results[metric][l]["centered"]["r2"])
+        best_r2 = transfer_results[metric][best_layer]["centered"]["r2"]
+        ax2.plot(layers, centered_r2, '-', label=f'{metric} D→M Cen (best L{best_layer}: {best_r2:.3f})',
+                 color=color, linewidth=2)
+        # D→M CI
+        if centered_std.any():
+            ax2.fill_between(layers, _clip_r2_for_plot(centered_r2 - centered_std), _clip_r2_for_plot(centered_r2 + centered_std),
+                             color=color, alpha=0.2)
+
+    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5, label='Chance')
+    ax2.set_xlabel('Layer Index')
+    ax2.set_ylabel('R² (out-of-sample)')
+    ax2.legend(loc='upper left', fontsize=7)
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Pearson Correlation (Shift Invariant)
+    ax3 = axes[1, 0]
+    ax3.set_title("Method 3: Pearson Correlation\n(Shift Invariant Signal Check)", fontsize=10)
+
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
+
+        # D→D Pearson (from training results - use correlation from fits)
+        if metric in direct_r2:
+            # Correlation = sqrt(R²) with sign preserved (assume positive for D→D)
+            d2d_corr = [np.sqrt(max(direct_r2[metric].get(l, 0), 0.0)) for l in layers]
+            ax3.plot(layers, d2d_corr, '-', label=f'{metric} D→D',
+                     color=color, linewidth=2, alpha=0.4)
+
+        # D→M Pearson
+        pearson_r = [transfer_results[metric][l]["centered"]["pearson"] for l in layers]
+        best_layer = max(layers, key=lambda l: abs(transfer_results[metric][l]["centered"]["pearson"]))
+        best_corr = transfer_results[metric][best_layer]["centered"]["pearson"]
+        ax3.plot(layers, pearson_r, '-', label=f'{metric} D→M (best L{best_layer}: {best_corr:.3f})',
+                 color=color, linewidth=2)
+
+    ax3.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax3.set_xlabel('Layer Index')
+    ax3.set_ylabel('Correlation (r)')
+    ax3.legend(loc='upper left', fontsize=7)
+    ax3.grid(True, alpha=0.3)
+
+    # Panel 4: Signal Emergence (Normalized timecourse)
+    ax4 = axes[1, 1]
+    ax4.set_title("Signal Emergence (Min-Max Scaled)\nCheck: Do lines rise together?", fontsize=10)
+
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
+
+        # D→D normalized (from training R²)
+        if metric in direct_r2:
+            d2d_r2 = _clip_r2_for_plot(np.array([direct_r2[metric].get(l, 0) for l in layers]))
+            if d2d_r2.max() > d2d_r2.min():
+                d2d_norm = (d2d_r2 - d2d_r2.min()) / (d2d_r2.max() - d2d_r2.min())
+            else:
+                d2d_norm = np.zeros_like(d2d_r2)
+            ax4.plot(layers, d2d_norm, '-', label=f'{metric} D→D',
+                     color=color, linewidth=2, alpha=0.4)
+
+        # D→M normalized
+        centered_r2 = np.array([transfer_results[metric][l]["centered"]["r2"] for l in layers], dtype=float)
+        centered_r2_plot = _clip_r2_for_plot(centered_r2)
+        # (use raw for normalization; clip only for display if needed)
+        if centered_r2.max() > centered_r2.min():
+            normalized = (centered_r2 - centered_r2.min()) / (centered_r2.max() - centered_r2.min())
+        else:
+            normalized = np.zeros_like(centered_r2)
+        ax4.plot(layers, normalized, '-', label=f'{metric} D→M',
+                 color=color, linewidth=2)
+
+    ax4.set_xlabel('Layer Index')
+    ax4.set_ylabel('Normalized R² (0-1)')
+    ax4.legend(loc='upper left', fontsize=7)
+    ax4.grid(True, alpha=0.3)
+
+    # Add behavioral correlation text box
+    behav_text = "Metric ↔ Confidence (full dataset):\n"
+    for metric in metrics:
+        sign = metric_sign_for_confidence(metric)
+        sign_str = " (inv)" if sign < 0 else ""
+        behav_r = behavioral.get(metric, {}).get("pearson_r", float("nan"))
+        behav_text += f"  {metric}{sign_str}: r={behav_r:.3f}\n"
+
+    behav_text += "\nMetric ↔ Confidence (test set):\n"
+    for metric in metrics:
+        sign = metric_sign_for_confidence(metric)
+        sign_str = " (inv)" if sign < 0 else ""
+        test_r = behavioral.get(metric, {}).get("test_pearson_r", float("nan"))
+        behav_text += f"  {metric}{sign_str}: r={test_r:.3f}\n"
+
+    fig.text(0.02, 0.02, behav_text, fontsize=8, family='monospace',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
+def plot_mean_diff_transfer_results(
+    transfer_results: dict,
+    direct_r2: dict,
+    direct_r2_std: dict,
+    behavioral: dict,
+    num_layers: int,
+    output_path: Path,
+    meta_task: str,
+    title_prefix: str = "Mean-diff Transfer",
+):
+    """
+    Plot mean-diff transfer R² across layers for all metrics.
+
+    2x2 grid format (same as probe plots):
+    - Panel 1: Transferred predictions → stated confidence
+    - Panel 2: Centered Scaler (R² geometry check)
+    - Panel 3: Pearson Correlation (Shift-Invariant)
+    - Panel 4: Normalized timecourse comparison
+
+    Mean-diff only has "centered" results (no "separate").
+    """
+    metrics = list(transfer_results.keys())
+    if not metrics:
+        print("  No metrics for mean-diff plot")
         return
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"Transfer Analysis ({position}): {meta_task} - {metric}", fontsize=14, fontweight='bold')
+    fig.suptitle(f"{title_prefix}: {meta_task}", fontsize=14, fontweight='bold')
 
     layers = list(range(num_layers))
-
-    # Color by method, not metric
-    PROBE_COLOR = METHOD_COLORS["probe"]      # tab:blue
-    MEANDIFF_COLOR = METHOD_COLORS["mean_diff"]  # tab:orange
-    ANSWER_COLOR = "black"
+    colors = {'entropy': 'tab:blue', 'top_logit': 'tab:orange', 'logit_gap': 'tab:green'}
 
     R2_PLOT_FLOOR = -0.5
     def _clip_r2_for_plot(arr: np.ndarray) -> np.ndarray:
@@ -544,329 +733,387 @@ def plot_combined_transfer_results(
         arr = np.where(np.isfinite(arr), arr, np.nan)
         return np.clip(arr, R2_PLOT_FLOOR, 1.0)
 
-    # Helper to find best layer
-    def _find_best(vals, maximize_abs=False):
-        finite = np.isfinite(vals)
-        if not finite.any():
-            return 0, float("nan")
-        if maximize_abs:
-            best_idx = int(np.argmax(np.abs(vals[finite])))
-        else:
-            best_idx = int(np.argmax(np.where(finite, vals, -np.inf)))
-        best_layer = int(np.array(layers)[finite][best_idx]) if maximize_abs else best_idx
-        return best_layer, float(vals[best_layer])
-
-    # === Panel 1: Transferred signal → stated confidence ===
+    # Panel 1: Transferred signal → stated confidence
     ax1 = axes[0, 0]
-    ax1.set_title(f"Transferred signal → stated confidence ({metric})\nPearson r(sign·ŷ(meta), confidence)", fontsize=10)
+    ax1.set_title("Method 1: Transferred signal → stated confidence\nPearson r(sign·ŷ(meta), confidence)", fontsize=10)
 
-    best_info_p1 = {}
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
+        if metric not in transfer_results:
+            continue
 
-    # Probe (blue, solid)
-    if metric in probe_results:
-        vals = np.array([probe_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson", np.nan) for l in layers], dtype=float)
-        best_layer, best_r = _find_best(vals, maximize_abs=True)
-        best_info_p1["probe"] = (best_layer, best_r)
-        ax1.plot(layers, vals, '-', color=PROBE_COLOR, linewidth=2, label='probe')
-        stds = np.array([probe_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson_std", 0.0) for l in layers], dtype=float)
+        vals = np.array(
+            [transfer_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson", np.nan) for l in layers],
+            dtype=float,
+        )
+
+        finite = np.isfinite(vals)
+        if finite.any():
+            best_layer = int(np.argmax(np.abs(vals[finite])))
+            best_layer = int(np.array(layers)[finite][best_layer])
+            best_r = float(vals[best_layer])
+        else:
+            best_layer = 0
+            best_r = float("nan")
+
+        ax1.plot(layers, vals, '-',
+                 label=f'{metric} (best L{best_layer}: {best_r:.3f})' if np.isfinite(best_r) else f'{metric}',
+                 color=color, linewidth=2)
+
+        stds = np.array(
+            [transfer_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson_std", 0.0) for l in layers],
+            dtype=float,
+        )
         if np.any(stds > 0):
-            ax1.fill_between(layers, vals - stds, vals + stds, color=PROBE_COLOR, alpha=CI_ALPHA, linewidth=0)
+            ax1.fill_between(layers, vals - stds, vals + stds, color=color, alpha=0.15, linewidth=0)
 
-    # Mean-diff (orange, dashed)
-    if mean_diff_results and metric in mean_diff_results:
-        vals = np.array([mean_diff_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson", np.nan) for l in layers], dtype=float)
-        best_layer, best_r = _find_best(vals, maximize_abs=True)
-        best_info_p1["mean_diff"] = (best_layer, best_r)
-        ax1.plot(layers, vals, '--', color=MEANDIFF_COLOR, linewidth=2, label='mean-diff')
-        stds = np.array([mean_diff_results[metric].get(l, {}).get("centered", {}).get("pred_conf_pearson_std", 0.0) for l in layers], dtype=float)
-        if np.any(stds > 0):
-            ax1.fill_between(layers, vals - stds, vals + stds, color=MEANDIFF_COLOR, alpha=CI_ALPHA, linewidth=0)
-
-    ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
     ax1.set_xlabel('Layer Index')
     ax1.set_ylabel('Corr with confidence (r)')
-    ax1.legend(loc='upper left', fontsize=8)
-    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.legend(loc='upper left', fontsize=7)
+    ax1.grid(True, alpha=0.3)
 
-    # Add best layer text box
-    if best_info_p1:
-        text = "\n".join([f"{m}: L{l}, r={v:.3f}" for m, (l, v) in best_info_p1.items()])
-        ax1.text(0.98, 0.02, text, transform=ax1.transAxes, fontsize=7, ha='right', va='bottom',
-                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), family='monospace')
-
-    # === Panel 2: Probe Transfer (D→D vs D→M) ===
+    # Panel 2: Centered R² (Rigorous)
     ax2 = axes[0, 1]
-    ax2.set_title(f"Probe Transfer ({metric}): D→D vs D→M", fontsize=10)
+    ax2.set_title("Method 2: Centered Scaler (Rigorous)\n(Geometry Check)", fontsize=10)
 
-    best_info_p2 = {}
-    CHANCE_LEVEL = 0.25
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
 
-    # D→D probe (blue, dotted) - reference line with CI
-    if metric in probe_direct_r2:
-        d2d_r2 = _clip_r2_for_plot(np.array([probe_direct_r2[metric].get(l, 0) for l in layers]))
-        ax2.plot(layers, d2d_r2, ':', color=PROBE_COLOR, linewidth=2, alpha=0.6, label='D→D probe')
-        # CI for D→D
-        d2d_std = np.array([probe_direct_r2_std.get(metric, {}).get(l, 0) for l in layers])
-        if np.any(d2d_std > 0):
-            ax2.fill_between(layers, _clip_r2_for_plot(d2d_r2 - d2d_std),
-                           _clip_r2_for_plot(d2d_r2 + d2d_std), color=PROBE_COLOR, alpha=CI_ALPHA * 0.5)
+        # D→D
+        if metric in direct_r2:
+            d2d_r2 = _clip_r2_for_plot(np.array([direct_r2[metric].get(l, 0) for l in layers]))
+            ax2.plot(layers, d2d_r2, '-', label=f'{metric} D→D', color=color, linewidth=2, alpha=0.4)
+            if metric in direct_r2_std:
+                d2d_std = np.array([direct_r2_std[metric].get(l, 0) for l in layers])
+                ax2.fill_between(layers, _clip_r2_for_plot(d2d_r2 - d2d_std), _clip_r2_for_plot(d2d_r2 + d2d_std),
+                                 color=color, alpha=0.18)
 
-    # D→M probe (blue, solid) with CI
-    if metric in probe_results:
-        centered_r2 = np.array([probe_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
-        best_layer, best_r2 = _find_best(centered_r2)
-        best_info_p2["probe"] = (best_layer, best_r2)
-        ax2.plot(layers, _clip_r2_for_plot(centered_r2), '-', color=PROBE_COLOR, linewidth=2, label='D→M probe')
-        centered_std = np.array([probe_results[metric].get(l, {}).get("centered", {}).get("r2_std", 0) for l in layers])
+        # D→M centered
+        centered_r2 = np.array([transfer_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
+        centered_std = np.array([transfer_results[metric].get(l, {}).get("centered", {}).get("r2_std", 0) for l in layers])
+
+        finite = np.isfinite(centered_r2)
+        if finite.any():
+            best_layer = int(np.argmax(np.where(finite, centered_r2, -np.inf)))
+            best_r2 = centered_r2[best_layer]
+        else:
+            best_layer = 0
+            best_r2 = np.nan
+
+        ax2.plot(layers, _clip_r2_for_plot(centered_r2), '-',
+                 label=f'{metric} D→M (best L{best_layer}: {best_r2:.3f})' if np.isfinite(best_r2) else f'{metric} D→M',
+                 color=color, linewidth=2)
         if np.any(centered_std > 0):
-            ax2.fill_between(layers, _clip_r2_for_plot(centered_r2 - centered_std),
-                           _clip_r2_for_plot(centered_r2 + centered_std), color=PROBE_COLOR, alpha=CI_ALPHA)
+            ax2.fill_between(layers, _clip_r2_for_plot(centered_r2 - centered_std), _clip_r2_for_plot(centered_r2 + centered_std),
+                             color=color, alpha=0.2)
 
-    # Answer accuracy on secondary axis
-    if answer_d2d and answer_d2m:
-        ax2b = ax2.twinx()
-        d2d_acc = np.array([answer_d2d.get(l, {}).get("accuracy", np.nan) for l in layers])
-        d2m_acc = np.array([answer_d2m.get(l, {}).get("centered", {}).get("accuracy", np.nan) for l in layers])
-        d2d_acc_std = np.array([answer_d2d.get(l, {}).get("accuracy_std", 0) for l in layers])
-        d2m_acc_std = np.array([answer_d2m.get(l, {}).get("centered", {}).get("accuracy_std", 0) for l in layers])
-
-        # D→D answer (black, dotted) with CI
-        ax2b.plot(layers, d2d_acc, ':', color=ANSWER_COLOR, linewidth=2, alpha=0.6, label='D→D answer')
-        if np.any(d2d_acc_std > 0):
-            ax2b.fill_between(layers, np.clip(d2d_acc - d2d_acc_std, 0, 1),
-                            np.clip(d2d_acc + d2d_acc_std, 0, 1), color=ANSWER_COLOR, alpha=CI_ALPHA * 0.5)
-
-        # D→M answer (black, solid) with CI
-        best_layer, best_acc = _find_best(d2m_acc)
-        best_info_p2["answer"] = (best_layer, best_acc)
-        ax2b.plot(layers, d2m_acc, '-', color=ANSWER_COLOR, linewidth=2, label='D→M answer')
-        if np.any(d2m_acc_std > 0):
-            ax2b.fill_between(layers, np.clip(d2m_acc - d2m_acc_std, 0, 1),
-                            np.clip(d2m_acc + d2m_acc_std, 0, 1), color=ANSWER_COLOR, alpha=CI_ALPHA)
-
-        ax2b.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.3, linewidth=1)
-        ax2b.set_ylabel('Answer Accuracy', color=ANSWER_COLOR)
-        ax2b.set_ylim(0, 1.0)
-
-    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5, label='Chance')
     ax2.set_xlabel('Layer Index')
-    ax2.set_ylabel('R² (out-of-sample)', color=PROBE_COLOR)
-    # Combine legends from both axes
-    handles1, labels1 = ax2.get_legend_handles_labels()
-    if answer_d2d and answer_d2m:
-        handles2, labels2 = ax2b.get_legend_handles_labels()
-        ax2.legend(handles1 + handles2, labels1 + labels2, loc='upper left', fontsize=8)
-    else:
-        ax2.legend(loc='upper left', fontsize=8)
-    ax2.grid(True, alpha=GRID_ALPHA)
+    ax2.set_ylabel('R² (out-of-sample)')
+    ax2.legend(loc='upper left', fontsize=7)
+    ax2.grid(True, alpha=0.3)
 
-    # === Panel 3: Mean-diff Transfer (D→D vs D→M) ===
+    # Panel 3: Pearson Correlation (Shift Invariant)
     ax3 = axes[1, 0]
-    ax3.set_title(f"Mean-diff Transfer ({metric}): D→D vs D→M", fontsize=10)
+    ax3.set_title("Method 3: Pearson Correlation\n(Shift Invariant Signal Check)", fontsize=10)
 
-    best_info_p3 = {}
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
 
-    # D→D mean-diff (orange, dotted) - reference line with CI
-    if metric in mean_diff_direct_r2:
-        d2d_r2 = _clip_r2_for_plot(np.array([mean_diff_direct_r2[metric].get(l, 0) for l in layers]))
-        ax3.plot(layers, d2d_r2, ':', color=MEANDIFF_COLOR, linewidth=2, alpha=0.6, label='D→D mean-diff')
-        # CI for D→D
-        d2d_std = np.array([mean_diff_direct_r2_std.get(metric, {}).get(l, 0) for l in layers])
-        if np.any(d2d_std > 0):
-            ax3.fill_between(layers, _clip_r2_for_plot(d2d_r2 - d2d_std),
-                           _clip_r2_for_plot(d2d_r2 + d2d_std), color=MEANDIFF_COLOR, alpha=CI_ALPHA * 0.5)
+        # D→D Pearson (sqrt of R²)
+        if metric in direct_r2:
+            d2d_corr = [np.sqrt(max(direct_r2[metric].get(l, 0), 0.0)) for l in layers]
+            ax3.plot(layers, d2d_corr, '-', label=f'{metric} D→D', color=color, linewidth=2, alpha=0.4)
 
-    # D→M mean-diff (orange, solid) with CI
-    if mean_diff_results and metric in mean_diff_results:
-        centered_r2 = np.array([mean_diff_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
-        best_layer, best_r2 = _find_best(centered_r2)
-        best_info_p3["mean_diff"] = (best_layer, best_r2)
-        ax3.plot(layers, _clip_r2_for_plot(centered_r2), '-', color=MEANDIFF_COLOR, linewidth=2, label='D→M mean-diff')
-        centered_std = np.array([mean_diff_results[metric].get(l, {}).get("centered", {}).get("r2_std", 0) for l in layers])
-        if np.any(centered_std > 0):
-            ax3.fill_between(layers, _clip_r2_for_plot(centered_r2 - centered_std),
-                           _clip_r2_for_plot(centered_r2 + centered_std), color=MEANDIFF_COLOR, alpha=CI_ALPHA)
+        # D→M Pearson
+        pearson_r = np.array([transfer_results[metric].get(l, {}).get("centered", {}).get("pearson", np.nan) for l in layers], dtype=float)
 
-    # Answer accuracy on secondary axis (same as Panel 2 for comparison)
-    if answer_d2d and answer_d2m:
-        ax3b = ax3.twinx()
-        d2d_acc = np.array([answer_d2d.get(l, {}).get("accuracy", np.nan) for l in layers])
-        d2m_acc = np.array([answer_d2m.get(l, {}).get("centered", {}).get("accuracy", np.nan) for l in layers])
-        d2d_acc_std = np.array([answer_d2d.get(l, {}).get("accuracy_std", 0) for l in layers])
-        d2m_acc_std = np.array([answer_d2m.get(l, {}).get("centered", {}).get("accuracy_std", 0) for l in layers])
+        finite = np.isfinite(pearson_r)
+        if finite.any():
+            best_layer = int(np.argmax(np.abs(pearson_r[finite])))
+            best_layer = int(np.array(layers)[finite][best_layer])
+            best_corr = pearson_r[best_layer]
+        else:
+            best_layer = 0
+            best_corr = np.nan
 
-        # D→D answer (black, dotted) with CI
-        ax3b.plot(layers, d2d_acc, ':', color=ANSWER_COLOR, linewidth=2, alpha=0.6, label='D→D answer')
-        if np.any(d2d_acc_std > 0):
-            ax3b.fill_between(layers, np.clip(d2d_acc - d2d_acc_std, 0, 1),
-                            np.clip(d2d_acc + d2d_acc_std, 0, 1), color=ANSWER_COLOR, alpha=CI_ALPHA * 0.5)
-
-        # D→M answer (black, solid) with CI
-        best_layer, best_acc = _find_best(d2m_acc)
-        best_info_p3["answer"] = (best_layer, best_acc)
-        ax3b.plot(layers, d2m_acc, '-', color=ANSWER_COLOR, linewidth=2, label='D→M answer')
-        if np.any(d2m_acc_std > 0):
-            ax3b.fill_between(layers, np.clip(d2m_acc - d2m_acc_std, 0, 1),
-                            np.clip(d2m_acc + d2m_acc_std, 0, 1), color=ANSWER_COLOR, alpha=CI_ALPHA)
-
-        ax3b.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.3, linewidth=1)
-        ax3b.set_ylabel('Answer Accuracy', color=ANSWER_COLOR)
-        ax3b.set_ylim(0, 1.0)
+        ax3.plot(layers, pearson_r, '-',
+                 label=f'{metric} D→M (best L{best_layer}: {best_corr:.3f})' if np.isfinite(best_corr) else f'{metric} D→M',
+                 color=color, linewidth=2)
 
     ax3.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
     ax3.set_xlabel('Layer Index')
-    ax3.set_ylabel('R² (out-of-sample)', color=MEANDIFF_COLOR)
-    # Combine legends from both axes
-    handles1, labels1 = ax3.get_legend_handles_labels()
-    if answer_d2d and answer_d2m:
-        handles2, labels2 = ax3b.get_legend_handles_labels()
-        ax3.legend(handles1 + handles2, labels1 + labels2, loc='upper left', fontsize=8)
-    else:
-        ax3.legend(loc='upper left', fontsize=8)
-    ax3.grid(True, alpha=GRID_ALPHA)
+    ax3.set_ylabel('Correlation (r)')
+    ax3.legend(loc='upper left', fontsize=7)
+    ax3.grid(True, alpha=0.3)
 
-    # === Panel 4: Transfer Ratio ===
+    # Panel 4: Signal Emergence (Normalized timecourse)
     ax4 = axes[1, 1]
-    ax4.set_title(f"Transfer Ratio ({metric}): D→M / D→D", fontsize=10)
+    ax4.set_title("Signal Emergence (Min-Max Scaled)\nCheck: Do lines rise together?", fontsize=10)
 
-    # Helper to compute ratio safely (avoid div by zero, clip extremes)
-    def _safe_ratio(d2m, d2d, min_denom=0.01):
-        """Compute D→M / D→D ratio, handling edge cases."""
-        ratio = np.full_like(d2m, np.nan)
-        valid = (d2d > min_denom) & np.isfinite(d2m)
-        ratio[valid] = d2m[valid] / d2d[valid]
-        return np.clip(ratio, 0, 2.0)  # Clip to reasonable range
+    for metric in metrics:
+        color = colors.get(metric, 'tab:gray')
 
-    # Probe transfer ratio (blue, solid)
-    if metric in probe_direct_r2 and metric in probe_results:
-        d2d_r2 = np.array([probe_direct_r2[metric].get(l, 0) for l in layers], dtype=float)
-        d2m_r2 = np.array([probe_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
-        probe_ratio = _safe_ratio(d2m_r2, d2d_r2)
-        ax4.plot(layers, probe_ratio, '-', color=PROBE_COLOR, linewidth=2, label='probe')
+        # D→D normalized
+        if metric in direct_r2:
+            d2d_r2 = _clip_r2_for_plot(np.array([direct_r2[metric].get(l, 0) for l in layers]))
+            if d2d_r2.max() > d2d_r2.min():
+                d2d_norm = (d2d_r2 - d2d_r2.min()) / (d2d_r2.max() - d2d_r2.min())
+            else:
+                d2d_norm = np.zeros_like(d2d_r2)
+            ax4.plot(layers, d2d_norm, '-', label=f'{metric} D→D', color=color, linewidth=2, alpha=0.4)
 
-    # Mean-diff transfer ratio (orange, dashed)
-    if metric in mean_diff_direct_r2 and mean_diff_results and metric in mean_diff_results:
-        d2d_r2 = np.array([mean_diff_direct_r2[metric].get(l, 0) for l in layers], dtype=float)
-        d2m_r2 = np.array([mean_diff_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
-        meandiff_ratio = _safe_ratio(d2m_r2, d2d_r2)
-        ax4.plot(layers, meandiff_ratio, '--', color=MEANDIFF_COLOR, linewidth=2, label='mean-diff')
-
-    # Answer transfer ratio (black, solid thin)
-    if answer_d2d and answer_d2m:
-        d2d_acc = np.array([answer_d2d.get(l, {}).get("accuracy", np.nan) for l in layers], dtype=float)
-        d2m_acc = np.array([answer_d2m.get(l, {}).get("centered", {}).get("accuracy", np.nan) for l in layers], dtype=float)
-        answer_ratio = _safe_ratio(d2m_acc, d2d_acc, min_denom=0.1)  # Higher threshold for accuracy
-        ax4.plot(layers, answer_ratio, '-', color=ANSWER_COLOR, linewidth=1.5, label='answer')
-
-    # Reference line at 1.0 (perfect transfer)
-    ax4.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7, linewidth=1, label='perfect transfer')
-    ax4.axhline(y=0, color='gray', linestyle=':', alpha=0.3, linewidth=1)
+        # D→M normalized
+        centered_r2 = np.array([transfer_results[metric].get(l, {}).get("centered", {}).get("r2", np.nan) for l in layers], dtype=float)
+        centered_r2_plot = _clip_r2_for_plot(centered_r2)
+        if np.nanmax(centered_r2) > np.nanmin(centered_r2):
+            normalized = (centered_r2 - np.nanmin(centered_r2)) / (np.nanmax(centered_r2) - np.nanmin(centered_r2))
+        else:
+            normalized = np.zeros_like(centered_r2)
+        ax4.plot(layers, normalized, '-', label=f'{metric} D→M', color=color, linewidth=2)
 
     ax4.set_xlabel('Layer Index')
-    ax4.set_ylabel('Transfer Ratio (D→M / D→D)')
-    ax4.set_ylim(-0.1, 2.1)
-    ax4.legend(loc='upper left', fontsize=8)
-    ax4.grid(True, alpha=GRID_ALPHA)
+    ax4.set_ylabel('Normalized R² (0-1)')
+    ax4.legend(loc='upper left', fontsize=7)
+    ax4.grid(True, alpha=0.3)
 
     # Add behavioral correlation text box
-    behav_text = f"Metric ↔ Confidence:\n{metric}: r={behavioral.get(metric, {}).get('test_pearson_r', float('nan')):.3f}"
+    behav_text = "Metric ↔ Confidence (full dataset):\n"
+    for metric in metrics:
+        sign = metric_sign_for_confidence(metric)
+        sign_str = " (inv)" if sign < 0 else ""
+        behav_r = behavioral.get(metric, {}).get("pearson_r", float("nan"))
+        behav_text += f"  {metric}{sign_str}: r={behav_r:.3f}\n"
+
+    behav_text += "\nMetric ↔ Confidence (test set):\n"
+    for metric in metrics:
+        sign = metric_sign_for_confidence(metric)
+        sign_str = " (inv)" if sign < 0 else ""
+        test_r = behavioral.get(metric, {}).get("test_pearson_r", float("nan"))
+        behav_text += f"  {metric}{sign_str}: r={test_r:.3f}\n"
+
     fig.text(0.02, 0.02, behav_text, fontsize=8, family='monospace',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
-def plot_confidence_directions(
-    conf_results: dict,
-    conf_unc_comparison: dict,
+def plot_answer_transfer_results(
+    d2d_results: dict,
+    d2m_results_by_pos: dict,
     num_layers: int,
     output_path: Path,
     meta_task: str,
-    compare_metric: str = None,
 ):
     """
-    Plot meta-task confidence direction results (trained on meta activations).
+    Plot answer classifier transfer accuracy across layers.
 
-    Shows probe and mean-diff R² by layer, with cosine similarity between methods,
-    and optionally comparison to transferred uncertainty directions.
+    Follows the same visual language as uncertainty transfer plots:
+    - D→D shown as lighter reference lines
+    - D→M shown as solid transfer lines
+    - Per-position breakdown with consistent colors
+    - Chance baseline at 25%
 
-    Args:
-        conf_results: Results from find_confidence_directions_both_methods()
-        conf_unc_comparison: Dict {"probe": {layer: {...}}, "mean_diff": {layer: {...}}}
-            comparing confidence directions to uncertainty directions
-        num_layers: Number of model layers
-        output_path: Where to save the figure
-        meta_task: Name of meta-task for title
-        compare_metric: Which uncertainty metric was compared (e.g., "entropy")
+    2x2 grid:
+    - Panel 1: D→D vs D→M accuracy (centered) - main transfer result
+    - Panel 2: D→D vs D→M accuracy (separate) - upper bound
+    - Panel 3: Transfer efficiency (D→M / D→D ratio)
+    - Panel 4: Normalized accuracy (min-max scaled emergence)
     """
+    CHANCE_LEVEL = 0.25  # 4-way classification
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Answer Direction D→M Transfer: {meta_task}", fontsize=14, fontweight='bold')
+
     layers = list(range(num_layers))
 
-    # Determine layout based on whether we have uncertainty comparison
-    n_cols = 3 if conf_unc_comparison else 2
-    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
-    if n_cols == 2:
-        axes = list(axes) + [None]  # pad for uniform indexing
-    fig.suptitle(f"Meta-task Confidence Directions: {meta_task}", fontsize=14, fontweight='bold')
+    # Position styling (match other transfer plots)
+    pos_colors = {
+        "question_mark": "tab:blue",
+        "question_newline": "tab:cyan",
+        "options_newline": "tab:green",
+        "final": "tab:red",
+    }
+    pos_labels = {
+        "question_mark": "question ?",
+        "question_newline": "question \\n",
+        "options_newline": "options \\n",
+        "final": "final",
+    }
 
-    # Panel 1: R² by layer for probe and mean-diff
-    ax1 = axes[0]
-    ax1.set_title("Confidence R² by Layer", fontsize=10)
+    positions = [p for p in d2m_results_by_pos.keys() if d2m_results_by_pos[p]]
 
-    for method, color, ls in [("probe", "tab:blue", "-"), ("mean_diff", "tab:orange", "--")]:
-        fits = conf_results["fits"][method]
-        r2_vals = [fits[l]["test_r2"] for l in layers]
-        ci_low = [fits[l].get("test_r2_ci_low", np.nan) for l in layers]
-        ci_high = [fits[l].get("test_r2_ci_high", np.nan) for l in layers]
+    # Build D→D accuracy and std arrays
+    d2d_acc = np.array([d2d_results.get(l, {}).get("accuracy", np.nan) for l in layers])
+    d2d_std = np.array([d2d_results.get(l, {}).get("accuracy_std", 0) for l in layers])
 
-        best_layer = max(layers, key=lambda l: fits[l]["test_r2"])
-        best_r2 = fits[best_layer]["test_r2"]
+    # Find best D→D layer
+    d2d_finite = np.isfinite(d2d_acc)
+    if d2d_finite.any():
+        best_d2d_layer = int(np.argmax(np.where(d2d_finite, d2d_acc, -np.inf)))
+        best_d2d_acc = d2d_acc[best_d2d_layer]
+    else:
+        best_d2d_layer, best_d2d_acc = 0, np.nan
 
-        ax1.plot(layers, r2_vals, ls, color=color, linewidth=2,
-                 label=f'{method} (L{best_layer}: {best_r2:.3f})')
-        if not all(np.isnan(ci_low)):
-            ax1.fill_between(layers, ci_low, ci_high, color=color, alpha=CI_ALPHA)
+    # Panel 1: D→D vs D→M Centered (Rigorous Transfer Test)
+    ax1 = axes[0, 0]
+    ax1.set_title("Centered Scaling (Rigorous)\nD→D reference vs D→M transfer", fontsize=10)
+    ax1.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.7, linewidth=1.5, label=f"Chance ({CHANCE_LEVEL:.0%})")
 
-    ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-    ax1.set_xlabel('Layer Index')
-    ax1.set_ylabel('R² (test set)')
-    ax1.legend(loc='upper left', fontsize=8)
-    ax1.grid(True, alpha=GRID_ALPHA)
+    # D→D as reference with CI band
+    ax1.plot(layers, d2d_acc, '-', color='tab:purple', linewidth=2, alpha=0.4,
+             label=f'D→D (best L{best_d2d_layer}: {best_d2d_acc:.1%})')
+    if np.any(d2d_std > 0):
+        ax1.fill_between(layers, d2d_acc - d2d_std, d2d_acc + d2d_std, color='tab:purple', alpha=0.18)
 
-    # Panel 2: Cosine similarity between probe and mean-diff directions
-    ax2 = axes[1]
-    ax2.set_title("Probe vs Mean-diff Cosine Similarity", fontsize=10)
+    # D→M per position with CI bands
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
 
-    cosine_sims = [conf_results["comparison"][l]["cosine_sim"] for l in layers]
-    ax2.plot(layers, cosine_sims, '-', color='tab:purple', linewidth=2)
-    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-    ax2.set_xlabel('Layer Index')
-    ax2.set_ylabel('Cosine Similarity')
-    ax2.set_ylim(-1.1, 1.1)
-    ax2.grid(True, alpha=GRID_ALPHA)
+        d2m_acc = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+        d2m_std = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy_std", 0)
+            for l in layers
+        ])
 
-    # Panel 3: Comparison with transferred uncertainty directions (if available)
-    if conf_unc_comparison and axes[2] is not None:
-        ax3 = axes[2]
-        metric_label = compare_metric if compare_metric else "Uncertainty"
-        ax3.set_title(f"Confidence vs {metric_label} Directions", fontsize=10)
+        finite = np.isfinite(d2m_acc)
+        if finite.any():
+            best_layer = int(np.argmax(np.where(finite, d2m_acc, -np.inf)))
+            best_acc = d2m_acc[best_layer]
+            label = f'D→M {display_name} (L{best_layer}: {best_acc:.1%})'
+        else:
+            label = f'D→M {display_name}'
 
-        # Plot cosine similarity with uncertainty directions
-        # conf_unc_comparison has structure: {"probe": {layer: {"cosine_similarity": ...}}, "mean_diff": {...}}
-        for method, color, ls in [("probe", "tab:blue", "-"), ("mean_diff", "tab:orange", "--")]:
-            method_comparison = conf_unc_comparison.get(method, {})
-            sims = [method_comparison.get(l, {}).get("cosine_similarity", np.nan) for l in layers]
-            if not all(np.isnan(sims)):
-                ax3.plot(layers, sims, ls, color=color, linewidth=2, label=f'{method}')
+        ax1.plot(layers, d2m_acc, '-', color=color, linewidth=2, label=label)
+        if np.any(d2m_std > 0):
+            ax1.fill_between(layers, d2m_acc - d2m_std, d2m_acc + d2m_std, color=color, alpha=0.2)
 
-        ax3.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-        ax3.set_xlabel('Layer Index')
-        ax3.set_ylabel('Cosine Similarity')
-        ax3.set_ylim(-1.1, 1.1)
-        ax3.legend(loc='upper left', fontsize=8)
-        ax3.grid(True, alpha=GRID_ALPHA)
+    ax1.set_xlabel("Layer Index")
+    ax1.set_ylabel("Accuracy")
+    ax1.set_ylim(0, 1.0)
+    ax1.legend(loc='lower right', fontsize=7)
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: D→D vs D→M Separate (Upper Bound)
+    ax2 = axes[0, 1]
+    ax2.set_title("Separate Scaling (Upper Bound)\nD→D reference vs D→M with domain adaptation", fontsize=10)
+    ax2.axhline(y=CHANCE_LEVEL, color='gray', linestyle=':', alpha=0.7, linewidth=1.5, label=f"Chance ({CHANCE_LEVEL:.0%})")
+
+    # D→D as reference with CI band
+    ax2.plot(layers, d2d_acc, '-', color='tab:purple', linewidth=2, alpha=0.4,
+             label=f'D→D (best L{best_d2d_layer}: {best_d2d_acc:.1%})')
+    if np.any(d2d_std > 0):
+        ax2.fill_between(layers, d2d_acc - d2d_std, d2d_acc + d2d_std, color='tab:purple', alpha=0.18)
+
+    # D→M separate per position with CI bands
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        d2m_acc_sep = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("separate", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+        d2m_std_sep = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("separate", {}).get("accuracy_std", 0)
+            for l in layers
+        ])
+
+        finite = np.isfinite(d2m_acc_sep)
+        if finite.any():
+            best_layer = int(np.argmax(np.where(finite, d2m_acc_sep, -np.inf)))
+            best_acc = d2m_acc_sep[best_layer]
+            label = f'D→M {display_name} (L{best_layer}: {best_acc:.1%})'
+        else:
+            label = f'D→M {display_name}'
+
+        ax2.plot(layers, d2m_acc_sep, '-', color=color, linewidth=2, label=label)
+        if np.any(d2m_std_sep > 0):
+            ax2.fill_between(layers, d2m_acc_sep - d2m_std_sep, d2m_acc_sep + d2m_std_sep, color=color, alpha=0.2)
+
+    ax2.set_xlabel("Layer Index")
+    ax2.set_ylabel("Accuracy")
+    ax2.set_ylim(0, 1.0)
+    ax2.legend(loc='lower right', fontsize=7)
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Transfer Efficiency (D→M / D→D ratio)
+    ax3 = axes[1, 0]
+    ax3.set_title("Transfer Efficiency\n(D→M Centered / D→D)", fontsize=10)
+    ax3.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, linewidth=1, label='Perfect transfer')
+
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        ratios = []
+        ratio_layers = []
+        for layer in layers:
+            d2d_val = d2d_results.get(layer, {}).get("accuracy", np.nan)
+            d2m_val = d2m_results_by_pos[pos].get(layer, {}).get("centered", {}).get("accuracy", np.nan)
+            if np.isfinite(d2d_val) and np.isfinite(d2m_val) and d2d_val > CHANCE_LEVEL:
+                ratios.append(d2m_val / d2d_val)
+                ratio_layers.append(layer)
+
+        if ratios:
+            best_ratio_idx = int(np.argmax(ratios))
+            best_ratio = ratios[best_ratio_idx]
+            best_ratio_layer = ratio_layers[best_ratio_idx]
+            ax3.plot(ratio_layers, ratios, '-', color=color, linewidth=2,
+                     label=f'{display_name} (L{best_ratio_layer}: {best_ratio:.2f})')
+
+    ax3.set_xlabel("Layer Index")
+    ax3.set_ylabel("D→M / D→D Ratio")
+    ax3.set_ylim(0, 1.5)
+    ax3.legend(loc='lower right', fontsize=7)
+    ax3.grid(True, alpha=0.3)
+
+    # Panel 4: Signal Emergence (min-max scaled)
+    ax4 = axes[1, 1]
+    ax4.set_title("Signal Emergence (Min-Max Scaled)\nNormalized timecourse", fontsize=10)
+
+    # Normalize D→D
+    d2d_valid = d2d_acc[np.isfinite(d2d_acc)]
+    if len(d2d_valid) > 1:
+        d2d_min, d2d_max = d2d_valid.min(), d2d_valid.max()
+        if d2d_max > d2d_min:
+            d2d_norm = (d2d_acc - d2d_min) / (d2d_max - d2d_min)
+            ax4.plot(layers, d2d_norm, '-', color='tab:purple', linewidth=2, alpha=0.4, label='D→D')
+
+    # Normalize D→M per position
+    for pos in positions:
+        color = pos_colors.get(pos, "tab:gray")
+        display_name = pos_labels.get(pos, pos)
+
+        d2m_acc = np.array([
+            d2m_results_by_pos[pos].get(l, {}).get("centered", {}).get("accuracy", np.nan)
+            for l in layers
+        ])
+
+        d2m_valid = d2m_acc[np.isfinite(d2m_acc)]
+        if len(d2m_valid) > 1:
+            d2m_min, d2m_max = d2m_valid.min(), d2m_valid.max()
+            if d2m_max > d2m_min:
+                d2m_norm = (d2m_acc - d2m_min) / (d2m_max - d2m_min)
+                ax4.plot(layers, d2m_norm, '-', color=color, linewidth=2, label=display_name)
+
+    ax4.set_xlabel("Layer Index")
+    ax4.set_ylabel("Normalized Accuracy (0-1)")
+    ax4.set_ylim(-0.1, 1.1)
+    ax4.legend(loc='lower right', fontsize=7)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    save_figure(fig, output_path)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 def plot_position_comparison(
@@ -962,7 +1209,7 @@ def plot_position_comparison(
         ax.set_ylabel('R²')
         ax.set_ylim(R2_PLOT_FLOOR, R2_PLOT_CEIL)
         ax.legend(loc='upper left', fontsize=9)
-        ax.grid(True, alpha=GRID_ALPHA)
+        ax.grid(True, alpha=0.3)
 
     # Bottom row: mean-diff
     for col, metric in enumerate(metrics):
@@ -1001,9 +1248,12 @@ def plot_position_comparison(
         ax.set_ylabel('R²')
         ax.set_ylim(R2_PLOT_FLOOR, R2_PLOT_CEIL)
         ax.legend(loc='upper left', fontsize=9)
-        ax.grid(True, alpha=GRID_ALPHA)
+        ax.grid(True, alpha=0.3)
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 # =============================================================================
@@ -1020,7 +1270,7 @@ def main():
     dataset = load_dataset(dataset_path)
 
     # Infer model from dataset
-    model_name = dataset['config']['model']
+    model_name = dataset['config']['base_model']
     model_short = get_model_short_name(model_name)
 
     print(f"  Model: {model_name}")
@@ -1056,13 +1306,15 @@ def main():
     # Determine output paths
     if ADAPTER:
         adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset['config']['dataset']}_meta_{META_TASK}"
+        base_output = f"{model_short}_adapter-{adapter_short}_{dataset['config']['dataset']}_transfer_{META_TASK}"
     else:
-        base_output = f"{model_short}_{dataset['config']['dataset']}_meta_{META_TASK}"
+        base_output = f"{model_short}_{dataset['config']['dataset']}_transfer_{META_TASK}"
 
     activations_path = OUTPUT_DIR / f"{base_output}_activations.npz"
     results_json_path = OUTPUT_DIR / f"{base_output}_results.json"
     results_npz_path = OUTPUT_DIR / f"{base_output}_results.npz"
+    plot_path = OUTPUT_DIR / f"{base_output}_results.png"
+    plot_path_mean_diff = OUTPUT_DIR / f"{base_output}_mean_diff_results.png"
     plot_path_positions = OUTPUT_DIR / f"{base_output}_position_comparison.png"
 
     print(f"\nMeta task: {META_TASK}")
@@ -1486,9 +1738,7 @@ def main():
         }
 
         sign_str = "(inverted)" if sign < 0 else ""
-        ci_lo = corr - 1.96 * full_std
-        ci_hi = corr + 1.96 * full_std
-        print(f"  {metric} {sign_str}: r={corr:.3f} [{ci_lo:.3f}, {ci_hi:.3f}] (p={p_value:.2e}), ρ={spearman_corr:.3f}")
+        print(f"  {metric} {sign_str}: r={corr:.3f}±{full_std:.3f} (p={p_value:.2e}), ρ={spearman_corr:.3f}")
 
 
     # Test-set baseline: correlation between (signed) raw metric values and meta-task target
@@ -1511,9 +1761,7 @@ def main():
         behavioral[metric]["test_spearman_p"] = float(test_rs_p)
 
         sign_str = "(inverted)" if sign < 0 else ""
-        test_ci_lo = test_r - 1.96 * test_std
-        test_ci_hi = test_r + 1.96 * test_std
-        print(f"  {metric} {sign_str} test-set: r={test_r:.3f} [{test_ci_lo:.3f}, {test_ci_hi:.3f}], ρ={test_rs:.3f}")
+        print(f"  {metric} {sign_str} test-set: r={test_r:.3f}±{test_std:.3f}, ρ={test_rs:.3f}")
 
     # =============================================================================
     # MEAN-DIFF TRANSFER (precomputed directions)
@@ -1672,13 +1920,14 @@ def main():
             print(f"    {pos}: R²={best_r2:.3f} (L{best_layer})")
 
     # =============================================================================
-    # ANSWER DIRECTION D2M TRANSFER
+    # ANSWER DIRECTION D2M TRANSFER (confound control)
     # =============================================================================
     # This tests whether answer directions (trained to predict A/B/C/D from direct
     # activations) can also predict answers in meta-task activations.
-
+    # If answer directions transfer as well as uncertainty directions, then D2M
+    # transfer might be confounded by answer encoding rather than uncertainty.
     print("\n" + "=" * 60)
-    print("ANSWER DIRECTION D2M TRANSFER")
+    print("ANSWER DIRECTION D2M TRANSFER (Confound Control)")
     print("=" * 60)
 
     answer_transfer_results = {}
@@ -1813,83 +2062,90 @@ def main():
             if best_unc_r2 > -float("inf"):
                 print(f"    {pos}: answer_acc={best_answer_acc:.1%}, uncertainty_r2={best_unc_r2:.3f}")
                 if best_answer_acc > 0.35:  # Well above chance (25%)
-                    print(f"      Answer directions transfer well ")
+                    print(f"      Warning: Answer directions transfer well - possible confound")
     else:
         print(f"\n  No answer classifiers found at {answer_probes_path}")
-        print("  Run identify_mc_answer_correlate.py first.")
+        print("  Run identify_mc_answer_correlate.py first to enable confound control.")
 
-    # For backward compatibility, use "final" position for legacy results
+    # For backward compatibility, use "final" position for legacy plots
     mean_diff_transfer_results = mean_diff_transfer_by_pos.get("final", mean_diff_transfer_by_pos.get(positions_available[0], {}))
 
-    # Plot combined transfer results - one 4-panel plot per position
-    # Combines probe (solid), mean-diff (dashed), and answer (dotted) on same figure
-    print(f"\nPlotting combined transfer results (per position)...")
-    print(f"  Metrics to plot: {metrics_tested}")
+    # Plot probe transfer results - one 4-panel plot per position
+    print(f"\nPlotting probe transfer results (per position)...")
     for pos in positions_available:
         if not transfer_results_by_pos[pos]:
             print(f"  Skipping {pos} (no data)")
             continue
-
-        # Get answer data for this position if available
-        answer_d2d = None
-        answer_d2m = None
-        if answer_transfer_results:
-            answer_d2d = answer_transfer_results.get("d2d")
-            answer_d2m = answer_transfer_results.get("d2m_by_position", {}).get(pos)
-
-        for metric in metrics_tested:
-            print(f"    {pos}/{metric}...")
-            pos_plot_path = OUTPUT_DIR / f"{base_output}_transfer_{pos}_{metric}.png"
-            plot_combined_transfer_results(
-                probe_results=transfer_results_by_pos[pos],
-                probe_direct_r2=direct_r2,
-                probe_direct_r2_std=direct_r2_std,
-                mean_diff_results=mean_diff_transfer_by_pos.get(pos, {}),
-                mean_diff_direct_r2=mean_diff_direct_r2,
-                mean_diff_direct_r2_std=mean_diff_direct_r2_std,
-                behavioral=behavioral,
-                num_layers=num_layers,
-                output_path=pos_plot_path,
-                meta_task=META_TASK,
-                metric=metric,
-                position=pos,
-                answer_d2d=answer_d2d,
-                answer_d2m=answer_d2m,
-            )
-
-    # Plot position comparison (only if multiple positions)
-    if len(positions_available) > 1:
-        print(f"\nPlotting position comparison...")
-        plot_position_comparison(
-            transfer_results_by_pos,
-            mean_diff_transfer_by_pos,
-            num_layers,
-            plot_path_positions,
-            META_TASK,
+        pos_plot_path = plot_path.with_name(f"{plot_path.stem}_{pos}.png")
+        plot_transfer_results(
+            transfer_results=transfer_results_by_pos[pos],
+            direct_r2=direct_r2,
+            direct_r2_std=direct_r2_std,
+            behavioral=behavioral,
+            num_layers=num_layers,
+            output_path=pos_plot_path,
+            meta_task=META_TASK,
+            title_prefix=f"Probe Transfer ({pos})",
         )
-    else:
-        print(f"\nSkipping position comparison (only 1 position: {positions_available[0]})")
+
+    # Plot mean-diff transfer results - one 4-panel plot per position
+    print(f"\nPlotting mean-diff transfer results (per position)...")
+    for pos in positions_available:
+        if not mean_diff_transfer_by_pos[pos]:
+            print(f"  Skipping mean-diff {pos} (no data)")
+            continue
+        pos_plot_path = plot_path_mean_diff.with_name(f"{plot_path_mean_diff.stem}_{pos}.png")
+        plot_mean_diff_transfer_results(
+            transfer_results=mean_diff_transfer_by_pos[pos],
+            direct_r2=mean_diff_direct_r2,
+            direct_r2_std=mean_diff_direct_r2_std,
+            behavioral=behavioral,
+            num_layers=num_layers,
+            output_path=pos_plot_path,
+            meta_task=META_TASK,
+            title_prefix=f"Mean-diff Transfer ({pos})",
+        )
+
+    # Plot position comparison (overlay view)
+    print(f"\nPlotting position comparison...")
+    plot_position_comparison(
+        transfer_results_by_pos,
+        mean_diff_transfer_by_pos,
+        num_layers,
+        plot_path_positions,
+        META_TASK,
+    )
+
+    # Plot answer transfer results (if available)
+    if answer_transfer_results:
+        print(f"\nPlotting answer transfer results...")
+        answer_plot_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_transfer_{META_TASK}_answer.png"
+        plot_answer_transfer_results(
+            d2d_results=answer_transfer_results["d2d"],
+            d2m_results_by_pos=answer_transfer_results["d2m_by_position"],
+            num_layers=num_layers,
+            output_path=answer_plot_path,
+            meta_task=META_TASK,
+        )
 
     # Save JSON results
     print(f"Saving results to {results_json_path}...")
     results_json = {
-        "config": get_config_dict(
-            model=model_name,
-            dataset=dataset['config']['dataset'],
-            meta_task=META_TASK,
-            num_questions=len(dataset['questions']),
-            num_layers=num_layers,
-            input_base_name=INPUT_BASE_NAME,
-            train_split=TRAIN_SPLIT,
-            n_train=len(train_idx),
-            n_test=len(test_idx),
-            seed=SEED,
-            probe_alpha=PROBE_ALPHA,
-            probe_pca_components=PROBE_PCA_COMPONENTS,
-            probe_positions=positions_available,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-        ),
+        "config": {
+            "model": model_name,
+            "dataset": dataset['config']['dataset'],
+            "meta_task": META_TASK,
+            "num_questions": len(dataset['questions']),
+            "num_layers": num_layers,
+            "input_base_name": INPUT_BASE_NAME,
+            "train_split": TRAIN_SPLIT,
+            "n_train": len(train_idx),
+            "n_test": len(test_idx),
+            "seed": SEED,
+            "probe_alpha": PROBE_ALPHA,
+            "probe_pca_components": PROBE_PCA_COMPONENTS,
+            "probe_positions": positions_available,
+        },
         "meta_target_stats": compute_behavioral_stats(
             confidences, option_probs, META_TASK
         ),
@@ -1997,7 +2253,7 @@ def main():
                 },
             }
 
-    # Add answer direction transfer results
+    # Add answer direction transfer results (confound control)
     if answer_transfer_results:
         results_json["answer_transfer"] = {
             "answer_mapping": answer_transfer_results.get("answer_mapping", {}),
@@ -2090,238 +2346,21 @@ def main():
 
     np.savez(results_npz_path, **save_dict)
 
-    # =========================================================================
-    # CONFIDENCE DIRECTIONS (optional)
-    # =========================================================================
-    if FIND_CONFIDENCE_DIRECTIONS:
-        print("\n" + "=" * 60)
-        print("FINDING CONFIDENCE DIRECTIONS")
-        print("=" * 60)
-
-        # Extract activations for "final" position
-        meta_activations_by_layer = {}
-        acts_data = np.load(activations_path)
-        has_positions = any("_" in k.replace("layer_", "", 1) for k in acts_data.files if k.startswith("layer_"))
-        if has_positions:
-            for i in range(num_layers):
-                meta_activations_by_layer[i] = acts_data[f"layer_{i}_final"]
-        else:
-            for i in range(num_layers):
-                meta_activations_by_layer[i] = acts_data[f"layer_{i}"]
-        print(f"  Loaded {num_layers} layers of meta-task activations")
-
-        # Use the same stated confidences already computed
-        print(f"  Stated confidence: mean={confidences.mean():.3f}, std={confidences.std():.3f}")
-        print(f"  Train/test split: {len(train_idx)}/{len(test_idx)}")
-
-        # Find confidence directions using both methods
-        print(f"\n  Training confidence probes ({N_BOOTSTRAP} bootstrap iterations)...")
-        conf_results = find_confidence_directions_both_methods(
-            meta_activations_by_layer,
-            confidences,
-            train_idx,
-            test_idx,
-            alpha=PROBE_ALPHA,
-            n_components=PROBE_PCA_COMPONENTS,
-            mean_diff_quantile=MEAN_DIFF_QUANTILE,
-            n_bootstrap=N_BOOTSTRAP,
-            train_split=TRAIN_SPLIT,
-            seed=SEED,
-        )
-
-        # Compare to uncertainty directions (if requested)
-        conf_unc_comparison = None
-        if COMPARE_UNCERTAINTY_METRIC:
-            uncertainty_dir_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_mc_{COMPARE_UNCERTAINTY_METRIC}_directions.npz"
-            if uncertainty_dir_path.exists():
-                print(f"\n  Loading uncertainty directions from {uncertainty_dir_path}...")
-                unc_data = np.load(uncertainty_dir_path)
-
-                # Compare BOTH probe and mean_diff confidence directions to uncertainty directions
-                conf_unc_comparison = {}
-                for method in ["probe", "mean_diff"]:
-                    # Load uncertainty directions for this method
-                    unc_dirs = {}
-                    for layer in range(num_layers):
-                        key = f"{method}_layer_{layer}"
-                        if key in unc_data:
-                            unc_dirs[layer] = unc_data[key]
-
-                    if unc_dirs:
-                        print(f"  Comparing {method} confidence to {len(unc_dirs)} layers of {COMPARE_UNCERTAINTY_METRIC} {method} directions")
-                        conf_unc_comparison[method] = compare_confidence_to_uncertainty(
-                            conf_results["directions"][method],
-                            unc_dirs
-                        )
-
-                if not conf_unc_comparison:
-                    conf_unc_comparison = None  # Reset if no comparisons made
-            else:
-                print(f"\n  Warning: Uncertainty directions not found at {uncertainty_dir_path}")
-
-        # Save meta-confidence directions (directions trained on meta activations, not transferred)
-        conf_dir_path = OUTPUT_DIR / f"{base_output}_metaconfdir_directions.npz"
-        print(f"\n  Saving meta-confidence directions to {conf_dir_path}...")
-        dir_save = {
-            "_metadata_input_base": INPUT_BASE_NAME,
-            "_metadata_meta_task": META_TASK,
-        }
-        for method in ["probe", "mean_diff"]:
-            for layer in range(num_layers):
-                dir_save[f"{method}_layer_{layer}"] = conf_results["directions"][method][layer]
-        np.savez(conf_dir_path, **dir_save)
-
-        # Save meta-confidence probe objects
-        conf_probes_path = OUTPUT_DIR / f"{base_output}_metaconfdir_probes.joblib"
-        print(f"  Saving meta-confidence probes to {conf_probes_path}...")
-        probe_save = {
-            "metadata": {
-                "input_base": INPUT_BASE_NAME,
-                "meta_task": META_TASK,
-                "train_split": TRAIN_SPLIT,
-                "probe_alpha": PROBE_ALPHA,
-                "pca_components": PROBE_PCA_COMPONENTS,
-                "seed": SEED,
-            },
-            "probes": conf_results["probes"],
-        }
-        joblib.dump(probe_save, conf_probes_path)
-
-        # Save meta-confidence results JSON
-        conf_results_path = OUTPUT_DIR / f"{base_output}_metaconfdir_results.json"
-        print(f"  Saving meta-confidence results to {conf_results_path}...")
-        conf_json = {
-            "config": get_config_dict(
-                input_base=INPUT_BASE_NAME,
-                meta_task=META_TASK,
-                train_split=TRAIN_SPLIT,
-                probe_alpha=PROBE_ALPHA,
-                pca_components=PROBE_PCA_COMPONENTS,
-                mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                n_bootstrap=N_BOOTSTRAP,
-                seed=SEED,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
-            "stats": {
-                "n_samples": len(confidences),
-                "n_train": len(train_idx),
-                "n_test": len(test_idx),
-                "confidence_mean": float(confidences.mean()),
-                "confidence_std": float(confidences.std()),
-                "confidence_min": float(confidences.min()),
-                "confidence_max": float(confidences.max()),
-            },
-            "results": {},
-            "comparison": {},
-        }
-        for method in ["probe", "mean_diff"]:
-            conf_json["results"][method] = {}
-            for layer in range(num_layers):
-                layer_info = {}
-                for k, v in conf_results["fits"][method][layer].items():
-                    if isinstance(v, np.floating):
-                        layer_info[k] = float(v)
-                    elif isinstance(v, np.integer):
-                        layer_info[k] = int(v)
-                    else:
-                        layer_info[k] = v
-                conf_json["results"][method][layer] = layer_info
-        for layer in range(num_layers):
-            conf_json["comparison"][layer] = {
-                "cosine_sim": float(conf_results["comparison"][layer]["cosine_sim"])
-            }
-        if conf_unc_comparison:
-            # Serialize nested structure: {"probe": {layer: {...}}, "mean_diff": {layer: {...}}}
-            conf_json["uncertainty_comparison"] = {
-                "metric": COMPARE_UNCERTAINTY_METRIC,
-                "by_method": {}
-            }
-            for method, method_comp in conf_unc_comparison.items():
-                conf_json["uncertainty_comparison"]["by_method"][method] = {
-                    layer: {k: float(v) for k, v in comp.items()}
-                    for layer, comp in method_comp.items()
-                }
-        with open(conf_results_path, "w") as f:
-            json.dump(conf_json, f, indent=2)
-
-        # Plot meta-confidence directions
-        conf_plot_path = OUTPUT_DIR / f"{base_output}_metaconfdir_results.png"
-        print(f"  Plotting meta-confidence results to {conf_plot_path}...")
-        plot_confidence_directions(
-            conf_results=conf_results,
-            conf_unc_comparison=conf_unc_comparison,
-            num_layers=num_layers,
-            output_path=conf_plot_path,
-            meta_task=META_TASK,
-            compare_metric=COMPARE_UNCERTAINTY_METRIC,
-        )
-
-        # Print meta-confidence direction summary
-        for method in ["probe", "mean_diff"]:
-            fits = conf_results["fits"][method]
-            layers = sorted(fits.keys())
-            best_layer = max(layers, key=lambda l: fits[l]["test_r2"])
-            best_r2 = fits[best_layer]["test_r2"]
-            ci_str = ""
-            if "test_r2_ci_low" in fits[best_layer]:
-                ci_str = f" [{fits[best_layer]['test_r2_ci_low']:.3f}, {fits[best_layer]['test_r2_ci_high']:.3f}]"
-            print(f"  {method}: best L{best_layer}, R²={best_r2:.3f}{ci_str}")
-
-        if conf_unc_comparison:
-            for method in ["probe", "mean_diff"]:
-                if method in conf_unc_comparison:
-                    method_fits = conf_results["fits"][method]
-                    best_layer = max(method_fits.keys(), key=lambda l: method_fits[l]["test_r2"])
-                    if best_layer in conf_unc_comparison[method]:
-                        best_cos = conf_unc_comparison[method][best_layer]["cosine_similarity"]
-                        print(f"  {method} confidence vs uncertainty (L{best_layer}): cosine={best_cos:.3f}")
-
     # Final summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
 
-    # Behavioral overview
-    meta_stats = compute_behavioral_stats(confidences, option_probs, META_TASK)
-    print(f"\nBEHAVIORAL ANALYSIS ({META_TASK}):")
-    if META_TASK == "delegate":
-        if "delegation_rate" in meta_stats:
-            print(f"  Token choice: Answer={1 - meta_stats['delegation_rate']:.1%}, Delegate={meta_stats['delegation_rate']:.1%}")
-            print(f"  Delegation rate: {meta_stats['delegation_rate']:.1%}")
-        if "self_accuracy" in meta_stats:
-            print(f"  Self-answer accuracy: {meta_stats['self_accuracy']:.1%}")
-    elif META_TASK == "confidence":
-        print(f"  Stated confidence: mean={confidences.mean():.3f}, std={confidences.std():.3f}")
-        if "modal_response_rates" in meta_stats:
-            modal_str = ", ".join(f"{k}={v:.1%}" for k, v in meta_stats["modal_response_rates"].items())
-            print(f"  Response distribution: {modal_str}")
-
     for metric in metrics_tested:
         print(f"\n{metric}:")
         layers_available = list(transfer_results[metric].keys())
 
-        # Behavioral correlation with [lo, hi] CI
-        sign_str = "(inv)" if metric_sign_for_confidence(metric) < 0 else ""
-        beh = behavioral[metric]
-        r_val = beh['pearson_r']
-        p_val = beh.get('pearson_p', float('nan'))
-        rho_val = beh.get('spearman_r', float('nan'))
-        if "test_pearson_r_std" in beh:
-            test_r = beh.get("test_pearson_r", r_val)
-            test_std = beh["test_pearson_r_std"]
-            ci_str = f" [{test_r - 1.96*test_std:.3f}, {test_r + 1.96*test_std:.3f}]"
-        else:
-            ci_str = ""
-        print(f"  Behavioral{sign_str}: r={r_val:.3f}{ci_str}, p={p_val:.2e}, rho={rho_val:.3f}")
-
         # D→D (test set)
-        d2d_r2_val = None
         if metric in direct_r2 and direct_r2[metric]:
             best_d2d = max(direct_r2[metric].keys(), key=lambda l: direct_r2[metric][l])
             d2d_r2_val = direct_r2[metric][best_d2d]
             d2d_std_val = direct_r2_std.get(metric, {}).get(best_d2d, 0)
-            print(f"  D→D (test):    R²={d2d_r2_val:.3f} [{d2d_r2_val - 1.96*d2d_std_val:.3f}, {d2d_r2_val + 1.96*d2d_std_val:.3f}] (L{best_d2d})")
+            print(f"  D→D (test): R²={d2d_r2_val:.3f}±{d2d_std_val:.3f} (L{best_d2d})")
 
         # D→M transfer
         best_layer_cen = max(layers_available, key=lambda l: transfer_results[metric][l]["centered"]["r2"])
@@ -2329,35 +2368,23 @@ def main():
         centered_std = transfer_results[metric][best_layer_cen]["centered"]["r2_std"]
         centered_pearson = transfer_results[metric][best_layer_cen]["centered"]["pearson"]
 
-        print(f"  D→M Centered:  R²={centered_r2:.3f} [{centered_r2 - 1.96*centered_std:.3f}, {centered_r2 + 1.96*centered_std:.3f}], r={centered_pearson:.3f} (L{best_layer_cen})")
+        best_layer_sep = max(layers_available, key=lambda l: transfer_results[metric][l]["separate"]["r2"])
+        separate_r2 = transfer_results[metric][best_layer_sep]["separate"]["r2"]
+        separate_std = transfer_results[metric][best_layer_sep]["separate"]["r2_std"]
 
-        # Transfer ratio
-        if d2d_r2_val and d2d_r2_val > 0:
-            transfer_ratio = centered_r2 / d2d_r2_val
-            if transfer_ratio > 0.6:
-                strength = "Strong"
-            elif transfer_ratio > 0.3:
-                strength = "Moderate"
-            elif transfer_ratio > 0.1:
-                strength = "Weak"
-            else:
-                strength = "No"
-            print(f"  Transfer ratio: {transfer_ratio:.1%} (best D→M / best D→D) -> {strength} evidence")
+        print(f"  D→M Centered: R²={centered_r2:.3f}±{centered_std:.3f}, r={centered_pearson:.3f} (L{best_layer_cen})")
+        print(f"  D→M Separate: R²={separate_r2:.3f}±{separate_std:.3f} (L{best_layer_sep})")
+
+        sign_str = "(inv)" if metric_sign_for_confidence(metric) < 0 else ""
+        print(f"  Behavioral{sign_str}: r={behavioral[metric]['pearson_r']:.3f}")
 
     print("\nOutput files:")
     print(f"  {activations_path.name}")
     print(f"  {results_json_path.name}")
     print(f"  {results_npz_path.name}")
-    for pos in positions_available:
-        for metric in metrics_tested:
-            print(f"  {base_output}_transfer_{pos}_{metric}.png")
-    if len(positions_available) > 1:
-        print(f"  {plot_path_positions.name}")
-    if FIND_CONFIDENCE_DIRECTIONS:
-        print(f"  {base_output}_metaconfdir_directions.npz")
-        print(f"  {base_output}_metaconfdir_probes.joblib")
-        print(f"  {base_output}_metaconfdir_results.json")
-        print(f"  {base_output}_metaconfdir_results.png")
+    print(f"  {plot_path.name}")
+    print(f"  {plot_path_mean_diff.name}")
+    print(f"  {plot_path_positions.name}")
 
 
 if __name__ == "__main__":

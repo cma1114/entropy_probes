@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Synthesize causal test results across ablation and steering experiments.
+Cross-stage. Synthesizes ablation and steering results across tasks to determine
+which layers pass all causal tests for a given metric, identifying layers with
+consistent causal involvement.
 
-This script loads results from all 4 causal tests (ablation × 2 tasks + steering × 2 tasks)
-and determines which layers pass all tests for a given metric and method.
+Inputs:
+    outputs/{base}_ablation_{task}_{metric}_results.json    Ablation results per task
+    outputs/{base}_steering_{task}_{metric}_results.json    Steering results per task
 
 Outputs:
-- JSON with full per-layer data and intersection analysis
-- Visualization showing pass/fail status for each layer × test
-- Text summary with exact criteria and results
+    outputs/{base}_causal_synthesis.json    Per-layer pass/fail and intersection analysis
+    outputs/{base}_causal_synthesis.png     Layer x test pass/fail visualization
+
+Run after: run_ablation_causality.py, run_steering_causality.py
 """
 
 import json
@@ -17,6 +21,9 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+
+from core.config_utils import get_config_dict
+from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
 # CONFIGURATION
@@ -107,7 +114,7 @@ def load_transfer_results(
     transfer_results = {}
 
     for task in ["confidence", "delegate"]:
-        filename = f"{model_prefix}_{dataset}_transfer_{task}_results.json"
+        filename = f"{model_prefix}_{dataset}_meta_{task}_results.json"
         filepath = OUTPUT_DIR / filename
 
         if not filepath.exists():
@@ -366,9 +373,7 @@ LAYERS PASSING ALL 4 TESTS:
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
 
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_path}")
+    save_figure(fig, output_path)
 
 
 # =============================================================================
@@ -500,13 +505,13 @@ def main():
     # JSON output
     json_path = OUTPUT_DIR / f"{base_output}.json"
     output_json = {
-        "config": {
-            "model_prefix": MODEL_PREFIX,
-            "dataset": DATASET,
-            "metric": METRIC,
-            "method": METHOD,
-            "p_threshold": P_THRESHOLD,
-        },
+        "config": get_config_dict(
+            model_prefix=MODEL_PREFIX,
+            dataset=DATASET,
+            metric=METRIC,
+            method=METHOD,
+            p_threshold=P_THRESHOLD,
+        ),
         "files_analyzed": files_loaded,
         "layer_status": {
             str(layer): status for layer, status in layer_status.items()

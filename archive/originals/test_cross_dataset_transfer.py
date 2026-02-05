@@ -1,29 +1,16 @@
 """
-Stage 2 (variant). Test cross-dataset generalization of uncertainty directions.
-Applies directions trained on one dataset to a different dataset's activations,
-measuring whether the learned representations generalize beyond the training
-distribution.
+Cross-Dataset Transfer Prediction Test (Optimized & Corrected).
 
-Uses Fisher-z confidence intervals, permutation tests with two-sided p-values,
-and BH-FDR correction across layers.
+Corrections from previous version:
+1. Fixes D2M p-value to be two-sided (abs(null) >= abs(obs)).
+2. Fixes RNG initialization (outside layer loop) to ensure independent permutations across layers.
+3. Restores missing metrics: transfer_efficiency, significant_layers list, best_layer index.
+4. Restores Config block and Synthesis plot.
 
-Inputs:
-    outputs/{source_base}_mc_{metric}_directions.npz   Source dataset directions
-    outputs/{source_base}_mc_activations.npz            Source dataset activations
-    outputs/{source_base}_mc_dataset.json               Source question metadata
-    outputs/{target_base}_mc_activations.npz            Target dataset activations
-    outputs/{target_base}_mc_dataset.json               Target question metadata
-
-    where source/target bases are derived from SOURCE_DATASETS / TARGET_DATASETS
-
-Outputs:
-    outputs/{base}_cross_transfer_results.json          Transfer R, CIs, p-values
-    outputs/{base}_cross_transfer_results.png           Transfer correlation curves
-
-Shared parameters (must match across scripts):
-    SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
-
-Run after: identify_mc_correlate.py (on both source and target datasets)
+Statistical improvements:
+5. Fisher-z confidence intervals on observed Pearson r (cross and within).
+6. BH-FDR correction across layers within each panel.
+7. Safer Pearson computation with guards against degenerate cases.
 """
 
 from pathlib import Path
@@ -36,37 +23,28 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from core import metric_sign_for_confidence
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, GRID_ALPHA
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
-MODEL_PREFIX = "Llama-3.3-70B-Instruct"  # Short model name (no HF org prefix)
+MODEL_PREFIX = "Llama-3.3-70B-Instruct"
 METRICS = ["entropy", "logit_gap"]
 METHODS = ["mean_diff", "probe"]
 META_TASKS = ["delegate"]
-
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-N_PERMUTATIONS = 100         # Permutation tests for cross-dataset significance
-
-# --- Direction-finding (must match across scripts) ---
-PROBE_ALPHA = 1000.0         # Must match across scripts
-PROBE_PCA_COMPONENTS = 100   # Must match across scripts
-TRAIN_SPLIT = 0.8            # Must match across scripts
-MEAN_DIFF_QUANTILE = 0.25    # Must match across scripts
-
-# --- Statistical configuration ---
-ALPHA = 0.05                 # Significance threshold
-CI_ALPHA = 0.05              # 95% Fisher-z CI for correlations
-USE_FDR = True               # Apply BH-FDR across layers within each panel
-EPS_DENOM = 1e-8             # Guard against near-constant predictions
-
-# --- Output ---
+N_PERMUTATIONS = 100
+SEED = 42
+MEAN_DIFF_QUANTILE = 0.25
+PROBE_ALPHA = 1000.0
+PROBE_PCA_COMPONENTS = 100
+WITHIN_TRAIN_SPLIT = 0.8
 OUTPUT_DIR = Path(__file__).parent / "outputs"
+
+# Statistical configuration
+ALPHA = 0.05  # Significance threshold
+CI_ALPHA = 0.05  # 95% Fisher-z CI for correlations
+USE_FDR = True  # Apply BH-FDR across layers within each panel
+EPS_DENOM = 1e-8  # Guard against near-constant predictions
 
 
 # =============================================================================
@@ -306,7 +284,7 @@ def load_data_package(dataset_name: str, metric: str, meta_tasks: list):
     
     meta_data = {}
     for task in meta_tasks:
-        path = OUTPUT_DIR / f"{dataset_name}_meta_{task}_activations.npz"
+        path = OUTPUT_DIR / f"{dataset_name}_transfer_{task}_activations.npz"
         if path.exists():
             m_data = np.load(path)
             acts = {}
@@ -442,7 +420,9 @@ def plot_transfer_results(d2d_results, d2m_results, dataset_a, dataset_b, output
                  ax.set_title(f"d2m: {metric} ({method}) - No data")
             col += 1
             
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 def _plot_single(ax, results, title):
     per_layer = results.get("per_layer", {})
@@ -483,7 +463,7 @@ def _plot_single(ax, results, title):
     ax.set_ylabel("Pearson r")
     ax.set_title(title)
     ax.legend(loc="upper left", fontsize=7)
-    ax.grid(True, alpha=GRID_ALPHA)
+    ax.grid(True, alpha=0.3)
 
 def plot_synthesis(all_d2d, all_d2m, model_prefix, output_path):
     pairs = list(all_d2d.keys())
@@ -517,7 +497,9 @@ def plot_synthesis(all_d2d, all_d2m, model_prefix, output_path):
             _plot_synthesis_single(axes[1, col], all_d2m, pairs, metric, method, layers, f"d2m: {metric} ({method})")
             col += 1
     
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 def _plot_synthesis_single(ax, all_results, pairs, metric, method, layers, title):
     layer_cross_rs, layer_within_rs = {l: [] for l in layers}, {l: [] for l in layers}
@@ -542,7 +524,7 @@ def _plot_synthesis_single(ax, all_results, pairs, metric, method, layers, title
     ax.set_ylabel("Pearson r")
     ax.set_title(title)
     ax.legend(loc="upper left", fontsize=7)
-    ax.grid(True, alpha=GRID_ALPHA)
+    ax.grid(True, alpha=0.3)
 
 # =============================================================================
 # MAIN
@@ -589,8 +571,8 @@ def main():
 
             indices_A = np.arange(len_A)
             indices_B = np.arange(len_B)
-            train_idx_A, _ = train_test_split(indices_A, train_size=TRAIN_SPLIT, random_state=SEED)
-            train_idx_B, test_idx_B = train_test_split(indices_B, train_size=TRAIN_SPLIT, random_state=SEED)
+            train_idx_A, _ = train_test_split(indices_A, train_size=WITHIN_TRAIN_SPLIT, random_state=SEED)
+            train_idx_B, test_idx_B = train_test_split(indices_B, train_size=WITHIN_TRAIN_SPLIT, random_state=SEED)
             
             # 2. Iterate Methods
             for method in METHODS:
@@ -794,22 +776,23 @@ def main():
 
     # Save Final JSON with Config
     results = {
-        "config": get_config_dict(
-            model_prefix=MODEL_PREFIX,
-            datasets=datasets,
-            metrics=METRICS,
-            methods=METHODS,
-            meta_tasks=META_TASKS,
-            n_permutations=N_PERMUTATIONS,
-            seed=SEED,
-            train_split=TRAIN_SPLIT,
-            alpha=ALPHA,
-            ci_alpha=CI_ALPHA,
-            use_fdr=USE_FDR,
-            probe_alpha=PROBE_ALPHA,
-            probe_pca_components=PROBE_PCA_COMPONENTS,
-            mean_diff_quantile=MEAN_DIFF_QUANTILE,
-        ),
+        "config": {
+            "model_prefix": MODEL_PREFIX,
+            "datasets": datasets,
+            "metrics": METRICS,
+            "methods": METHODS,
+            "meta_tasks": META_TASKS,
+            "n_permutations": N_PERMUTATIONS,
+            "seed": SEED,
+            "within_train_split": WITHIN_TRAIN_SPLIT,
+            "alpha": ALPHA,
+            "ci_alpha": CI_ALPHA,
+            "use_fdr": USE_FDR,
+            "note": (
+                "Fair comparison: both cross (A_train) and within (B_train) use 80% for training. "
+                "CIs are Fisher-z for observed r. BH-FDR is applied across layers within each panel when USE_FDR=True."
+            ),
+        },
         "d2d": all_d2d,
         "d2m": all_d2m,
     }

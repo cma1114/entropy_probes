@@ -1,17 +1,11 @@
 """
-Interpret linear probe or contrastive direction vectors using Activation Oracles (AO).
-Loads saved direction vectors and uses the AO adapter to surface what concepts they represent.
+Interpret linear probe directions using Activation Oracles.
 
-Inputs:
-    outputs/{base}_mc_{metric}_directions.npz   Direction vectors (from probe or contrastive runs)
+This script loads direction vectors from run_contrastive_direction.py outputs
+and uses the Activation Oracle (AO) adapter to interpret what concepts they represent.
 
-Outputs:
-    Console output                              Interpretation of direction vectors
-
-Shared parameters (must match across scripts):
-    (none)
-
-Run after: identify_mc_correlate.py
+Usage:
+    python act_oracles.py
 """
 
 import json
@@ -24,46 +18,42 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import sys
 
-from core import get_model_short_name
-from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
-
 # Lazy imports for heavy dependencies (torch, peft)
 # Only imported when running full interpretation, not for analysis-only mode
 
 # =============================================================================
-# CONFIGURATION
+# Configuration
 # =============================================================================
 
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Set to adapter path if using fine-tuned model
+BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_NAME = BASE_MODEL_NAME  # Set to adapter path if using fine-tuned model
 DATASET_NAME = "TriviaMC"
-METRIC = "top_logit" if "70B" in MODEL else "entropy"
+METRIC = "top_logit" if "70B" in BASE_MODEL_NAME else "entropy"
 
 # Explicit path to directions file (bypasses auto-discovery if set)
 # Set to None to use automatic pattern matching based on config below
 DIRECTIONS_FILE = "Llama-3.1-8B-Instruct_TriviaMC_introspection_entropy_directions.npz"
 
 # Optional filters for finding direction files (only used when DIRECTIONS_FILE is None)
-META_TASK = None
-DIRECTION_TYPE = None
+META_TASK = None  
+DIRECTION_TYPE = None 
 
-# --- Quantization ---
-LOAD_IN_4BIT = True if "70B" in MODEL else False
+# Quantization options for large models
+LOAD_IN_4BIT = True if "70B" in BASE_MODEL_NAME else False
 LOAD_IN_8BIT = False
 
-# --- Experiment ---
-BATCH_SIZE = 8  # 8-16 safe for 8B on 24GB VRAM
+# Optimization: Batch Size
+# 8-16 is usually safe for 8B models on 24GB VRAM.
+BATCH_SIZE = 8
 
-# --- Script-specific ---
 # Confidence testing options
-RUN_CONFIDENCE_TESTS = True        # Enable log probability tracking (minimal overhead)
-RUN_BASELINE_COMPARISON = True     # Compare against random vectors (slower, ~3x per layer)
-NUM_BASELINE_VECTORS = 3           # Number of random baselines if comparison enabled
+RUN_CONFIDENCE_TESTS = True  # Enable log probability tracking (minimal overhead)
+RUN_BASELINE_COMPARISON = True  # Compare against random vectors (slower, ~3x per layer)
+NUM_BASELINE_VECTORS = 3  # Number of random baselines if comparison enabled
 
 # Semantic analysis options
-RUN_SEMANTIC_ANALYSIS = True
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+RUN_SEMANTIC_ANALYSIS = True  # Enable semantic similarity analysis
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # Lightweight, fast
 
 # Target concepts for semantic similarity analysis (3 core concepts)
 TARGET_CONCEPTS = {
@@ -95,8 +85,8 @@ TARGET_CONCEPTS = {
     ],
 }
 
-# --- Output ---
-OUTPUT_DIR = Path("outputs")
+# Output directory
+OUTPUTS_DIR = Path("outputs")
 
 # Activation Oracle adapter paths
 AO_ADAPTERS = {
@@ -924,9 +914,9 @@ def generate_text_summary(analysis: Dict, output_path: str) -> None:
 
 def get_model_prefix() -> str:
     """Get model prefix for filenames."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
         return f"{model_short}_adapter-{adapter_short}"
     return model_short
 
@@ -938,7 +928,7 @@ def find_directions_file() -> Path:
     if DIRECTIONS_FILE is not None:
         path = Path(DIRECTIONS_FILE)
         if not path.is_absolute():
-            path = OUTPUT_DIR / path
+            path = OUTPUTS_DIR / path
         if path.exists():
             return path
         raise FileNotFoundError(f"Specified directions file not found: {path}")
@@ -959,7 +949,7 @@ def find_directions_file() -> Path:
     patterns.append(f"{model_prefix}_{DATASET_NAME}_{METRIC}_directions.npz")
 
     for pattern in patterns:
-        path = OUTPUT_DIR / pattern
+        path = OUTPUTS_DIR / pattern
         if path.exists():
             return path
 
@@ -969,13 +959,13 @@ def find_directions_file() -> Path:
     ]
 
     for pattern in glob_patterns:
-        matches = list(OUTPUT_DIR.glob(pattern))
+        matches = list(OUTPUTS_DIR.glob(pattern))
         if matches:
             matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             return matches[0]
 
     raise FileNotFoundError(
-        f"No directions file found in {OUTPUT_DIR}\n"
+        f"No directions file found in {OUTPUTS_DIR}\n"
         f"Model: {model_prefix}, Dataset: {DATASET_NAME}, Metric: {METRIC}"
     )
 
@@ -1325,20 +1315,23 @@ def visualize_ao_results(
     ax2.set_ylabel("Score (0-1)")
     ax2.set_title("Layer Quality & Distinctiveness", fontsize=11, fontweight='bold')
     ax2.legend(loc='upper right', fontsize=8)
-    ax2.grid(True, alpha=GRID_ALPHA)
+    ax2.grid(True, alpha=0.3)
     ax2.set_ylim(0, 1.05)
     ax2.set_xlim(min(layers) - 0.5, max(layers) + 0.5)
 
     # =========================================================================
     # Title and save
     # =========================================================================
-    model_short = get_model_short_name(MODEL)
+    model_short = get_model_short_name(BASE_MODEL_NAME)
     suptitle = f"AO Interpretation: {model_short} - {DATASET_NAME}"
     if title_suffix:
         suptitle += f"\n{title_suffix}"
     fig.suptitle(suptitle, fontsize=14, fontweight='bold')
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {output_path}")
+    plt.close()
 
 
 def plot_interpretations(
@@ -1364,7 +1357,7 @@ def plot_interpretations(
 
     # Create figure
     fig_height = max(8, n_layers * 0.4)
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    _, ax = plt.subplots(figsize=(14, fig_height))
 
     # Plot each layer's interpretation
     for i, layer_idx in enumerate(layers):
@@ -1399,7 +1392,7 @@ def plot_interpretations(
     ax.set_xticks([])
     ax.invert_yaxis()  # Put layer 0 at top
 
-    model_short = get_model_short_name(MODEL)
+    model_short = get_model_short_name(BASE_MODEL_NAME)
     title = f"Activation Oracle Interpretations\n{model_short} - {DATASET_NAME} - {DIRECTION_TYPE}"
     if title_suffix:
         title += f"\n{title_suffix}"
@@ -1409,7 +1402,10 @@ def plot_interpretations(
     for spine in ax.spines.values():
         spine.set_visible(True)
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {output_path}")
+    plt.close()
 
 
 def print_interpretations(results: dict, baseline_results: dict = None):
@@ -1449,6 +1445,13 @@ def print_interpretations(results: dict, baseline_results: dict = None):
 # Main
 # =============================================================================
 
+def get_model_short_name(model_name: str) -> str:
+    """Extract short name from model path (lazy import alternative)."""
+    if "/" in model_name:
+        return model_name.split("/")[-1]
+    return model_name
+
+
 def main():
     # Import heavy dependencies only when running full interpretation
     import torch
@@ -1457,7 +1460,7 @@ def main():
     print(f"\n{'=' * 70}")
     print("ACTIVATION ORACLE PROBE INTERPRETATION (ACCELERATED)")
     print("=" * 70)
-    print(f"Model: {get_model_short_name(MODEL)}")
+    print(f"Model: {get_model_short_name(BASE_MODEL_NAME)}")
     print(f"Dataset: {DATASET_NAME}")
     print(f"Metric: {METRIC}")
     print(f"Task: {META_TASK}")
@@ -1489,7 +1492,7 @@ def main():
     print(f"Loaded directions for {len(directions)} layers: {sorted(directions.keys())}")
 
     # Determine model size from config
-    if "70B" in MODEL or "70b" in MODEL:
+    if "70B" in BASE_MODEL_NAME or "70b" in BASE_MODEL_NAME:
         model_size = "70b"
     else:
         model_size = "8b"

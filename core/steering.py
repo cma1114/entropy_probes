@@ -87,6 +87,10 @@ class AblationHook:
 
     Projects out the direction: x' = x - (x · d) * d
 
+    If preserve_norm=True, rescales after projection to maintain original
+    activation magnitude, avoiding LayerNorm amplification artifacts:
+        x' = (x - (x · d) * d) * ||x|| / ||x - (x · d) * d||
+
     Usage:
         hook = AblationHook(direction)
         handle = model.model.layers[layer_idx].register_forward_hook(hook)
@@ -97,13 +101,17 @@ class AblationHook:
     def __init__(
         self,
         direction,
-        position: str = "last"
+        position: str = "last",
+        preserve_norm: bool = False
     ):
         """
         Args:
             direction: (hidden_dim,) direction to ablate (will be normalized).
                        Can be numpy array or torch tensor.
             position: Which token position to ablate ("last", "all", or int)
+            preserve_norm: If True, rescale ablated activations to preserve
+                          original magnitude. This avoids LayerNorm artifacts
+                          in downstream layers.
         """
         # Convert to tensor if needed, then normalize
         if isinstance(direction, np.ndarray):
@@ -113,6 +121,7 @@ class AblationHook:
         # Ensure normalized
         self.direction = direction / direction.norm()
         self.position = position
+        self.preserve_norm = preserve_norm
         self._device_set = False
 
     def __call__(self, module, input, output):
@@ -132,15 +141,31 @@ class AblationHook:
             # Project out direction from last token
             last_hidden = hidden_states[:, -1, :]  # (batch, hidden)
             proj = (last_hidden @ self.direction).unsqueeze(-1) * self.direction  # (batch, hidden)
-            hidden_states[:, -1, :] = last_hidden - proj
+            ablated = last_hidden - proj
+            if self.preserve_norm:
+                # Rescale to preserve original magnitude
+                orig_norm = torch.norm(last_hidden, dim=-1, keepdim=True)
+                ablated_norm = torch.norm(ablated, dim=-1, keepdim=True)
+                ablated = ablated * orig_norm / (ablated_norm + 1e-8)
+            hidden_states[:, -1, :] = ablated
         elif self.position == "all":
             # Project out from all tokens
             proj = (hidden_states @ self.direction).unsqueeze(-1) * self.direction
-            hidden_states = hidden_states - proj
+            ablated = hidden_states - proj
+            if self.preserve_norm:
+                orig_norm = torch.norm(hidden_states, dim=-1, keepdim=True)
+                ablated_norm = torch.norm(ablated, dim=-1, keepdim=True)
+                ablated = ablated * orig_norm / (ablated_norm + 1e-8)
+            hidden_states = ablated
         elif isinstance(self.position, int):
             pos_hidden = hidden_states[:, self.position, :]
             proj = (pos_hidden @ self.direction).unsqueeze(-1) * self.direction
-            hidden_states[:, self.position, :] = pos_hidden - proj
+            ablated = pos_hidden - proj
+            if self.preserve_norm:
+                orig_norm = torch.norm(pos_hidden, dim=-1, keepdim=True)
+                ablated_norm = torch.norm(ablated, dim=-1, keepdim=True)
+                ablated = ablated * orig_norm / (ablated_norm + 1e-8)
+            hidden_states[:, self.position, :] = ablated
 
         if isinstance(output, tuple):
             return (hidden_states,) + output[1:]
@@ -490,6 +515,11 @@ class BatchPatchingHook:
         self.position = position
         self.last_token_indices = last_token_indices
         self._device_set = False
+        self.position_indices = None  # For indexed mode
+
+    def set_position_indices(self, indices: torch.Tensor):
+        """Set per-example position indices for indexed patching."""
+        self.position_indices = indices
 
     def __call__(self, module, input, output):
         if isinstance(output, tuple):
@@ -504,6 +534,8 @@ class BatchPatchingHook:
             )
             if self.last_token_indices is not None:
                 self.last_token_indices = self.last_token_indices.to(hidden_states.device)
+            if self.position_indices is not None:
+                self.position_indices = self.position_indices.to(hidden_states.device)
             self._device_set = True
 
         batch_size = hidden_states.shape[0]
@@ -525,6 +557,11 @@ class BatchPatchingHook:
             hidden_states[:, :, :] = self.target_activations.unsqueeze(1)
         elif isinstance(self.position, int):
             hidden_states[:, self.position, :] = self.target_activations
+        elif self.position == "indexed" and self.position_indices is not None:
+            # Per-example position indices (pattern from BatchAblationHook)
+            hidden_states = hidden_states.clone()  # Clone before in-place modification
+            batch_indices = torch.arange(batch_size, device=hidden_states.device)
+            hidden_states[batch_indices, self.position_indices, :] = self.target_activations
 
         if isinstance(output, tuple):
             return (hidden_states,) + output[1:]

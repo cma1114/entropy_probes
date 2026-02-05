@@ -1,17 +1,14 @@
 """
-Create a balanced correct/incorrect subset by filtering questions the model gets right/wrong.
-Requires GPU to run the model and determine correctness.
+Create difficulty-filtered dataset by selecting questions the model gets right/wrong.
 
-Inputs:
-    data/{dataset}.jsonl                        Source MC dataset
+Creates a .jsonl file that plugs directly into the existing pipeline:
+  data/{dataset}_difficulty_filtered.jsonl
 
-Outputs:
-    data/{dataset}_difficulty_filtered.jsonl     Balanced filtered dataset
+Then use with existing scripts:
+  identify_mc_correlate.py:  DATASET = "TriviaMC_difficulty_filtered"
+  test_cross_dataset_transfer.py: auto-discovers it
 
-Shared parameters (must match across scripts):
-    SEED
-
-Run after: (none)
+Requires GPU to run the model and determine correct/incorrect.
 """
 
 from pathlib import Path
@@ -34,25 +31,21 @@ from tasks import format_direct_prompt
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
 MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 DATASET = "TriviaMC"
+N_CORRECT = 250
+N_INCORRECT = 250
+SEED = 42
+BATCH_SIZE = 8
 
-# --- Quantization ---
-LOAD_IN_4BIT = True   # Set True for 70B+ models
+# Quantization (for large models)
+LOAD_IN_4BIT = True
 LOAD_IN_8BIT = False
 
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 8
-N_CORRECT = 250              # Target number of correct questions
-N_INCORRECT = 250            # Target number of incorrect questions
+# Estimation parameters
+ESTIMATED_ACCURACY = 0.87
+SAFETY_MARGIN = 1.3
 
-# --- Script-specific ---
-ESTIMATED_ACCURACY = 0.87    # Expected model accuracy (for sample size estimation)
-SAFETY_MARGIN = 1.3          # Oversample factor
-
-# --- Output ---
 DATA_DIR = Path(__file__).parent / "data"
 
 

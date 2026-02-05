@@ -1,18 +1,12 @@
 """
-Build a stratified next-token dataset for entropy prediction experiments.
-Samples diverse text from HuggingFace datasets, computes output entropy via batched
-inference, stratifies by entropy decile, and saves the result.
+Build a stratified dataset for entropy prediction experiments.
+OPTIMIZED VERSION: Uses batched inference and vectorized entropy calculation.
 
-Inputs:
-    HuggingFace datasets (downloaded automatically)
-
-Outputs:
-    data/{model}_nexttoken_stratified.json      Stratified next-token dataset
-
-Shared parameters (must match across scripts):
-    SEED
-
-Run after: (none)
+This script:
+1. Samples diverse text from multiple HuggingFace datasets
+2. Runs a pilot to compute actual output entropy for each prompt (BATCHED)
+3. Stratifies by entropy and samples evenly across deciles
+4. Saves the final dataset
 """
 
 import torch
@@ -30,32 +24,29 @@ from core import (
     get_run_name,
     get_model_short_name,
 )
-from core.config_utils import get_config_dict
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Set to adapter path if using fine-tuned model
-
-# --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
-LOAD_IN_8BIT = False
-
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
-BATCH_SIZE = 16              # 16-32 safe for 8B on 24GB VRAM; decrease if OOM
+# Configuration
+BASE_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_NAME = BASE_MODEL_NAME
 PILOT_SIZE = 10000
 FINAL_SIZE = 5000
 MIN_PROMPT_LENGTH = 20
 MAX_PROMPT_LENGTH = 500
 CHECKPOINT_INTERVAL = 500
+SEED = 42
 
-# --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# --- OPTIMIZATION CONFIG ---
+# Batch size depends on VRAM. 16-32 is usually safe for 8B models on 24GB VRAM.
+# Decrease if you hit OOM errors.
+BATCH_SIZE = 16
+# ---------------------------
+
+# Quantization (for large models like 70B)
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+
+OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR.mkdir(exist_ok=True)
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -64,11 +55,11 @@ torch.manual_seed(SEED)
 
 def get_output_prefix() -> str:
     """Generate output filename prefix based on config."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}_nexttoken")
-    return str(OUTPUT_DIR / f"{model_short}_nexttoken")
+    model_short = get_model_short_name(BASE_MODEL_NAME)
+    if MODEL_NAME != BASE_MODEL_NAME:
+        adapter_short = get_model_short_name(MODEL_NAME)
+        return str(OUTPUTS_DIR / f"{model_short}_adapter-{adapter_short}_nexttoken")
+    return str(OUTPUTS_DIR / f"{model_short}_nexttoken")
 
 
 def load_diverse_texts(num_samples: int) -> List[str]:
@@ -354,8 +345,8 @@ def main():
 
     # Load model
     model, tokenizer, num_layers = load_model_and_tokenizer(
-        MODEL,
-        adapter_path=ADAPTER,
+        BASE_MODEL_NAME,
+        adapter_path=MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
         load_in_4bit=LOAD_IN_4BIT,
         load_in_8bit=LOAD_IN_8BIT,
     )
@@ -386,18 +377,16 @@ def main():
 
     # Save final dataset
     output_data = {
-        "config": get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-            seed=SEED,
-            batch_size=BATCH_SIZE,
-            pilot_size=PILOT_SIZE,
-            final_size=FINAL_SIZE,
-            min_prompt_length=MIN_PROMPT_LENGTH,
-            max_prompt_length=MAX_PROMPT_LENGTH,
-        ),
+        "config": {
+            "base_model": BASE_MODEL_NAME,
+            "adapter": MODEL_NAME if MODEL_NAME != BASE_MODEL_NAME else None,
+            "pilot_size": PILOT_SIZE,
+            "final_size": FINAL_SIZE,
+            "min_prompt_length": MIN_PROMPT_LENGTH,
+            "max_prompt_length": MAX_PROMPT_LENGTH,
+            "seed": SEED,
+            "batch_size": BATCH_SIZE
+        },
         "data": final_dataset
     }
 

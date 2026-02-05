@@ -1,29 +1,20 @@
 """
-Stage 1 (alternative). Find next-token uncertainty directions and output token directions
-from model activations during diverse text prediction.
+Identify internal correlates of uncertainty in next-token prediction.
 
-Tests whether activations encode uncertainty metrics (entropy, logit_gap, etc.) using
-both probe and mean_diff direction-finding methods. Optionally also finds output token
-directions that predict which token the model selected (parallel to MC answer directions).
+Tests whether model activations encode uncertainty metrics (entropy, logit_gap, etc.)
+on diverse text, using both probe and mean_diff direction-finding methods.
 
-Inputs:
-    data/{model}_nexttoken_stratified.json              Stratified next-token dataset
-                                                        (produced by build_nexttoken_dataset.py)
+Requires a stratified dataset from build_nexttoken_dataset.py.
 
 Outputs:
-    outputs/{base}_nexttoken_activations.npz            Cached activations + metrics
-    outputs/{base}_nexttoken_dataset.json               Sample metadata + metric values
-    outputs/{base}_nexttoken_{metric}_directions.npz    Direction vectors per metric
-    outputs/{base}_nexttoken_{metric}_results.json      Per-layer R², CIs, statistics
-    outputs/{base}_nexttoken_{metric}_results.png       R² curves per metric
-    outputs/{base}_nexttoken_token_results.json         Token prediction accuracy (if enabled)
+- {model}_nexttoken_activations.npz: Reusable activations and metrics
+- {model}_nexttoken_dataset.json: Full sample metadata
+- {model}_nexttoken_entropy_distribution.png: Entropy distribution plot
+- {model}_nexttoken_{metric}_directions.npz: Direction vectors per metric
+- {model}_nexttoken_{metric}_results.json: Statistics per metric
+- {model}_nexttoken_{metric}_results.png: R² curves per metric
 
-    where {base} = {model_short_name}
-
-Shared parameters (must match across scripts):
-    SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
-
-Run after: build_nexttoken_dataset.py
+Configuration is set at the top of the script - no CLI args needed.
 """
 
 from pathlib import Path
@@ -32,11 +23,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from typing import Dict, Tuple
-from joblib import Parallel, delayed
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 
 from core import (
     load_model_and_tokenizer,
@@ -46,41 +32,35 @@ from core import (
     METRIC_INFO,
     DEVICE,
 )
-from core.config_utils import get_config_dict
-from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter
 DATASET_PATH = None  # Auto-detect based on model, or set explicitly
 METRICS = ["entropy", "logit_gap"]  # Which metrics to analyze
-
-# --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
-LOAD_IN_8BIT = False
-
-# --- Experiment ---
-SEED = 42                    # Must match across scripts
+SEED = 42
 BATCH_SIZE = 8
 MAX_PROMPT_LENGTH = 500
-N_BOOTSTRAP = 100            # Bootstrap iterations for confidence intervals
-N_JOBS = -1                  # Parallel jobs: -1 = all cores, 1 = sequential
-CHECKPOINT_INTERVAL = 200    # Checkpointing for large datasets
 
-# --- Direction-finding (must match across scripts) ---
-PROBE_ALPHA = 1000.0         # Must match across scripts
-PROBE_PCA_COMPONENTS = 100   # Must match across scripts
-TRAIN_SPLIT = 0.8            # Must match across scripts
-MEAN_DIFF_QUANTILE = 0.25    # Must match across scripts
+# Direction-finding parameters
+PROBE_ALPHA = 1000.0
+PROBE_PCA_COMPONENTS = 100
+PROBE_N_BOOTSTRAP = 100  # Bootstrap iterations for confidence intervals
+PROBE_TRAIN_SPLIT = 0.8
+MEAN_DIFF_QUANTILE = 0.25
+N_JOBS = -1  # Parallel jobs: -1 = all cores, 1 = sequential with progress bar
 
-# --- Output Token Directions ---
-FIND_OUTPUT_TOKEN_DIRECTIONS = True  # Find directions predicting output token (parallel to MC answer directions)
+# Checkpointing (for large datasets)
+CHECKPOINT_INTERVAL = 200
 
-# --- Output ---
+# Quantization (for large models)
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+
+# Output
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 
 # =============================================================================
@@ -107,7 +87,7 @@ def plot_entropy_distribution(
     ax1.set_ylabel('Percentage')
     ax1.set_title(f'Next-Token Entropy Distribution (n={len(entropies)})')
     ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA)
+    ax1.grid(True, alpha=0.3)
 
     # 2. CDF
     ax2 = axes[1]
@@ -117,14 +97,17 @@ def plot_entropy_distribution(
     ax2.set_xlabel('Entropy')
     ax2.set_ylabel('Cumulative Probability')
     ax2.set_title('Entropy CDF')
-    ax2.grid(True, alpha=GRID_ALPHA)
+    ax2.grid(True, alpha=0.3)
     # Mark quartiles
     for q, label in [(0.25, 'Q1'), (0.5, 'Median'), (0.75, 'Q3')]:
         val = np.percentile(entropies, q * 100)
         ax2.axhline(q, color='gray', linestyle=':', alpha=0.5)
         ax2.axvline(val, color='gray', linestyle=':', alpha=0.5)
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 def plot_results(
@@ -133,6 +116,8 @@ def plot_results(
     output_path: Path
 ):
     """Plot R² across layers for both methods with confidence intervals."""
+    colors = {'probe': 'tab:blue', 'mean_diff': 'tab:orange'}
+
     results = all_results[metric]
     layers = sorted(results["fits"]["probe"].keys())
 
@@ -141,7 +126,6 @@ def plot_results(
 
     for method in ["probe", "mean_diff"]:
         fits = results["fits"][method]
-        color = METHOD_COLORS.get(method, "tab:gray")
         r2_values = [fits[l]["r2"] for l in layers]
 
         # Check for std (bootstrap)
@@ -152,7 +136,7 @@ def plot_results(
                 layers,
                 np.array(r2_values) - np.array(r2_std),
                 np.array(r2_values) + np.array(r2_std),
-                alpha=CI_ALPHA, color=color
+                alpha=0.2, color=colors[method]
             )
 
         # Find best layer for this method
@@ -160,16 +144,19 @@ def plot_results(
         best_r2 = fits[best_layer]["r2"]
         label = f'{method} (best: L{best_layer}, R²={best_r2:.3f})'
 
-        ax.plot(layers, r2_values, 'o-', label=label, color=color, markersize=4)
+        ax.plot(layers, r2_values, 'o-', label=label, color=colors[method], markersize=4)
 
     ax.set_xlabel('Layer Index')
     ax.set_ylabel('R² Score')
     ax.set_title(f'{metric} Predictability by Layer (Next-Token)')
     ax.legend()
-    ax.grid(True, alpha=GRID_ALPHA)
+    ax.grid(True, alpha=0.3)
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 
-    save_figure(fig, output_path)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_path}")
 
 
 def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: int):
@@ -207,115 +194,6 @@ def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: 
 
 
 # =============================================================================
-# TOKEN PREDICTION FUNCTIONS
-# =============================================================================
-
-
-def top_k_accuracy(proba: np.ndarray, y_true: np.ndarray, k: int, classes: np.ndarray) -> float:
-    """Compute top-k accuracy: fraction where true label is in top-k predictions."""
-    top_k_indices = np.argsort(proba, axis=1)[:, -k:]
-    top_k_classes = classes[top_k_indices]
-    correct = np.any(top_k_classes == y_true[:, None], axis=1)
-    return float(np.mean(correct))
-
-
-def _train_token_probe_for_layer(
-    layer_idx: int,
-    X: np.ndarray,
-    tokens: np.ndarray,
-    train_split: float,
-    seed: int,
-    use_pca: bool,
-    pca_components: int,
-) -> Tuple[int, Dict]:
-    """
-    Train logistic regression probe to predict output token.
-
-    Returns:
-        (layer_idx, results_dict) where results_dict contains accuracy metrics.
-    """
-    rng = np.random.RandomState(seed)
-    n = len(tokens)
-
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    split_idx = int(n * train_split)
-    train_idx = indices[:split_idx]
-    test_idx = indices[split_idx:]
-
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = tokens[train_idx], tokens[test_idx]
-
-    # Scale
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Optional PCA
-    if use_pca:
-        n_components = min(pca_components, X_train_scaled.shape[1], X_train_scaled.shape[0])
-        pca = PCA(n_components=n_components, svd_solver='randomized', random_state=seed)
-        X_train_pca = pca.fit_transform(X_train_scaled)
-        X_test_pca = pca.transform(X_test_scaled)
-    else:
-        X_train_pca = X_train_scaled
-        X_test_pca = X_test_scaled
-
-    # Train classifier
-    clf = LogisticRegression(max_iter=1000, random_state=seed, solver='lbfgs')
-    clf.fit(X_train_pca, y_train)
-
-    top1_acc = clf.score(X_test_pca, y_test)
-    proba = clf.predict_proba(X_test_pca)
-    top5_acc = top_k_accuracy(proba, y_test, k=5, classes=clf.classes_)
-    top10_acc = top_k_accuracy(proba, y_test, k=10, classes=clf.classes_)
-
-    return layer_idx, {
-        "top1_accuracy": float(top1_acc),
-        "top5_accuracy": float(top5_acc),
-        "top10_accuracy": float(top10_acc),
-        "n_classes": len(clf.classes_),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
-    }
-
-
-def run_token_prediction_probe(
-    activations: Dict[int, np.ndarray],
-    predicted_tokens: np.ndarray,
-    train_split: float = TRAIN_SPLIT,
-    seed: int = SEED,
-    use_pca: bool = True,
-    pca_components: int = PROBE_PCA_COMPONENTS,
-    n_jobs: int = N_JOBS,
-) -> Dict[int, Dict]:
-    """
-    Train logistic regression probes to predict output token at each layer.
-
-    Returns:
-        {layer_idx: {"top1_accuracy": ..., "top5_accuracy": ..., "top10_accuracy": ..., ...}}
-    """
-    layer_indices = sorted(activations.keys())
-    n_unique = len(np.unique(predicted_tokens))
-    print(f"\nTraining token prediction probes across {len(activations)} layers...")
-    print(f"  Target: {len(predicted_tokens)} tokens, {n_unique} unique classes")
-
-    results_list = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_train_token_probe_for_layer)(
-            layer_idx,
-            activations[layer_idx],
-            predicted_tokens,
-            train_split,
-            seed,
-            use_pca,
-            pca_components,
-        )
-        for layer_idx in layer_indices
-    )
-    return {layer_idx: result for layer_idx, result in results_list}
-
-
-# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -325,7 +203,7 @@ def find_dataset_path(model_name: str) -> Path:
     if DATASET_PATH:
         return Path(DATASET_PATH)
 
-    model_short = get_model_short_name(model_name, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    model_short = get_model_short_name(model_name)
 
     # Try model-specific path
     model_specific = OUTPUT_DIR / f"{model_short}_nexttoken_entropy_dataset.json"
@@ -500,7 +378,7 @@ def extract_activations_and_metrics(
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    model_short = get_model_short_name(MODEL)
     if ADAPTER:
         adapter_short = get_model_short_name(ADAPTER)
         base_name = f"{model_short}_adapter-{adapter_short}_nexttoken"
@@ -513,7 +391,7 @@ def main():
     if ADAPTER:
         print(f"Adapter: {ADAPTER}")
     print(f"Metrics: {METRICS}")
-    print(f"Bootstrap iterations: {N_BOOTSTRAP}")
+    print(f"Bootstrap iterations: {PROBE_N_BOOTSTRAP}")
     print(f"Output base: {base_name}")
     print()
 
@@ -590,15 +468,13 @@ def main():
         metadata.append(meta_item)
 
     dataset_json = {
-        "config": get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            dataset_path=str(dataset_path),
-            num_samples=len(dataset),
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-        ),
+        "config": {
+            "dataset_path": str(dataset_path),
+            "num_samples": len(dataset),
+            "base_model": MODEL,
+            "adapter": ADAPTER,
+            "seed": SEED,
+        },
         "stats": {},
         "data": metadata,
     }
@@ -625,7 +501,7 @@ def main():
     all_results = {}
 
     for metric in METRICS:
-        print(f"\n--- {metric.upper()} ({N_BOOTSTRAP} bootstrap iterations) ---")
+        print(f"\n--- {metric.upper()} ({PROBE_N_BOOTSTRAP} bootstrap iterations) ---")
         target_values = metrics_to_analyze[metric]
 
         results = find_directions(
@@ -634,8 +510,8 @@ def main():
             methods=["probe", "mean_diff"],
             probe_alpha=PROBE_ALPHA,
             probe_pca_components=PROBE_PCA_COMPONENTS,
-            probe_n_bootstrap=N_BOOTSTRAP,
-            probe_train_split=TRAIN_SPLIT,
+            probe_n_bootstrap=PROBE_N_BOOTSTRAP,
+            probe_train_split=PROBE_TRAIN_SPLIT,
             mean_diff_quantile=MEAN_DIFF_QUANTILE,
             seed=SEED,
             n_jobs=N_JOBS,
@@ -652,12 +528,8 @@ def main():
             best_corr = fits[best_layer]["corr"]
 
             r2_std_str = ""
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                r2_std_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_lo = best_r2 - 1.96 * fits[best_layer]['r2_std']
-                ci_hi = best_r2 + 1.96 * fits[best_layer]['r2_std']
-                r2_std_str = f" [{ci_lo:.3f}, {ci_hi:.3f}]"
+            if "r2_std" in fits[best_layer]:
+                r2_std_str = f" ± {fits[best_layer]['r2_std']:.3f}"
 
             avg_r2 = np.mean([f["r2"] for f in fits.values()])
 
@@ -689,19 +561,15 @@ def main():
         # Save results JSON for this metric
         results_path = OUTPUT_DIR / f"{base_name}_{metric}_results.json"
         results_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                metric=metric,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                probe_alpha=PROBE_ALPHA,
-                pca_components=PROBE_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
+            "config": {
+                "train_split": PROBE_TRAIN_SPLIT,
+                "probe_alpha": PROBE_ALPHA,
+                "use_pca": True,
+                "pca_components": PROBE_PCA_COMPONENTS,
+                "n_bootstrap": PROBE_N_BOOTSTRAP,
+                "mean_diff_quantile": MEAN_DIFF_QUANTILE,
+                "seed": SEED,
+            },
             "metric_stats": {
                 "mean": float(target_values.mean()),
                 "std": float(target_values.std()),
@@ -741,72 +609,6 @@ def main():
     # Diagnostic summary
     print_diagnostic_summary(metrics_to_analyze, all_results, num_layers)
 
-    # =========================================================================
-    # OUTPUT TOKEN DIRECTIONS (parallel to MC answer directions)
-    # =========================================================================
-
-    token_results = None
-    if FIND_OUTPUT_TOKEN_DIRECTIONS and predicted_tokens is not None:
-        print("\n" + "=" * 60)
-        print("OUTPUT TOKEN DIRECTIONS")
-        print("=" * 60)
-
-        token_results = run_token_prediction_probe(
-            activations_by_layer,
-            predicted_tokens,
-            train_split=TRAIN_SPLIT,
-            seed=SEED,
-            use_pca=True,
-            pca_components=PROBE_PCA_COMPONENTS,
-            n_jobs=N_JOBS,
-        )
-
-        # Find best layer
-        best_layer = max(token_results.keys(), key=lambda l: token_results[l]["top1_accuracy"])
-        best_top1 = token_results[best_layer]["top1_accuracy"]
-        best_top5 = token_results[best_layer]["top5_accuracy"]
-        best_top10 = token_results[best_layer]["top10_accuracy"]
-        n_classes = token_results[best_layer]["n_classes"]
-
-        print(f"\nTOKEN PREDICTION RESULTS:")
-        print(f"  Best layer: {best_layer}")
-        print(f"  Top-1 accuracy: {best_top1:.3f} ({best_top1*100:.1f}%)")
-        print(f"  Top-5 accuracy: {best_top5:.3f} ({best_top5*100:.1f}%)")
-        print(f"  Top-10 accuracy: {best_top10:.3f} ({best_top10*100:.1f}%)")
-        print(f"  Number of unique tokens: {n_classes}")
-
-        # Layerwise summary
-        print(f"\n  {'Layer':<8} {'Top-1':>8} {'Top-5':>8} {'Top-10':>8}")
-        print(f"  {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
-        for layer in sorted(token_results.keys()):
-            r = token_results[layer]
-            print(f"  {layer:<8d} {r['top1_accuracy']:>8.3f} {r['top5_accuracy']:>8.3f} {r['top10_accuracy']:>8.3f}")
-
-        # Save token results JSON
-        token_results_path = OUTPUT_DIR / f"{base_name}_token_results.json"
-        token_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                pca_components=PROBE_PCA_COMPONENTS,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
-            "summary": {
-                "best_layer": int(best_layer),
-                "best_top1_accuracy": float(best_top1),
-                "best_top5_accuracy": float(best_top5),
-                "best_top10_accuracy": float(best_top10),
-                "n_classes": int(n_classes),
-            },
-            "per_layer": {int(l): r for l, r in token_results.items()},
-        }
-        with open(token_results_path, "w") as f:
-            json.dump(token_json, f, indent=2)
-        print(f"\n  Saved: {token_results_path}")
-
     # Final summary
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -826,12 +628,6 @@ def main():
                 mae_str = f", MAE={fits[best_layer]['mae']:.3f}"
             print(f"  {method}: best R²={best_r2:.3f}{mae_str} at layer {best_layer}")
 
-    if token_results is not None:
-        print(f"\ntoken prediction:")
-        best_layer = max(token_results.keys(), key=lambda l: token_results[l]["top1_accuracy"])
-        best_top1 = token_results[best_layer]["top1_accuracy"]
-        print(f"  best top-1 accuracy={best_top1:.3f} at layer {best_layer}")
-
     print("\nOutput files:")
     print(f"  {base_name}_activations.npz")
     print(f"  {base_name}_dataset.json")
@@ -841,8 +637,6 @@ def main():
         print(f"  {base_name}_{metric}_directions.npz")
         print(f"  {base_name}_{metric}_results.json")
         print(f"  {base_name}_{metric}_results.png")
-    if FIND_OUTPUT_TOKEN_DIRECTIONS and token_results is not None:
-        print(f"  {base_name}_token_results.json")
 
 
 if __name__ == "__main__":

@@ -38,35 +38,19 @@ def has_chat_template(tokenizer) -> bool:
         return False
 
 
-def get_model_short_name(
-    model_name: str,
-    load_in_4bit: bool = False,
-    load_in_8bit: bool = False,
-) -> str:
+def get_model_short_name(model_name: str) -> str:
     """
     Extract a short, filesystem-safe name from a model path.
 
-    Appends quantization suffix when applicable so that outputs from different
-    precisions never collide.
-
     Examples:
-        "meta-llama/Llama-3.1-8B-Instruct"              -> "Llama-3.1-8B-Instruct"
-        "meta-llama/Llama-3.1-8B-Instruct", 4bit=True   -> "Llama-3.1-8B-Instruct_4bit"
-        "meta-llama/Llama-3.3-70B-Instruct", 8bit=True   -> "Llama-3.3-70B-Instruct_8bit"
+        "meta-llama/Llama-3.1-8B-Instruct" -> "Llama-3.1-8B-Instruct"
+        "/path/to/adapter" -> "adapter"
     """
     # Handle HuggingFace paths
     if "/" in model_name:
         parts = model_name.split("/")
-        short = parts[-1]
-    else:
-        short = model_name
-
-    if load_in_4bit:
-        short += "_4bit"
-    elif load_in_8bit:
-        short += "_8bit"
-
-    return short
+        return parts[-1]
+    return model_name
 
 
 def get_run_name(
@@ -75,17 +59,12 @@ def get_run_name(
     task: str = "probe",
     adapter: Optional[str] = None,
     num_questions: Optional[int] = None,
-    seed: Optional[int] = None,
-    load_in_4bit: bool = False,
-    load_in_8bit: bool = False,
+    seed: Optional[int] = None
 ) -> str:
     """
     Generate a consistent run name for output files.
 
     Format: {model_short}[_adapter]_{dataset}_{task}[_n{num}][_s{seed}]
-
-    The model_short component includes a quantization suffix (_4bit/_8bit)
-    when applicable, so outputs from different precisions never collide.
 
     Args:
         base_model: Base model name/path
@@ -94,13 +73,11 @@ def get_run_name(
         adapter: Optional adapter path
         num_questions: Optional number of questions
         seed: Optional random seed
-        load_in_4bit: Whether model is loaded in 4-bit quantization
-        load_in_8bit: Whether model is loaded in 8-bit quantization
 
     Returns:
         Filesystem-safe run name string
     """
-    model_short = get_model_short_name(base_model, load_in_4bit=load_in_4bit, load_in_8bit=load_in_8bit)
+    model_short = get_model_short_name(base_model)
 
     parts = [model_short]
 
