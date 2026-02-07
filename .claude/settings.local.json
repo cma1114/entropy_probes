@@ -10,7 +10,9 @@
       "Bash(grep:*)",
       "mcp__ide__getDiagnostics",
       "Bash(cat:*)",
-      "Bash(head:*)"
+      "Bash(head:*)",
+      "Bash(wc:*)",
+      "Bash(codex:*)"
     ]
   },
   "enableAllProjectMcpServers": false

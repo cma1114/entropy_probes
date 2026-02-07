@@ -51,8 +51,9 @@ from core.plotting import save_figure, GRID_ALPHA
 # =============================================================================
 
 # --- Model & Data ---
-MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Set to adapter path if using fine-tuned model
+DATASET_FILTER = None#"TriviaMC_difficulty_filtered"  # Only load directions for this dataset (None = all)
 
 # --- Quantization ---
 # Must match the setting used when producing the direction files
@@ -62,7 +63,7 @@ LOAD_IN_8BIT = False
 # --- Script-specific ---
 TOP_K_TOKENS = 12  # Number of top tokens to show in logit lens
 LAYERS_TO_ANALYZE = None  # None = all layers, or list like [10, 15, 20]
-AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+AVAILABLE_METRICS = ["logit_gap"]#"entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
 # --- Output ---
 OUTPUT_DIR = Path("outputs")
@@ -142,7 +143,7 @@ def extract_metric_from_npz(path: Path) -> Optional[str]:
     return None
 
 
-def find_direction_files(output_dir: Path, model_short: str, metric_filter: Optional[str] = None) -> Dict[str, Path]:
+def find_direction_files(output_dir: Path, model_short: str, metric_filter: Optional[str] = None, dataset_filter: Optional[str] = None, exclude_adapters: bool = False) -> Dict[str, Path]:
     """
     Find all direction files for a given model.
 
@@ -150,6 +151,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
         output_dir: Directory to search
         model_short: Short model name for pattern matching
         metric_filter: If specified, only include files for this metric
+        dataset_filter: If specified, only include files for this dataset
+        exclude_adapters: If True, exclude files with "adapter-" in the name
 
     Returns dict mapping direction_type -> path.
     For dataset-specific files (like mc), includes the dataset in the key.
@@ -367,6 +370,97 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             if key not in direction_files:
                 direction_files[key] = path
 
+    # Orthogonal directions from analyze_introspection_orthogonalization.py:
+    # {model}_{dataset}_orthogonal_directions.npz
+    # Contains: introspection_layer_N, surface_layer_N
+    orthogonal_pattern = f"{model_short}*_orthogonal_directions.npz"
+    for path in output_dir.glob(orthogonal_pattern):
+        dataset = extract_dataset_from_npz(path)
+        if dataset is None:
+            # Try to extract from filename
+            name = path.name
+            prefix = f"{model_short}_"
+            suffix = "_orthogonal_directions.npz"
+            if name.startswith(prefix) and name.endswith(suffix):
+                dataset = name[len(prefix):-len(suffix)]
+
+        if dataset:
+            key = f"orthogonal_{dataset}"
+        else:
+            key = "orthogonal"
+
+        if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+            direction_files[key] = path
+
+    # Consensus directions from compare_directions_cross_dataset.py:
+    # {model}_consensus_directions.npz or {model}_adapter-{name}_consensus_directions.npz
+    # Contains: d_self_layer_N, d_other_layer_N, d_introspection_layer_N,
+    #           d_surface_layer_N, d_contrast_layer_N, d_mc_{metric}_layer_N (averaged across datasets)
+    consensus_pattern = f"{model_short}*_consensus_directions.npz"
+    for path in output_dir.glob(consensus_pattern):
+        # Use most recent if multiple exist
+        if "consensus" not in direction_files or path.stat().st_mtime > direction_files["consensus"].stat().st_mtime:
+            direction_files["consensus"] = path
+
+    # Meta confidence directions from test_meta_transfer.py:
+    # {model}_{dataset}_meta_confidence_metaconfdir_directions.npz (d_self)
+    # {model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz (d_other)
+    for conf_type, label in [("confidence", "d_self"), ("other_confidence", "d_other")]:
+        pattern = f"{model_short}*_meta_{conf_type}_metaconfdir_directions.npz"
+        for path in output_dir.glob(pattern):
+            dataset = extract_dataset_from_npz(path)
+            if dataset is None:
+                # Try to extract from filename
+                name = path.name
+                prefix = f"{model_short}_"
+                suffix = f"_meta_{conf_type}_metaconfdir_directions.npz"
+                if name.startswith(prefix) and name.endswith(suffix):
+                    dataset = name[len(prefix):-len(suffix)]
+
+            if dataset:
+                key = f"{label}_{dataset}"
+            else:
+                key = label
+
+            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                direction_files[key] = path
+
+    # Contrast directions from compute_contrast_direction.py:
+    # {model}_{dataset}_contrast_directions.npz
+    # Contains: contrast_layer_N (paired difference between self and other activations)
+    contrast_pattern = f"{model_short}*_contrast_directions.npz"
+    for path in output_dir.glob(contrast_pattern):
+        dataset = extract_dataset_from_npz(path)
+        if dataset is None:
+            # Try to extract from filename
+            name = path.name
+            prefix = f"{model_short}_"
+            suffix = "_contrast_directions.npz"
+            if name.startswith(prefix) and name.endswith(suffix):
+                dataset = name[len(prefix):-len(suffix)]
+
+        if dataset:
+            key = f"contrast_{dataset}"
+        else:
+            key = "contrast"
+
+        if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+            direction_files[key] = path
+
+    # Filter by dataset if specified
+    if dataset_filter:
+        direction_files = {
+            k: v for k, v in direction_files.items()
+            if dataset_filter in k or dataset_filter in str(v)
+        }
+
+    # Filter out adapter files if requested
+    if exclude_adapters:
+        direction_files = {
+            k: v for k, v in direction_files.items()
+            if "adapter-" not in str(v.name)
+        }
+
     return direction_files
 
 
@@ -419,7 +513,14 @@ def load_directions(path: Path) -> Dict[int, Dict[str, np.ndarray]]:
                 # Skip scaler keys (probe_scaler_scale_N, probe_scaler_mean_N)
                 if "scaler" in direction_name:
                     continue
-                directions[layer_idx][direction_name] = data[key]
+                # Skip scalar entries (cosine, residual_norm from orthogonal files)
+                if direction_name in ("cosine", "residual_norm"):
+                    continue
+                arr = data[key]
+                # Skip if not a proper direction vector (must be 1D with reasonable size)
+                if arr.ndim != 1 or arr.shape[0] < 100:
+                    continue
+                directions[layer_idx][direction_name] = arr
             except ValueError:
                 pass
 
@@ -651,56 +752,87 @@ def plot_logit_lens_heatmap(
 ):
     """
     Plot heatmap showing top-k tokens for each layer.
+    Two panels: positive direction (top) and negative direction (bottom).
     Rows = layers, Columns = top-k tokens
     Cell values = softmax probabilities, annotations = token strings
     """
-    token_data = []
-    probs_data = []
+    # Collect data for both positive and negative directions
+    pos_token_data = []
+    pos_probs_data = []
+    neg_token_data = []
+    neg_probs_data = []
 
     for layer_idx in layers:
         if direction_source in all_directions and layer_idx in all_directions[direction_source]:
             if direction_name in all_directions[direction_source][layer_idx]:
                 direction = all_directions[direction_source][layer_idx][direction_name]
-                tokens, probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k, norm_weight)
-                token_data.append(tokens)
-                probs_data.append(probs)
+                # Positive direction
+                pos_tokens, pos_probs = logit_lens_for_layer(direction, lm_head_weight, tokenizer, top_k, norm_weight)
+                pos_token_data.append(pos_tokens)
+                pos_probs_data.append(pos_probs)
+                # Negative direction
+                neg_tokens, neg_probs = logit_lens_for_layer(-direction, lm_head_weight, tokenizer, top_k, norm_weight)
+                neg_token_data.append(neg_tokens)
+                neg_probs_data.append(neg_probs)
             else:
-                token_data.append([''] * top_k)
-                probs_data.append([0.0] * top_k)
+                pos_token_data.append([''] * top_k)
+                pos_probs_data.append([0.0] * top_k)
+                neg_token_data.append([''] * top_k)
+                neg_probs_data.append([0.0] * top_k)
         else:
-            token_data.append([''] * top_k)
-            probs_data.append([0.0] * top_k)
+            pos_token_data.append([''] * top_k)
+            pos_probs_data.append([0.0] * top_k)
+            neg_token_data.append([''] * top_k)
+            neg_probs_data.append([0.0] * top_k)
 
-    if not probs_data:
+    if not pos_probs_data:
         print(f"No data for {direction_source}/{direction_name}")
         return
 
     # Convert to arrays
-    probs_array = np.array(probs_data)
-    token_labels = np.array(token_data)
+    pos_probs_array = np.array(pos_probs_data)
+    pos_token_labels = np.array(pos_token_data)
+    neg_probs_array = np.array(neg_probs_data)
+    neg_token_labels = np.array(neg_token_data)
 
     # Clean token labels for display
-    cleaned_token_labels = np.vectorize(clean_token_str)(token_labels)
+    pos_cleaned = np.vectorize(clean_token_str)(pos_token_labels)
+    neg_cleaned = np.vectorize(clean_token_str)(neg_token_labels)
 
-    # Plot
+    # Plot with two panels
     plt.rcParams['font.family'] = 'DejaVu Sans'
-    fig_height = max(8, len(layers) * 0.25)
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    panel_height = max(4, len(layers) * 0.25)
+    fig, axes = plt.subplots(2, 1, figsize=(14, panel_height * 2 + 1))
 
+    # Positive direction (top panel)
     sns.heatmap(
-        probs_array,
-        annot=cleaned_token_labels,
+        pos_probs_array,
+        annot=pos_cleaned,
         fmt='',
         cmap="Reds",
         xticklabels=False,
         yticklabels=[f"L{l}" for l in layers],
-        ax=ax,
-        cbar_kws={'label': 'Softmax Probability'}
+        ax=axes[0],
+        cbar_kws={'label': 'Softmax Prob'}
     )
+    axes[0].set_title(f"Positive Direction (+d): {direction_source}/{direction_name}")
+    axes[0].set_xlabel(f"Top {top_k} Tokens")
+    axes[0].set_ylabel("Layer")
 
-    ax.set_title(f"Logit Lens: {direction_source}/{direction_name}\n(Top {top_k} tokens per layer)")
-    ax.set_xlabel(f"Top {top_k} Tokens")
-    ax.set_ylabel("Layer")
+    # Negative direction (bottom panel)
+    sns.heatmap(
+        neg_probs_array,
+        annot=neg_cleaned,
+        fmt='',
+        cmap="Blues",
+        xticklabels=False,
+        yticklabels=[f"L{l}" for l in layers],
+        ax=axes[1],
+        cbar_kws={'label': 'Softmax Prob'}
+    )
+    axes[1].set_title(f"Negative Direction (-d): {direction_source}/{direction_name}")
+    axes[1].set_xlabel(f"Top {top_k} Tokens")
+    axes[1].set_ylabel("Layer")
 
     save_figure(fig, output_path)
 
@@ -779,10 +911,17 @@ def main():
     print(f"Device: {DEVICE}")
     if args.metric:
         print(f"Metric filter: {args.metric}")
+    if DATASET_FILTER:
+        print(f"Dataset filter: {DATASET_FILTER}")
 
     # Find direction files
     model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    direction_files = find_direction_files(OUTPUT_DIR, model_short, metric_filter=args.metric)
+    direction_files = find_direction_files(
+        OUTPUT_DIR, model_short,
+        metric_filter=args.metric,
+        dataset_filter=DATASET_FILTER,
+        exclude_adapters=(ADAPTER is None)
+    )
 
     if not direction_files:
         print(f"No direction files found in {OUTPUT_DIR} for model {model_short}")
