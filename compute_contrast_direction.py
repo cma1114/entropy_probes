@@ -1,12 +1,12 @@
 """
-Compute contrast direction from paired self vs other confidence activations.
+Compute selfVother_conf direction from paired activations.
 
-d_contrast = normalize(mean(self_activation - other_activation))
+d_selfVother_conf = normalize(mean(self_activation - other_activation))
 
-This captures what changes in activation space when the model introspects
-(self-confidence) vs externally evaluates (other-confidence) the same questions.
+This captures what changes in activation space when the model is asked about
+its own confidence vs another entity's confidence on the same questions.
 
-Unlike d_introspection (which orthogonalizes direction vectors), this works
+Unlike d_self_confidence_unique (which orthogonalizes direction vectors), this works
 directly on paired activations - same question, same answer options, only
 the task framing differs.
 
@@ -17,7 +17,7 @@ Inputs (for each dataset):
     outputs/{model}_{dataset}_meta_other_confidence_activations.npz
 
 Outputs (for each dataset):
-    outputs/{model}_{dataset}_contrast_directions.npz
+    outputs/{model}_{dataset}_selfVother_conf_directions.npz
 
 Configuration:
     MODEL_SHORT: Model name (e.g., "Llama-3.1-8B-Instruct")
@@ -105,19 +105,19 @@ def load_activations(base_name: str, task: str, position: str = "final") -> dict
     return activations
 
 
-def compute_contrast_direction(
+def compute_selfVother_conf_direction(
     self_acts: np.ndarray,
     other_acts: np.ndarray
 ) -> tuple[np.ndarray, dict]:
     """
-    Compute contrast direction from paired activations.
+    Compute selfVother_conf direction from paired activations.
 
     Args:
         self_acts: (n_samples, hidden_dim) self-confidence activations
         other_acts: (n_samples, hidden_dim) other-confidence activations
 
     Returns:
-        direction: (hidden_dim,) normalized contrast direction
+        direction: (hidden_dim,) normalized direction (self - other)
         info: dict with statistics
     """
     assert self_acts.shape == other_acts.shape, \
@@ -186,8 +186,8 @@ def process_dataset(base_name: str) -> bool:
     print(f"  Samples: {n_samples}")
     print(f"  Hidden dim: {hidden_dim}")
 
-    # Compute contrast direction for each layer
-    print("\nComputing contrast directions...")
+    # Compute selfVother_conf direction for each layer
+    print("\nComputing selfVother_conf directions...")
     save_data = {
         "_metadata_model": base_name.split("_")[0],
         "_metadata_dataset": "_".join(base_name.split("_")[1:]),
@@ -196,14 +196,14 @@ def process_dataset(base_name: str) -> bool:
 
     raw_norms = []
     for layer in layers:
-        direction, info = compute_contrast_direction(
+        direction, info = compute_selfVother_conf_direction(
             self_acts[layer], other_acts[layer]
         )
-        save_data[f"contrast_layer_{layer}"] = direction
+        save_data[f"selfVother_conf_layer_{layer}"] = direction
         raw_norms.append(info["raw_norm"])
 
     # Save
-    output_path = OUTPUT_DIR / f"{base_name}_contrast_directions.npz"
+    output_path = OUTPUT_DIR / f"{base_name}_selfVother_conf_directions.npz"
     np.savez_compressed(output_path, **save_data)
     print(f"\nSaved: {output_path.name}")
 

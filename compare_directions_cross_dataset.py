@@ -7,19 +7,21 @@ Computes:
 3. Per-dataset alignment to consensus (how much each dataset shares the common signal)
 
 Direction Types:
-    d_self         - predicts self-confidence (from meta_confidence)
-    d_other        - predicts other-confidence (from meta_other_confidence)
-    d_introspection - d_self orthogonalized against d_other
-    d_surface      - d_other orthogonalized against d_self
-    d_contrast     - mean(self_activation - other_activation) for paired questions
-    d_mc_{metric}  - predicts MC answer metric (from identify_mc_correlate.py, e.g. logit_gap, entropy)
+    d_self_confidence         - predicts self-confidence (from meta_confidence)
+    d_other_confidence        - predicts other-confidence (from meta_other_confidence)
+    d_self_confidence_unique      - d_self_confidence with d_other_confidence projected out
+    d_other_confidence_unique     - d_other_confidence with d_self_confidence projected out
+    d_selfVother_conf             - mean(self_activation - other_activation) for paired questions
+    d_mc_{metric}                 - predicts MC answer metric (from identify_mc_correlate.py, e.g. logit_gap, entropy)
+    d_meta_mc_uncert              - predicts MC uncertainty from meta-task activations (metamcuncert)
 
 Inputs:
-    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz     (d_self)
-    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other)
-    outputs/{model}_{dataset}_orthogonal_directions.npz   (d_introspection, d_surface)
-    outputs/{model}_{dataset}_contrast_directions.npz     (d_contrast)
+    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz     (d_self_confidence)
+    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other_confidence)
+    outputs/{model}_{dataset}_orthogonal_directions.npz   (d_self_confidence_unique, d_other_confidence_unique)
+    outputs/{model}_{dataset}_selfVother_conf_directions.npz  (d_selfVother_conf)
     outputs/{model}_{dataset}_mc_{metric}_directions.npz  (d_mc_{metric})
+    outputs/{model}_{dataset}_meta_confidence_metamcuncert_directions.npz  (d_meta_mc_uncert)
 
 Outputs:
     outputs/{model}_cross_dataset_comparison.json
@@ -29,7 +31,7 @@ Outputs:
 Run after:
     test_meta_transfer.py with META_TASK="confidence" and FIND_CONFIDENCE_DIRECTIONS=True
     test_meta_transfer.py with META_TASK="other_confidence" and FIND_CONFIDENCE_DIRECTIONS=True
-    analyze_introspection_orthogonalization.py (or compute orthogonal directions)
+    compute_orthogonal_directions.py
     compute_contrast_direction.py
 """
 
@@ -77,7 +79,15 @@ def get_base_name(dataset: str) -> str:
 # All direction types
 # MC_METRIC should match the METRICS setting in identify_mc_correlate.py
 MC_METRIC = "logit_gap"  # or "entropy", "top_prob", etc.
-DIRECTION_TYPES = ["d_self", "d_other", "d_introspection", "d_surface", "d_contrast", f"d_mc_{MC_METRIC}"]
+DIRECTION_TYPES = [
+    "d_self_confidence",
+    "d_other_confidence",
+    "d_self_confidence_unique",
+    "d_other_confidence_unique",
+    "d_selfVother_conf",
+    f"d_mc_{MC_METRIC}",
+    "d_meta_mc_uncert",  # metamcuncert: meta activations → MC uncertainty
+]
 
 
 # =============================================================================
@@ -102,48 +112,72 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                    (e.g., "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered")
 
     Returns:
-        {"d_self": {layer: vec}, "d_other": {layer: vec}, ...}
+        {"d_self_confidence": {layer: vec}, "d_other_confidence": {layer: vec}, ...}
     """
     directions = {dt: {} for dt in DIRECTION_TYPES}
 
-    # d_self from meta_confidence directions
+    # d_self_confidence from meta_confidence directions
     self_path = OUTPUT_DIR / f"{base_name}_meta_confidence_metaconfdir_directions.npz"
     if self_path.exists():
         data = np.load(self_path)
         for key in data.files:
             if key.startswith("mean_diff_layer_"):
                 layer = int(key.replace("mean_diff_layer_", ""))
-                directions["d_self"][layer] = normalize(data[key])
+                directions["d_self_confidence"][layer] = normalize(data[key])
 
-    # d_other from meta_other_confidence directions
+    # d_other_confidence from meta_other_confidence directions
     other_path = OUTPUT_DIR / f"{base_name}_meta_other_confidence_metaconfdir_directions.npz"
     if other_path.exists():
         data = np.load(other_path)
         for key in data.files:
             if key.startswith("mean_diff_layer_"):
                 layer = int(key.replace("mean_diff_layer_", ""))
-                directions["d_other"][layer] = normalize(data[key])
+                directions["d_other_confidence"][layer] = normalize(data[key])
 
-    # d_introspection, d_surface from orthogonal directions
+    # d_self_confidence_unique, d_other_confidence_unique from orthogonal directions
     ortho_path = OUTPUT_DIR / f"{base_name}_orthogonal_directions.npz"
     if ortho_path.exists():
         data = np.load(ortho_path)
         for key in data.files:
-            if key.startswith("introspection_layer_"):
+            # New format
+            if key.startswith("self_confidence_unique_layer_"):
+                layer = int(key.replace("self_confidence_unique_layer_", ""))
+                directions["d_self_confidence_unique"][layer] = normalize(data[key])
+            elif key.startswith("other_confidence_unique_layer_"):
+                layer = int(key.replace("other_confidence_unique_layer_", ""))
+                directions["d_other_confidence_unique"][layer] = normalize(data[key])
+            # Legacy format (for backward compatibility)
+            elif key.startswith("introspection_layer_"):
                 layer = int(key.replace("introspection_layer_", ""))
-                directions["d_introspection"][layer] = normalize(data[key])
+                if layer not in directions["d_self_confidence_unique"]:
+                    directions["d_self_confidence_unique"][layer] = normalize(data[key])
             elif key.startswith("surface_layer_"):
                 layer = int(key.replace("surface_layer_", ""))
-                directions["d_surface"][layer] = normalize(data[key])
+                if layer not in directions["d_other_confidence_unique"]:
+                    directions["d_other_confidence_unique"][layer] = normalize(data[key])
 
-    # d_contrast from contrast directions
-    contrast_path = OUTPUT_DIR / f"{base_name}_contrast_directions.npz"
-    if contrast_path.exists():
-        data = np.load(contrast_path)
+    # d_selfVother_conf from selfVother_conf directions
+    svo_path = OUTPUT_DIR / f"{base_name}_selfVother_conf_directions.npz"
+    if svo_path.exists():
+        data = np.load(svo_path)
         for key in data.files:
-            if key.startswith("contrast_layer_"):
-                layer = int(key.replace("contrast_layer_", ""))
-                directions["d_contrast"][layer] = normalize(data[key])
+            if key.startswith("selfVother_conf_layer_"):
+                layer = int(key.replace("selfVother_conf_layer_", ""))
+                directions["d_selfVother_conf"][layer] = normalize(data[key])
+    else:
+        # Legacy: try old self_vs_other_confidence or contrast format
+        for legacy_suffix, legacy_prefix in [
+            ("_self_vs_other_confidence_directions.npz", "self_vs_other_confidence_layer_"),
+            ("_contrast_directions.npz", "contrast_layer_"),
+        ]:
+            legacy_path = OUTPUT_DIR / f"{base_name}{legacy_suffix}"
+            if legacy_path.exists():
+                data = np.load(legacy_path)
+                for key in data.files:
+                    if key.startswith(legacy_prefix):
+                        layer = int(key.replace(legacy_prefix, ""))
+                        directions["d_selfVother_conf"][layer] = normalize(data[key])
+                break
 
     # d_mc_{metric} from mc directions (from identify_mc_correlate.py)
     mc_path = OUTPUT_DIR / f"{base_name}_mc_{MC_METRIC}_directions.npz"
@@ -153,6 +187,15 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
             if key.startswith("mean_diff_layer_"):
                 layer = int(key.replace("mean_diff_layer_", ""))
                 directions[f"d_mc_{MC_METRIC}"][layer] = normalize(data[key])
+
+    # d_meta_mc_uncert from metamcuncert directions (meta activations → MC uncertainty)
+    mmu_path = OUTPUT_DIR / f"{base_name}_meta_confidence_metamcuncert_directions.npz"
+    if mmu_path.exists():
+        data = np.load(mmu_path)
+        for key in data.files:
+            if key.startswith("mean_diff_layer_"):
+                layer = int(key.replace("mean_diff_layer_", ""))
+                directions["d_meta_mc_uncert"][layer] = normalize(data[key])
 
     # Check we have at least some directions
     has_any = any(len(d) > 0 for d in directions.values())

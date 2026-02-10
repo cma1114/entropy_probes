@@ -2,57 +2,57 @@
 
 ## Overview
 
-This document describes the methodology for isolating "true introspection" from surface difficulty cues by orthogonalizing confidence direction vectors, and analyzing their consistency across datasets.
+This document describes the methodology for computing orthogonalized confidence direction vectors and analyzing their consistency across datasets.
 
 ## Conceptual Framework
 
 ### The Problem
 
-When a model predicts its own confidence (self-confidence), two signals are confounded:
+When a model predicts its own confidence (self-confidence), two signals may be confounded:
 
-1. **Introspection**: The model's genuine access to its internal uncertainty
+1. **Self-knowledge**: The model's access to its internal uncertainty state
 2. **Surface difficulty cues**: Observable features that correlate with question difficulty (e.g., obscure vocabulary, complex syntax)
 
-Similarly, when predicting another model's confidence (other-confidence), the model primarily uses surface difficulty cues (it can't introspect into another model).
+Similarly, when predicting another model's confidence (other-confidence), the model primarily uses surface difficulty cues (it can't access another model's internal state).
 
 ### The Solution: Orthogonalization
 
 We extract two direction vectors:
-- **d_self**: Direction that predicts self-confidence (introspection + surface)
-- **d_other**: Direction that predicts other-confidence (primarily surface)
+- **d_self_confidence**: Direction that predicts self-confidence
+- **d_other_confidence**: Direction that predicts other-confidence
 
 Then apply Gram-Schmidt orthogonalization:
 ```
-d_introspection = d_self - proj(d_self, d_other)
-                = d_self - cos(d_self, d_other) * d_other
+d_self_confidence_unique = d_self_confidence - proj(d_self_confidence, d_other_confidence)
+                         = d_self_confidence - cos(d_self_confidence, d_other_confidence) * d_other_confidence
 
-d_surface = d_other - proj(d_other, d_self)
-          = d_other - cos(d_self, d_other) * d_self
+d_other_confidence_unique = d_other_confidence - proj(d_other_confidence, d_self_confidence)
+                          = d_other_confidence - cos(d_other_confidence, d_self_confidence) * d_self_confidence
 ```
 
 This yields:
-- **d_introspection**: The component of self-confidence prediction that is *orthogonal* to other-confidence prediction (pure introspection)
-- **d_surface**: The component of other-confidence prediction that is *orthogonal* to self-confidence prediction (pure surface cues)
+- **d_self_confidence_unique**: The component of self-confidence prediction that is *orthogonal* to other-confidence prediction
+- **d_other_confidence_unique**: The component of other-confidence prediction that is *orthogonal* to self-confidence prediction
 
 ### Alternative Approach: Paired Contrast Direction
 
 A complementary approach works directly on paired activations rather than direction vectors:
 
 ```
-d_contrast = normalize(mean(self_activation[i] - other_activation[i]))
+d_selfVother_conf = normalize(mean(self_activation[i] - other_activation[i]))
 ```
 
 For each question, we have activations from two contexts:
 - **Self-confidence trial**: "How confident are you in your answer?"
 - **Other-confidence trial**: "How confident would [other model] be?"
 
-Since these are the **same questions** with the **same answer options**, the only difference is the task framing. The contrast direction captures what changes in activation space when the model introspects vs externally evaluates.
+Since these are the **same questions** with the **same answer options**, the only difference is the task framing. The contrast direction captures what changes in activation space when the model is asked about itself vs another model.
 
-**Key difference from d_introspection:**
-- d_introspection: Orthogonalizes *direction vectors* (found from high/low confidence samples)
-- d_contrast: Averages *paired activation differences* (same question, different task)
+**Key difference from d_self_confidence_unique:**
+- d_self_confidence_unique: Orthogonalizes *direction vectors* (found from high/low confidence samples)
+- d_selfVother_conf: Averages *paired activation differences* (same question, different task)
 
-Both aim to isolate introspection-specific signal, but from different angles.
+Both aim to isolate self-specific signal, but from different angles.
 
 ## Direction Finding Methods
 
@@ -86,7 +86,7 @@ This prevents circularity: the R² values for predictive power are genuine out-o
 For each pair of datasets, compute cosine similarity between their direction vectors at each layer:
 
 ```
-cos(d_introspection_DatasetA, d_introspection_DatasetB)
+cos(d_self_confidence_unique_DatasetA, d_self_confidence_unique_DatasetB)
 ```
 
 Moderate pairwise similarities (0.3-0.5) with high variance across layers suggest:
@@ -100,7 +100,7 @@ To extract the "common core" shared across all datasets:
 
 ```python
 # Stack direction vectors from all datasets
-vecs = [d_introspection_A, d_introspection_B, d_introspection_C]
+vecs = [d_self_confidence_unique_A, d_self_confidence_unique_B, d_self_confidence_unique_C]
 
 # Average and renormalize
 consensus = normalize(mean(vecs))
@@ -122,7 +122,7 @@ argmax_v sum_i cos(v, d_i) = argmax_v sum_i (v · d_i)
 Compute how well each dataset's direction aligns with the consensus:
 
 ```
-alignment = cos(d_introspection_DatasetA, d_introspection_consensus)
+alignment = cos(d_self_confidence_unique_DatasetA, d_self_confidence_unique_consensus)
 ```
 
 **Key insight:** If pairwise similarities are moderate but alignment to consensus is high, this indicates:
@@ -168,17 +168,17 @@ probs = softmax(logits)
 top_tokens = argsort(probs)[-k:]
 ```
 
-This reveals semantic content: d_introspection might point toward uncertainty words ("maybe", "unsure"), while d_surface might point toward topic/complexity words.
+This reveals semantic content encoded by each direction.
 
 ## Direction Types Summary
 
 | Direction | Source | What it captures |
 |-----------|--------|------------------|
-| **d_self** | `*_meta_confidence_metaconfdir_directions.npz` | Predicts self-confidence (introspection + surface cues) |
-| **d_other** | `*_meta_other_confidence_metaconfdir_directions.npz` | Predicts other-confidence (primarily surface cues) |
-| **d_introspection** | `*_orthogonal_directions.npz` | d_self orthogonalized against d_other (pure introspection) |
-| **d_surface** | `*_orthogonal_directions.npz` | d_other orthogonalized against d_self (pure surface cues) |
-| **d_contrast** | `*_contrast_directions.npz` | mean(self_activation - other_activation) for paired questions |
+| **d_self_confidence** | `*_meta_confidence_metaconfdir_directions.npz` | Predicts self-confidence |
+| **d_other_confidence** | `*_meta_other_confidence_metaconfdir_directions.npz` | Predicts other-confidence |
+| **d_self_confidence_unique** | `*_orthogonal_directions.npz` | d_self_confidence with d_other_confidence projected out |
+| **d_other_confidence_unique** | `*_orthogonal_directions.npz` | d_other_confidence with d_self_confidence projected out |
+| **d_selfVother_conf** | `*_selfVother_conf_directions.npz` | mean(self_activation - other_activation) for paired questions |
 | **d_mc_{metric}** | `*_mc_{metric}_directions.npz` | Predicts MC answer metric (from identify_mc_correlate.py, e.g. logit_gap, entropy) |
 
 ## Pipeline
@@ -197,7 +197,7 @@ DATASET = "TriviaMC_difficulty_filtered"  # or "PopMC_0_difficulty_filtered" or 
 python identify_mc_correlate.py
 ```
 
-#### Step 2: For EACH dataset, get d_self
+#### Step 2: For EACH dataset, get d_self_confidence
 
 ```python
 # In test_meta_transfer.py, set:
@@ -209,7 +209,7 @@ FIND_CONFIDENCE_DIRECTIONS = True
 python test_meta_transfer.py
 ```
 
-#### Step 3: For EACH dataset, get d_other
+#### Step 3: For EACH dataset, get d_other_confidence
 
 ```python
 # In test_meta_transfer.py, set:
@@ -237,7 +237,7 @@ DATASETS = [
 python compute_orthogonal_directions.py
 ```
 
-#### Step 5: Compute contrast directions (all datasets at once)
+#### Step 5: Compute selfVother_conf directions (all datasets at once)
 
 ```python
 # In compute_contrast_direction.py, set:
@@ -287,8 +287,8 @@ If you set `DATASET_FILTER = "TriviaMC_difficulty_filtered"`, it will only analy
 Once Steps 1-3 are done for all datasets, the remaining steps are just:
 
 ```bash
-python compute_orthogonal_directions.py   # all datasets in one run
-python compute_contrast_direction.py      # all datasets in one run
+python compute_orthogonal_directions.py   # d_self_confidence_unique, d_other_confidence_unique
+python compute_contrast_direction.py      # d_selfVother_conf
 python compare_directions_cross_dataset.py # consensus
 python analyze_directions.py               # logit lens
 ```
@@ -309,28 +309,28 @@ python analyze_introspection_orthogonalization.py
 
 | File | Contents |
 |------|----------|
-| `*_meta_confidence_metaconfdir_directions.npz` | d_self per layer |
-| `*_meta_other_confidence_metaconfdir_directions.npz` | d_other per layer |
-| `*_orthogonal_directions.npz` | d_introspection, d_surface per layer |
-| `*_contrast_directions.npz` | d_contrast per layer |
+| `*_meta_confidence_metaconfdir_directions.npz` | d_self_confidence per layer |
+| `*_meta_other_confidence_metaconfdir_directions.npz` | d_other_confidence per layer |
+| `*_orthogonal_directions.npz` | d_self_confidence_unique, d_other_confidence_unique per layer |
+| `*_selfVother_conf_directions.npz` | d_selfVother_conf per layer |
 | `*_orthogonal_analysis_results.json` | Predictive power, steering, ablation results |
-| `{model}_cross_dataset_comparison.json` | Pairwise similarities, alignment scores for all 5 types |
-| `{model}_consensus_directions.npz` | Consensus for all 5 direction types |
+| `{model}_cross_dataset_comparison.json` | Pairwise similarities, alignment scores for all direction types |
+| `{model}_consensus_directions.npz` | Consensus for all direction types |
 | `*_direction_analysis.json` | Logit lens results (top-k tokens per layer) |
 
 ## Key Findings Template
 
 When running this analysis, report:
 
-1. **Cosine similarity cos(d_self, d_other)**: How much do self and other confidence directions overlap? High overlap (>0.8) means limited unique introspective content.
+1. **Cosine similarity cos(d_self_confidence, d_other_confidence)**: How much do self and other confidence directions overlap? High overlap (>0.8) means limited unique content.
 
-2. **Predictive power of d_introspection for self vs other**: If genuine introspection exists, d_introspection should predict self-confidence (high R²) but NOT other-confidence (R² ≈ 0).
+2. **Predictive power of d_self_confidence_unique for self vs other**: Does the unique component of d_self_confidence predict self-confidence (high R²) but NOT other-confidence (R² ≈ 0)?
 
 3. **Cross-dataset consistency**: Alignment to consensus >0.7 suggests universal directions; <0.5 suggests dataset-specific artifacts.
 
-4. **Logit lens interpretation**: What semantic content do the directions encode? Do d_introspection and d_surface point to qualitatively different token types?
+4. **Logit lens interpretation**: What semantic content do the directions encode? Do d_self_confidence_unique and d_other_confidence_unique point to qualitatively different token types?
 
-5. **d_introspection vs d_contrast comparison**: These two approaches to isolating introspection should be compared:
+5. **d_self_confidence_unique vs d_selfVother_conf comparison**: These two approaches should be compared:
    - High cosine similarity → Both methods capture the same signal
-   - Low similarity → They capture different aspects of introspection
-   - If d_contrast has higher cross-dataset consistency, paired subtraction may be a cleaner method
+   - Low similarity → They capture different aspects
+   - If d_selfVother_conf has higher cross-dataset consistency, paired subtraction may be a cleaner method

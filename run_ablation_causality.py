@@ -7,26 +7,31 @@ Supports multiple direction types via DIRECTION_TYPE:
 - "uncertainty": Entropy/logit_gap directions (from identify_mc_correlate.py)
 - "answer": MC answer A/B/C/D directions (from identify_mc_correlate.py with FIND_ANSWER_DIRECTIONS=True)
 - "confidence": Stated confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
+- "metamcuncert": MC uncertainty directions found from meta activations (from test_meta_transfer.py with FIND_MC_UNCERTAINTY_DIRECTIONS=True)
 
 Tests all layers with pooled null distribution + FDR correction.
 
 Inputs:
-    outputs/{base}_mc_{metric}_directions.npz           Uncertainty directions
+    outputs/{base}_mc_{metric}_directions.npz            Uncertainty directions
     outputs/{base}_mc_answer_directions.npz              Answer directions (if DIRECTION_TYPE="answer")
     outputs/{base}_meta_{task}_metaconfdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
+    outputs/{base}_meta_{task}_metamcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
     outputs/{base}_mc_dataset.json                       Question metadata + metric values
 
-Outputs:
-    outputs/{base}_ablation_{task}_{metric}_results.json    Ablation effect sizes, p-values
-    outputs/{base}_ablation_{task}_{metric}_results.png     Ablation effect curves
+Outputs (one file per method/position combination):
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{positions}_results.json
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{positions}_{position}.png
 
     where {base} = {model_short_name}_{dataset}
+          {dir_suffix} = "{direction_type}_{metric}" for uncertainty, else "{direction_type}"
+          {method} = "probe" or "mean_diff"
+          {positions} = position(s) tested, joined by underscore (e.g., "final" or "final_question_mark")
 
 Shared parameters (must match across scripts):
     SEED, TRAIN_SPLIT
 
 Run after: identify_mc_correlate.py
-    + test_meta_transfer.py (if using DIRECTION_TYPE="confidence")
+    + test_meta_transfer.py (if using DIRECTION_TYPE="confidence" or "metamcuncert")
 """
 
 import torch
@@ -83,6 +88,7 @@ META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
 # - "uncertainty": Ablate uncertainty directions (from identify_mc_correlate.py)
 # - "answer": Ablate MC answer directions (from identify_mc_correlate.py with FIND_ANSWER_DIRECTIONS=True)
 # - "confidence": Ablate confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
+# - "metamcuncert": Ablate MC uncertainty directions found from meta activations (test_meta_transfer.py)
 DIRECTION_TYPE = "uncertainty"
 
 # Descriptions for each direction type (used in summary output)
@@ -98,6 +104,10 @@ DIRECTION_DESCRIPTIONS = {
     "confidence": {
         "trained_on": "stated confidence from meta-task (same output being measured)",
         "interpretation": "Tests if confidence expression mechanism affects calibration (partially circular)",
+    },
+    "metamcuncert": {
+        "trained_on": "MC uncertainty predicted from meta-task activations",
+        "interpretation": "Tests if meta-task uses uncertainty direction found in its own activations",
     },
 }
 
@@ -258,15 +268,15 @@ def load_directions(
 
     Args:
         base_name: Base name for input files
-        direction_type: "uncertainty", "answer", or "confidence"
+        direction_type: "uncertainty", "answer", "confidence", or "metamcuncert"
         metric: Uncertainty metric (only used for direction_type="uncertainty")
-        meta_task: Meta task (only used for direction_type="confidence")
+        meta_task: Meta task (only used for direction_type="confidence" or "metamcuncert")
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
         For uncertainty: {"probe": {...}, "mean_diff": {...}}
         For answer: {"answer": {...}}
-        For confidence: {"confidence": {...}}
+        For confidence/metamcuncert: {"probe": {...}, "mean_diff": {...}}
     """
     if direction_type == "uncertainty":
         path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
@@ -274,6 +284,8 @@ def load_directions(
         path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
     elif direction_type == "confidence":
         path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_directions.npz"
+    elif direction_type == "metamcuncert":
+        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -351,7 +363,7 @@ def load_directions(
                     direction = direction / norm
                 methods["answer"][layer] = direction
 
-    elif direction_type == "confidence":
+    elif direction_type in ("confidence", "metamcuncert"):
         # Keys are like "probe_layer_0", "mean_diff_layer_5" (same format as uncertainty)
         for key in data.files:
             if key.startswith("_"):
@@ -1942,82 +1954,78 @@ def main():
             print(f"  Significant layers (bootstrap FDR): {summary.get('n_significant_bootstrap_fdr', 0)}")
             print(f"  Best |Δcorr| layer: {summary.get('best_layer_abs_delta')} (Δ={summary.get('best_abs_delta', 0.0):+.3f})")
 
-        # Incremental save after each position completes (crash protection)
+        # Incremental save after each position completes (crash protection) - one per method
         model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
         # Extract dataset name by removing model prefix from INPUT_BASE_NAME
         dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
         # Include direction type in output name to distinguish different ablation experiments
         dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-        # Include adapter in output name if used
-        if ADAPTER:
-            adapter_short = get_model_short_name(ADAPTER)
-            base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-        else:
-            base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-        checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
-        checkpoint_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
-                direction_type=DIRECTION_TYPE,
-                metric=METRIC,
-                meta_task=META_TASK,
-                num_questions=len(questions),
-                use_transfer_split=USE_TRANSFER_SPLIT,
-                seed=SEED,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-                positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_pos[p]],
-            ),
-            "by_position": {},
-        }
-        for pos in PROBE_POSITIONS:
-            if all_analyses_by_pos[pos]:
-                checkpoint_json["by_position"][pos] = {}
-                for m, analysis in all_analyses_by_pos[pos].items():
-                    checkpoint_json["by_position"][pos][m] = {
+        # Build position suffix
+        pos_suffix = "_".join(PROBE_POSITIONS)
+
+        for method in methods:
+            if ADAPTER:
+                adapter_short = get_model_short_name(ADAPTER)
+                base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+            else:
+                base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+            checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
+
+            checkpoint_json = {
+                "config": get_config_dict(
+                    model=MODEL,
+                    input_base_name=INPUT_BASE_NAME,
+                    direction_type=DIRECTION_TYPE,
+                    metric=METRIC,
+                    meta_task=META_TASK,
+                    num_questions=len(questions),
+                    use_transfer_split=USE_TRANSFER_SPLIT,
+                    seed=SEED,
+                    load_in_4bit=LOAD_IN_4BIT,
+                    load_in_8bit=LOAD_IN_8BIT,
+                    method=method,
+                    positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_pos[p]],
+                ),
+                "by_position": {},
+            }
+            for pos in PROBE_POSITIONS:
+                if all_analyses_by_pos[pos] and method in all_analyses_by_pos[pos]:
+                    analysis = all_analyses_by_pos[pos][method]
+                    checkpoint_json["by_position"][pos] = {
                         "per_layer": analysis["per_layer"],
                         "summary": analysis["summary"],
                     }
-        with open(checkpoint_path, "w") as f:
-            json.dump(checkpoint_json, f, indent=2)
-        print(f"  Checkpoint saved: {checkpoint_path.name}")
-
-    # For backward compatibility, keep "final" as the default if it was tested
-    if "final" in all_analyses_by_pos:
-        all_analyses = all_analyses_by_pos["final"]
-    else:
-        # Use first available position
-        all_analyses = all_analyses_by_pos[PROBE_POSITIONS[0]]
+            with open(checkpoint_path, "w") as f:
+                json.dump(checkpoint_json, f, indent=2)
+            print(f"  Checkpoint saved: {checkpoint_path.name}")
 
     # Generate output filename (include DIRECTION_TYPE for clarity)
     model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
     # Extract dataset name by removing model prefix from INPUT_BASE_NAME
     dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
     dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-    # Include adapter in output name if used
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-    else:
-        base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}"
-    # Add confidence signal to filename when non-default (for delegate task)
-    if META_TASK == "delegate" and CONFIDENCE_SIGNAL != "prob":
-        base_output += f"_{CONFIDENCE_SIGNAL}"
+    # Build position suffix for filename
+    pos_suffix = "_".join(PROBE_POSITIONS)
 
-    # Save JSON results
+    def get_base_output(method: str) -> str:
+        """Get base output path for a specific method."""
+        if ADAPTER:
+            adapter_short = get_model_short_name(ADAPTER)
+            base = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+        else:
+            base = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+        # Add confidence signal to filename when non-default (for delegate task)
+        if META_TASK == "delegate" and CONFIDENCE_SIGNAL != "prob":
+            base += f"_{CONFIDENCE_SIGNAL}"
+        return base
+
+    # Save JSON results - one file per method
     print("\nSaving results...")
-    results_path = OUTPUT_DIR / f"{base_output}_results.json"
+    saved_files = []
+    for method in methods:
+        base_output = get_base_output(method)
+        results_path = OUTPUT_DIR / f"{base_output}_results.json"
 
-    # Load existing results if present, otherwise create new
-    if results_path.exists():
-        with open(results_path, "r") as f:
-            output_json = json.load(f)
-        print(f"  Merging with existing results: {results_path.name}")
-        # Ensure by_position exists (for older format files)
-        if "by_position" not in output_json:
-            output_json["by_position"] = {}
-    else:
         output_json = {
             "config": get_config_dict(
                 model=MODEL,
@@ -2033,22 +2041,16 @@ def main():
                 transfer_r2_threshold=TRANSFER_R2_THRESHOLD,
                 load_in_4bit=LOAD_IN_4BIT,
                 load_in_8bit=LOAD_IN_8BIT,
-                methods_tested=[],
-                positions_tested=[],
+                method=method,
+                positions_tested=PROBE_POSITIONS,
             ),
             "by_position": {},
         }
 
-    # Update config with current run's positions/methods (accumulate)
-    existing_positions = set(output_json["config"].get("positions_tested", []))
-    existing_methods = set(output_json["config"].get("methods_tested", []))
-    output_json["config"]["positions_tested"] = sorted(existing_positions | set(PROBE_POSITIONS))
-    output_json["config"]["methods_tested"] = sorted(existing_methods | set(methods))
-
-    # Legacy format: only update top-level keys when "final" position was tested
-    if "final" in PROBE_POSITIONS:
-        for method, analysis in all_analyses.items():
-            output_json[method] = {
+        # Per-position results for this method
+        for position in PROBE_POSITIONS:
+            analysis = all_analyses_by_pos[position][method]
+            output_json["by_position"][position] = {
                 "layers": analysis["layers"],
                 "num_questions": analysis["num_questions"],
                 "num_controls": analysis["num_controls"],
@@ -2057,59 +2059,29 @@ def main():
                 "summary": analysis["summary"],
             }
 
-    # Merge new results into by_position (overwrites same position/method)
-    for position in PROBE_POSITIONS:
-        if position not in output_json["by_position"]:
-            output_json["by_position"][position] = {}
-        for method, analysis in all_analyses_by_pos[position].items():
-            output_json["by_position"][position][method] = {
-                "layers": analysis["layers"],
-                "num_questions": analysis["num_questions"],
-                "num_controls": analysis["num_controls"],
-                "metric": analysis["metric"],
-                "per_layer": analysis["per_layer"],
-                "summary": analysis["summary"],
-            }
+        # Backward compatibility: keep default position results at top level
+        default_position = "final" if "final" in all_analyses_by_pos else PROBE_POSITIONS[0]
+        analysis = all_analyses_by_pos[default_position][method]
+        output_json["layers"] = analysis["layers"]
+        output_json["num_questions"] = analysis["num_questions"]
+        output_json["num_controls"] = analysis["num_controls"]
+        output_json["metric"] = analysis["metric"]
+        output_json["per_layer"] = analysis["per_layer"]
+        output_json["summary"] = analysis["summary"]
 
-    # Comparison summary (primarily useful when >=2 methods)
-    if len(methods) >= 2:
-        # For backward compatibility, keep the old keys (control-based) *and* add bootstrap-based keys.
-        output_json["comparison"] = {
-            method: {
-                # Control-null statistics (may be uninformative if NUM_CONTROLS == 0)
-                "n_significant_fdr_controls": all_analyses[method]["summary"].get("n_significant_fdr", 0),
-                "best_layer_z": all_analyses[method]["summary"].get("best_layer"),
-                "best_effect_z": all_analyses[method]["summary"].get("best_effect_z", 0.0),
+        with open(results_path, "w") as f:
+            json.dump(output_json, f, indent=2)
+        print(f"  Saved {results_path.name}")
+        saved_files.append(results_path.name)
 
-                # Bootstrap statistics (recommended)
-                "n_significant_bootstrap_fdr": all_analyses[method]["summary"].get("n_significant_bootstrap_fdr", 0),
-                "best_layer_abs_delta": all_analyses[method]["summary"].get("best_layer_abs_delta"),
-                "best_abs_delta": all_analyses[method]["summary"].get("best_abs_delta", 0.0),
-            }
-            for method in methods
-        }
-
-        best_method_boot = max(methods, key=lambda m: all_analyses[m]["summary"].get("n_significant_bootstrap_fdr", 0))
-        best_method_ctrl = max(methods, key=lambda m: all_analyses[m]["summary"].get("n_significant_fdr", 0))
-        output_json["comparison"]["method_with_more_bootstrap_effect"] = best_method_boot
-        output_json["comparison"]["method_with_more_control_effect"] = best_method_ctrl
-
-
-
-    with open(results_path, "w") as f:
-        json.dump(output_json, f, indent=2)
-    print(f"  Saved {results_path}")
-
-    # Generate plots for each position
+    # Generate plots - one per method per position
     print("\nGenerating plots...")
-    for position in PROBE_POSITIONS:
-        for method in methods:
-            plot_path = OUTPUT_DIR / f"{base_output}_{method}_{position}.png"
+    for method in methods:
+        base_output = get_base_output(method)
+        for position in PROBE_POSITIONS:
+            plot_path = OUTPUT_DIR / f"{base_output}_{position}.png"
             plot_ablation_results(all_analyses_by_pos[position][method], method, plot_path)
-
-        if len(methods) >= 2:
-            comparison_path = OUTPUT_DIR / f"{base_output}_comparison_{position}.png"
-            plot_method_comparison(all_analyses_by_pos[position], comparison_path)
+            saved_files.append(plot_path.name)
 
     # Print summary for each position
     for position in PROBE_POSITIONS:
@@ -2120,12 +2092,8 @@ def main():
     print("DONE")
     print("=" * 70)
     print(f"\nOutput files:")
-    print(f"  {results_path.name}")
-    for position in PROBE_POSITIONS:
-        for method in methods:
-            print(f"  {base_output}_{method}_{position}.png")
-        if len(methods) >= 2:
-            print(f"  {base_output}_comparison_{position}.png")
+    for f in saved_files:
+        print(f"  {f}")
 
 
 if __name__ == "__main__":

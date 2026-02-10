@@ -23,6 +23,10 @@ Outputs:
     outputs/{base}_meta_{task}_metaconfdir_probes.joblib   Meta-confidence probes (if FIND_CONFIDENCE_DIRECTIONS)
     outputs/{base}_meta_{task}_metaconfdir_results.json    Meta-confidence R² (if FIND_CONFIDENCE_DIRECTIONS)
     outputs/{base}_meta_{task}_metaconfdir_results.png     Meta-confidence plot (if FIND_CONFIDENCE_DIRECTIONS)
+    outputs/{base}_meta_{task}_metamcuncert_directions.npz  MC uncertainty directions from meta (if FIND_MC_UNCERTAINTY_DIRECTIONS)
+    outputs/{base}_meta_{task}_metamcuncert_probes.joblib   MC uncertainty probes from meta (if FIND_MC_UNCERTAINTY_DIRECTIONS)
+    outputs/{base}_meta_{task}_metamcuncert_results.json    MC uncertainty R² + comparison to d_mc (if FIND_MC_UNCERTAINTY_DIRECTIONS)
+    outputs/{base}_meta_{task}_metamcuncert_results.png     MC uncertainty plot (if FIND_MC_UNCERTAINTY_DIRECTIONS)
 
     where {base} = {model_short_name}_{dataset}
 
@@ -63,6 +67,7 @@ from core.answer_directions import (
 )
 from core.confidence_directions import (
     find_confidence_directions_both_methods,
+    find_mc_uncertainty_directions_from_meta,
     compare_confidence_to_uncertainty,
 )
 from tasks import (
@@ -118,6 +123,12 @@ TRAIN_SPLIT = 0.8            # Must match across scripts
 FIND_CONFIDENCE_DIRECTIONS = True  # Train probes on stated confidence from meta activations
 MEAN_DIFF_QUANTILE = 0.25          # Must match across scripts
 COMPARE_UNCERTAINTY_METRIC = METRICS[0]  # Compare confidence vs uncertainty dirs (None to skip)
+
+# --- MC Uncertainty directions from meta activations ---
+# Train probes on meta-task activations to predict MC uncertainty (logit_gap, entropy)
+# This finds d_meta→mc_uncertainty and compares to d_mc_uncertainty via cosine similarity
+FIND_MC_UNCERTAINTY_DIRECTIONS = True
+MC_UNCERTAINTY_METRIC = "logit_gap"  # Which MC metric to predict from meta activations
 
 # --- Script-specific ---
 # Token positions to probe for transfer
@@ -864,6 +875,109 @@ def plot_confidence_directions(
         ax3.set_ylim(-1.1, 1.1)
         ax3.legend(loc='upper left', fontsize=8)
         ax3.grid(True, alpha=GRID_ALPHA)
+
+    plt.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_mc_uncertainty_from_meta(
+    mc_uncert_results: dict,
+    mc_dir_comparison: dict,
+    num_layers: int,
+    output_path: Path,
+    meta_task: str,
+    mc_metric: str,
+):
+    """
+    Plot MC uncertainty direction results (trained on meta activations → MC uncertainty).
+
+    Shows R² for predicting MC uncertainty from meta-task activations, cosine similarity
+    between probe and mean-diff methods, and importantly the comparison to original
+    d_mc_uncertainty directions.
+
+    Args:
+        mc_uncert_results: Results from find_mc_uncertainty_directions_from_meta()
+        mc_dir_comparison: Dict {"probe": {layer: {...}}, "mean_diff": {layer: {...}}}
+            comparing new directions to original MC uncertainty directions
+        num_layers: Number of model layers
+        output_path: Where to save the figure
+        meta_task: Name of meta-task for title (source of activations)
+        mc_metric: Which MC metric was predicted (e.g., "logit_gap")
+    """
+    layers = list(range(num_layers))
+
+    # Always 3 panels: R², method comparison, MC direction comparison
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"Meta→MC Uncertainty Directions: {meta_task} activations → {mc_metric}",
+                 fontsize=14, fontweight='bold')
+
+    # Panel 1: R² by layer for probe and mean-diff
+    ax1 = axes[0]
+    ax1.set_title(f"R² Predicting {mc_metric} from Meta Activations", fontsize=10)
+
+    for method, color, ls in [("probe", "tab:blue", "-"), ("mean_diff", "tab:orange", "--")]:
+        fits = mc_uncert_results["fits"][method]
+        r2_vals = [fits[l]["test_r2"] for l in layers]
+        ci_low = [fits[l].get("test_r2_ci_low", np.nan) for l in layers]
+        ci_high = [fits[l].get("test_r2_ci_high", np.nan) for l in layers]
+        shuffled = [fits[l].get("shuffled_r2", np.nan) for l in layers]
+
+        best_layer = max(layers, key=lambda l: fits[l]["test_r2"])
+        best_r2 = fits[best_layer]["test_r2"]
+
+        ax1.plot(layers, r2_vals, ls, color=color, linewidth=2,
+                 label=f'{method} (L{best_layer}: {best_r2:.3f})')
+        if not all(np.isnan(ci_low)):
+            ax1.fill_between(layers, ci_low, ci_high, color=color, alpha=CI_ALPHA)
+
+    ax1.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax1.set_xlabel('Layer Index')
+    ax1.set_ylabel('R² (test set)')
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=GRID_ALPHA)
+
+    # Panel 2: Cosine similarity between probe and mean-diff directions
+    ax2 = axes[1]
+    ax2.set_title("Probe vs Mean-diff Cosine Similarity", fontsize=10)
+
+    cosine_sims = [mc_uncert_results["comparison"][l]["cosine_sim"] for l in layers]
+    ax2.plot(layers, cosine_sims, '-', color='tab:purple', linewidth=2)
+    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax2.set_xlabel('Layer Index')
+    ax2.set_ylabel('Cosine Similarity')
+    ax2.set_ylim(-1.1, 1.1)
+    ax2.grid(True, alpha=GRID_ALPHA)
+
+    # Panel 3: KEY COMPARISON - cosine similarity to original d_mc_uncertainty
+    ax3 = axes[2]
+    ax3.set_title(f"Comparison to d_mc_{mc_metric}\n(high = same direction)", fontsize=10)
+
+    if mc_dir_comparison:
+        for method, color, ls in [("probe", "tab:blue", "-"), ("mean_diff", "tab:orange", "--")]:
+            method_comparison = mc_dir_comparison.get(method, {})
+            sims = [method_comparison.get(l, {}).get("cosine_similarity", np.nan) for l in layers]
+            abs_sims = [method_comparison.get(l, {}).get("abs_cosine_similarity", np.nan) for l in layers]
+            if not all(np.isnan(sims)):
+                # Find layer with best R² for this method
+                fits = mc_uncert_results["fits"][method]
+                best_layer = max(layers, key=lambda l: fits[l]["test_r2"])
+                best_cos = method_comparison.get(best_layer, {}).get("cosine_similarity", np.nan)
+                ax3.plot(layers, sims, ls, color=color, linewidth=2,
+                         label=f'{method} (L{best_layer}: {best_cos:.3f})')
+
+        ax3.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+        ax3.axhline(y=0.6, color='green', linestyle='--', alpha=0.3, label='Strong similarity')
+        ax3.axhline(y=-0.6, color='green', linestyle='--', alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, "MC directions\nnot available",
+                 ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+
+    ax3.set_xlabel('Layer Index')
+    ax3.set_ylabel('Cosine Similarity')
+    ax3.set_ylim(-1.1, 1.1)
+    if mc_dir_comparison:
+        ax3.legend(loc='upper left', fontsize=8)
+    ax3.grid(True, alpha=GRID_ALPHA)
 
     plt.tight_layout()
     save_figure(fig, output_path)
@@ -2277,6 +2391,203 @@ def main():
                         best_cos = conf_unc_comparison[method][best_layer]["cosine_similarity"]
                         print(f"  {method} confidence vs uncertainty (L{best_layer}): cosine={best_cos:.3f}")
 
+    # =========================================================================
+    # MC UNCERTAINTY DIRECTIONS FROM META ACTIVATIONS
+    # =========================================================================
+    # Finds d_meta→mc_uncertainty: direction in META activations that predicts MC uncertainty
+    # Compares to d_mc_uncertainty via cosine similarity to test if same representation
+    if FIND_MC_UNCERTAINTY_DIRECTIONS:
+        print("\n" + "=" * 60)
+        print("FINDING MC UNCERTAINTY DIRECTIONS FROM META ACTIVATIONS")
+        print("=" * 60)
+
+        # Extract activations for "final" position (reuse if already loaded)
+        if "meta_activations_by_layer" not in dir() or meta_activations_by_layer is None:
+            meta_activations_by_layer = {}
+            acts_data = np.load(activations_path)
+            has_positions = any("_" in k.replace("layer_", "", 1) for k in acts_data.files if k.startswith("layer_"))
+            if has_positions:
+                for i in range(num_layers):
+                    meta_activations_by_layer[i] = acts_data[f"layer_{i}_final"]
+            else:
+                for i in range(num_layers):
+                    meta_activations_by_layer[i] = acts_data[f"layer_{i}"]
+            print(f"  Loaded {num_layers} layers of meta-task activations")
+
+        # Load MC uncertainty values from dataset
+        mc_uncertainty = dataset["metric_values"][MC_UNCERTAINTY_METRIC]
+        print(f"  Target: {MC_UNCERTAINTY_METRIC}")
+        print(f"  MC uncertainty: mean={mc_uncertainty.mean():.3f}, std={mc_uncertainty.std():.3f}")
+        print(f"  Train/test split: {len(train_idx)}/{len(test_idx)}")
+
+        # Find directions: meta activations → MC uncertainty
+        print(f"\n  Training probes ({N_BOOTSTRAP} bootstrap iterations)...")
+        mc_uncert_results = find_mc_uncertainty_directions_from_meta(
+            meta_activations_by_layer,
+            mc_uncertainty,
+            train_idx,
+            test_idx,
+            alpha=PROBE_ALPHA,
+            n_components=PROBE_PCA_COMPONENTS,
+            mean_diff_quantile=MEAN_DIFF_QUANTILE,
+            n_bootstrap=N_BOOTSTRAP,
+            seed=SEED,
+        )
+
+        # Compare to original d_mc_uncertainty (from identify_mc_correlate.py)
+        mc_dir_comparison = None
+        mc_directions_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_mc_{MC_UNCERTAINTY_METRIC}_directions.npz"
+        if mc_directions_path.exists():
+            print(f"\n  Loading original MC uncertainty directions from {mc_directions_path}...")
+            mc_data = np.load(mc_directions_path)
+
+            # Compare BOTH probe and mean_diff
+            mc_dir_comparison = {}
+            for method in ["probe", "mean_diff"]:
+                mc_dirs = {}
+                for layer in range(num_layers):
+                    key = f"{method}_layer_{layer}"
+                    if key in mc_data:
+                        mc_dirs[layer] = mc_data[key]
+
+                if mc_dirs:
+                    print(f"  Comparing {method} d_meta→mc to {len(mc_dirs)} layers of d_mc {method} directions")
+                    mc_dir_comparison[method] = compare_confidence_to_uncertainty(
+                        mc_uncert_results["directions"][method],
+                        mc_dirs
+                    )
+
+            if not mc_dir_comparison:
+                mc_dir_comparison = None
+        else:
+            print(f"\n  Warning: MC directions not found at {mc_directions_path}")
+
+        # Save directions
+        mcuncert_dir_path = OUTPUT_DIR / f"{base_output}_metamcuncert_directions.npz"
+        print(f"\n  Saving metamcuncert directions to {mcuncert_dir_path}...")
+        dir_save = {
+            "_metadata_input_base": INPUT_BASE_NAME,
+            "_metadata_meta_task": META_TASK,
+            "_metadata_mc_metric": MC_UNCERTAINTY_METRIC,
+        }
+        for method in ["probe", "mean_diff"]:
+            for layer in range(num_layers):
+                dir_save[f"{method}_layer_{layer}"] = mc_uncert_results["directions"][method][layer]
+        np.savez(mcuncert_dir_path, **dir_save)
+
+        # Save probe objects
+        mcuncert_probes_path = OUTPUT_DIR / f"{base_output}_metamcuncert_probes.joblib"
+        print(f"  Saving metamcuncert probes to {mcuncert_probes_path}...")
+        probe_save = {
+            "metadata": {
+                "input_base": INPUT_BASE_NAME,
+                "meta_task": META_TASK,
+                "mc_metric": MC_UNCERTAINTY_METRIC,
+                "train_split": TRAIN_SPLIT,
+                "probe_alpha": PROBE_ALPHA,
+                "pca_components": PROBE_PCA_COMPONENTS,
+                "seed": SEED,
+            },
+            "probes": mc_uncert_results["probes"],
+        }
+        joblib.dump(probe_save, mcuncert_probes_path)
+
+        # Save results JSON
+        mcuncert_results_path = OUTPUT_DIR / f"{base_output}_metamcuncert_results.json"
+        print(f"  Saving metamcuncert results to {mcuncert_results_path}...")
+        mcuncert_json = {
+            "config": get_config_dict(
+                input_base=INPUT_BASE_NAME,
+                meta_task=META_TASK,
+                mc_metric=MC_UNCERTAINTY_METRIC,
+                train_split=TRAIN_SPLIT,
+                probe_alpha=PROBE_ALPHA,
+                pca_components=PROBE_PCA_COMPONENTS,
+                mean_diff_quantile=MEAN_DIFF_QUANTILE,
+                n_bootstrap=N_BOOTSTRAP,
+                seed=SEED,
+                load_in_4bit=LOAD_IN_4BIT,
+                load_in_8bit=LOAD_IN_8BIT,
+            ),
+            "target_stats": {
+                "mc_metric": MC_UNCERTAINTY_METRIC,
+                "mean": float(mc_uncertainty.mean()),
+                "std": float(mc_uncertainty.std()),
+                "min": float(mc_uncertainty.min()),
+                "max": float(mc_uncertainty.max()),
+            },
+            "stats": {
+                "n_samples": len(mc_uncertainty),
+                "n_train": len(train_idx),
+                "n_test": len(test_idx),
+            },
+            "results": {},
+            "comparison_within_methods": {},
+        }
+        for method in ["probe", "mean_diff"]:
+            mcuncert_json["results"][method] = {}
+            for layer in range(num_layers):
+                layer_info = {}
+                for k, v in mc_uncert_results["fits"][method][layer].items():
+                    if isinstance(v, np.floating):
+                        layer_info[k] = float(v)
+                    elif isinstance(v, np.integer):
+                        layer_info[k] = int(v)
+                    else:
+                        layer_info[k] = v
+                mcuncert_json["results"][method][layer] = layer_info
+        for layer in range(num_layers):
+            mcuncert_json["comparison_within_methods"][layer] = {
+                "cosine_sim": float(mc_uncert_results["comparison"][layer]["cosine_sim"])
+            }
+        if mc_dir_comparison:
+            mcuncert_json["comparison_to_mc_directions"] = {
+                "metric": MC_UNCERTAINTY_METRIC,
+                "by_method": {}
+            }
+            for method, method_comp in mc_dir_comparison.items():
+                mcuncert_json["comparison_to_mc_directions"]["by_method"][method] = {
+                    layer: {k: float(v) for k, v in comp.items()}
+                    for layer, comp in method_comp.items()
+                }
+        with open(mcuncert_results_path, "w") as f:
+            json.dump(mcuncert_json, f, indent=2)
+
+        # Plot results
+        mcuncert_plot_path = OUTPUT_DIR / f"{base_output}_metamcuncert_results.png"
+        print(f"  Plotting metamcuncert results to {mcuncert_plot_path}...")
+        plot_mc_uncertainty_from_meta(
+            mc_uncert_results=mc_uncert_results,
+            mc_dir_comparison=mc_dir_comparison,
+            num_layers=num_layers,
+            output_path=mcuncert_plot_path,
+            meta_task=META_TASK,
+            mc_metric=MC_UNCERTAINTY_METRIC,
+        )
+
+        # Print summary
+        for method in ["probe", "mean_diff"]:
+            fits = mc_uncert_results["fits"][method]
+            layers = sorted(fits.keys())
+            best_layer = max(layers, key=lambda l: fits[l]["test_r2"])
+            best_r2 = fits[best_layer]["test_r2"]
+            ci_str = ""
+            if "test_r2_ci_low" in fits[best_layer]:
+                ci_str = f" [{fits[best_layer]['test_r2_ci_low']:.3f}, {fits[best_layer]['test_r2_ci_high']:.3f}]"
+            print(f"  {method}: best L{best_layer}, R²={best_r2:.3f}{ci_str}")
+
+        # KEY COMPARISON: cosine similarity to original MC directions
+        if mc_dir_comparison:
+            print(f"\n  Comparison to d_mc_{MC_UNCERTAINTY_METRIC} (same direction = high cosine):")
+            for method in ["probe", "mean_diff"]:
+                if method in mc_dir_comparison:
+                    method_fits = mc_uncert_results["fits"][method]
+                    best_layer = max(method_fits.keys(), key=lambda l: method_fits[l]["test_r2"])
+                    if best_layer in mc_dir_comparison[method]:
+                        best_cos = mc_dir_comparison[method][best_layer]["cosine_similarity"]
+                        abs_cos = mc_dir_comparison[method][best_layer]["abs_cosine_similarity"]
+                        print(f"    {method} (L{best_layer}): cosine={best_cos:.3f} (|cos|={abs_cos:.3f})")
+
     # Final summary
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -2358,6 +2669,11 @@ def main():
         print(f"  {base_output}_metaconfdir_probes.joblib")
         print(f"  {base_output}_metaconfdir_results.json")
         print(f"  {base_output}_metaconfdir_results.png")
+    if FIND_MC_UNCERTAINTY_DIRECTIONS:
+        print(f"  {base_output}_metamcuncert_directions.npz")
+        print(f"  {base_output}_metamcuncert_probes.joblib")
+        print(f"  {base_output}_metamcuncert_results.json")
+        print(f"  {base_output}_metamcuncert_results.png")
 
 
 if __name__ == "__main__":

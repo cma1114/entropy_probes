@@ -1,12 +1,16 @@
 """
-Compute orthogonalized directions (d_introspection, d_surface) from d_self and d_other.
+Compute orthogonalized directions from d_self_confidence and d_other_confidence.
+
+Outputs:
+    d_self_confidence_unique  = d_self_confidence with d_other_confidence projected out
+    d_other_confidence_unique = d_other_confidence with d_self_confidence projected out
 
 This is just Gram-Schmidt projection - takes seconds, not hours.
 Processes all datasets in DATASETS list in one run.
 
 Inputs (for each dataset):
-    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz    (d_self)
-    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other)
+    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz    (d_self_confidence)
+    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other_confidence)
 
 Outputs (for each dataset):
     outputs/{model}_{dataset}_orthogonal_directions.npz
@@ -38,7 +42,7 @@ DATASETS = [
     "SimpleMC",
 ]
 METHOD = "mean_diff"  # "probe" or "mean_diff" - must match what you want to orthogonalize
-MIN_RESIDUAL_NORM = 0.1  # Flag layers where d_self ≈ d_other
+MIN_RESIDUAL_NORM = 0.1  # Flag layers where d_self_confidence ≈ d_other_confidence
 
 OUTPUT_DIR = Path("outputs")
 
@@ -70,40 +74,40 @@ def load_directions(base_name: str, task: str, method: str) -> dict[int, np.ndar
     return directions
 
 
-def orthogonalize(d_self: np.ndarray, d_other: np.ndarray):
+def orthogonalize(d_self_confidence: np.ndarray, d_other_confidence: np.ndarray):
     """
     Gram-Schmidt orthogonalization.
 
-    d_introspection = d_self - proj(d_self, d_other)
-    d_surface = d_other - proj(d_other, d_self)
+    d_self_confidence_unique = d_self_confidence - proj(d_self_confidence, d_other_confidence)
+    d_other_confidence_unique = d_other_confidence - proj(d_other_confidence, d_self_confidence)
     """
     # Normalize inputs
-    d_self = d_self / np.linalg.norm(d_self)
-    d_other = d_other / np.linalg.norm(d_other)
+    d_self_confidence = d_self_confidence / np.linalg.norm(d_self_confidence)
+    d_other_confidence = d_other_confidence / np.linalg.norm(d_other_confidence)
 
     # Cosine similarity
-    cosine = float(np.dot(d_self, d_other))
+    cosine = float(np.dot(d_self_confidence, d_other_confidence))
 
     # Gram-Schmidt
-    d_introspection = d_self - cosine * d_other
-    residual_norm = float(np.linalg.norm(d_introspection))
+    d_self_confidence_unique = d_self_confidence - cosine * d_other_confidence
+    residual_norm = float(np.linalg.norm(d_self_confidence_unique))
 
-    d_surface = d_other - cosine * d_self
+    d_other_confidence_unique = d_other_confidence - cosine * d_self_confidence
 
-    # Check for degenerate case (d_self ≈ d_other)
+    # Check for degenerate case (d_self_confidence ≈ d_other_confidence)
     # Flag it but keep the actual residual - don't replace with random noise
     degenerate = residual_norm < MIN_RESIDUAL_NORM
 
     # Normalize outputs (even if small, preserves the actual direction)
-    intro_norm = np.linalg.norm(d_introspection)
-    surf_norm = np.linalg.norm(d_surface)
+    self_unique_norm = np.linalg.norm(d_self_confidence_unique)
+    other_unique_norm = np.linalg.norm(d_other_confidence_unique)
 
-    d_introspection = d_introspection / intro_norm
-    d_surface = d_surface / surf_norm
+    d_self_confidence_unique = d_self_confidence_unique / self_unique_norm
+    d_other_confidence_unique = d_other_confidence_unique / other_unique_norm
 
     return {
-        "d_introspection": d_introspection.astype(np.float32),
-        "d_surface": d_surface.astype(np.float32),
+        "d_self_confidence_unique": d_self_confidence_unique.astype(np.float32),
+        "d_other_confidence_unique": d_other_confidence_unique.astype(np.float32),
         "cosine": cosine,
         "residual_norm": residual_norm,
         "degenerate": degenerate,
@@ -119,13 +123,13 @@ def process_dataset(base_name: str) -> bool:
     # Load directions
     print("\nLoading directions...")
     try:
-        d_self_by_layer = load_directions(base_name, "confidence", METHOD)
-        d_other_by_layer = load_directions(base_name, "other_confidence", METHOD)
+        d_self_conf_by_layer = load_directions(base_name, "confidence", METHOD)
+        d_other_conf_by_layer = load_directions(base_name, "other_confidence", METHOD)
     except FileNotFoundError as e:
         print(f"  SKIPPED: {e}")
         return False
 
-    layers = sorted(set(d_self_by_layer.keys()) & set(d_other_by_layer.keys()))
+    layers = sorted(set(d_self_conf_by_layer.keys()) & set(d_other_conf_by_layer.keys()))
     print(f"  Layers: {len(layers)}")
 
     # Orthogonalize
@@ -140,10 +144,10 @@ def process_dataset(base_name: str) -> bool:
     cosines = []
 
     for layer in layers:
-        result = orthogonalize(d_self_by_layer[layer], d_other_by_layer[layer])
+        result = orthogonalize(d_self_conf_by_layer[layer], d_other_conf_by_layer[layer])
 
-        save_data[f"introspection_layer_{layer}"] = result["d_introspection"]
-        save_data[f"surface_layer_{layer}"] = result["d_surface"]
+        save_data[f"self_confidence_unique_layer_{layer}"] = result["d_self_confidence_unique"]
+        save_data[f"other_confidence_unique_layer_{layer}"] = result["d_other_confidence_unique"]
         save_data[f"cosine_layer_{layer}"] = np.array([result["cosine"]])
         save_data[f"residual_norm_layer_{layer}"] = np.array([result["residual_norm"]])
 
@@ -158,7 +162,7 @@ def process_dataset(base_name: str) -> bool:
 
     # Summary
     print(f"\nSummary:")
-    print(f"  Mean cos(d_self, d_other): {np.mean(cosines):.3f}")
+    print(f"  Mean cos(d_self_confidence, d_other_confidence): {np.mean(cosines):.3f}")
     print(f"  Degenerate layers: {n_degenerate}/{len(layers)}")
     return True
 

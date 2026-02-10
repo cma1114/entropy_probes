@@ -8,6 +8,8 @@ Test the hypothesis that LLMs genuinely introspect on their uncertainty rather t
 
 1. **Identify**: Find internal correlates of output uncertainty (entropy, logit_gap, etc.)
 2. **Transfer**: Test whether these correlates appear during meta-judgment tasks (confidence reports, delegation decisions)
+   - D→M transfer: Does d_mc_uncertainty from the MC task predict uncertainty in meta-task activations?
+   - M→D prediction: Can we find a direction in meta activations that predicts MC uncertainty? Is it the same as d_mc? (metamcuncert approach)
 3. **Causality**: Verify the relationship is causal via ablation and steering
 4. **Interpret**: Understand what the uncertainty direction represents (logit lens, direction similarity)
 
@@ -72,7 +74,11 @@ Loads directions from Stage 1 and tests how well they predict uncertainty from m
 - Transfer ratio (best D→M / best D→D) with introspection strength interpretation
 - Answer direction analysis
 
-Optionally finds confidence directions from meta-task activations (`FIND_CONFIDENCE_DIRECTIONS = True`).
+Optional direction-finding from meta-task activations:
+- `FIND_CONFIDENCE_DIRECTIONS = True`: Find directions predicting stated confidence
+- `FIND_MC_UNCERTAINTY_DIRECTIONS = True`: Find directions in meta-task activations that predict MC uncertainty (the "metamcuncert" directions)
+
+The metamcuncert approach is a key introspection test: we find directions in the model's meta-task activations (when it's being asked about confidence) that predict its actual MC-task uncertainty. These can then be compared via cosine similarity to the original d_mc_uncertainty to test whether the same geometric representation is used in both contexts.
 
 ### Stage 3: Causal tests
 
@@ -97,7 +103,11 @@ python run_activation_patching.py
 
 Pairs questions by metric value in MC tasks (e.g., low-entropy source ↔ high-entropy target) and swaps complete activation vectors between them during meta task inference. At each tested layer, the source question's hidden state is replaced with the target's activations. If the source's behavior shifts toward the target's uncertainty profile, this demonstrates that full activations (not just a 1D direction) causally encode uncertainty.
 
-Both ablation and steering test probe and mean_diff methods, and support `DIRECTION_TYPE = "uncertainty"`, `"answer"`, or `"confidence"`.
+Both ablation and steering test probe and mean_diff methods, and support `DIRECTION_TYPE`:
+- `"uncertainty"`: MC uncertainty directions (d_mc_uncertainty from identify_mc_correlate.py)
+- `"answer"`: MC answer directions (A/B/C/D from identify_mc_correlate.py)
+- `"confidence"`: Stated confidence directions (from test_meta_transfer.py)
+- `"metamcuncert"`: MC uncertainty directions found from meta activations (from test_meta_transfer.py with `FIND_MC_UNCERTAINTY_DIRECTIONS = True`)
 
 **Cross-direction causality** (internal effects):
 ```bash
@@ -188,6 +198,8 @@ These are marked with `# Must match across scripts` in each file's constant bloc
 
 All outputs use the prefix `{model_short}_{dataset}` where `model_short` is derived from the HuggingFace model name (e.g., `Llama-3.1-8B-Instruct`). When quantization is enabled, a suffix is appended (e.g., `Llama-3.1-8B-Instruct_4bit`).
 
+For causality outputs, `{dir_suffix}` encodes the direction type: `uncertainty_{metric}` for uncertainty directions, or just the direction type name for others (e.g., `answer`, `confidence`, `metamcuncert`).
+
 | Stage | File pattern | Description |
 |-------|-------------|-------------|
 | **Identify** | `*_mc_activations.npz` | Reusable activations (all layers) |
@@ -209,11 +221,13 @@ All outputs use the prefix `{model_short}_{dataset}` where `model_short` is deri
 | **Meta-task** | `*_meta_{task}_activations.npz` | Meta-task activations |
 | | `*_meta_{task}_results.json` | Transfer R², behavioral analysis |
 | | `*_meta_{task}_results.png` | Transfer plots |
-| | `*_meta_{task}_confidence_directions.npz` | Confidence directions |
-| **Causality** | `*_ablation_{task}_{metric}_results.json` | Ablation effects + FDR |
-| | `*_ablation_{task}_{metric}_results.png` | Ablation plots |
-| | `*_steering_{task}_{metric}_results.json` | Steering dose-response |
-| | `*_steering_{task}_{metric}_results.png` | Steering plots |
+| | `*_meta_{task}_metaconfdir_directions.npz` | Confidence directions (meta → stated conf) |
+| | `*_meta_{task}_metamcuncert_directions.npz` | MC uncertainty directions from meta (meta → MC unc) |
+| | `*_meta_{task}_metamcuncert_results.json` | R², cosine similarity to d_mc |
+| **Causality** | `*_ablation_{task}_{dir_suffix}_results.json` | Ablation effects + FDR |
+| | `*_ablation_{task}_{dir_suffix}_results.png` | Ablation plots |
+| | `*_steering_{task}_{dir_suffix}_results.json` | Steering dose-response |
+| | `*_steering_{task}_{dir_suffix}_results.png` | Steering plots |
 | | `*_cross_direction_{metric}_results.json` | Cross-direction effects |
 | | `*_cross_direction_{metric}_results.png` | Cross-direction heatmaps |
 | | `*_cross_direction_{metric}_ablation_effect.png` | Single ablation trajectory plot |

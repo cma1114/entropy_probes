@@ -5,24 +5,33 @@ along each direction and measuring whether stated confidence shifts in the
 expected direction. Complements ablation (run_ablation_causality.py) which
 tests necessity.
 
+Supports multiple direction types via DIRECTION_TYPE:
+- "uncertainty": Entropy/logit_gap directions (from identify_mc_correlate.py)
+- "metamcuncert": MC uncertainty directions found from meta activations (from test_meta_transfer.py)
+
 Tests all layers with both probe and mean_diff methods, using pooled null
 distribution + FDR correction. Uses KV cache optimization and batched
 multiplier sweeps for efficiency.
 
 Inputs:
-    outputs/{base}_mc_{metric}_directions.npz          Uncertainty directions (from Stage 1)
-    outputs/{base}_mc_dataset.json                     Question metadata + metric values
+    outputs/{base}_mc_{metric}_directions.npz           Uncertainty directions (from Stage 1)
+    outputs/{base}_meta_{task}_metamcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
+    outputs/{base}_mc_dataset.json                      Question metadata + metric values
 
-Outputs:
-    outputs/{base}_steering_{task}_{metric}_results.json   Steering slopes, p-values
-    outputs/{base}_steering_{task}_{metric}_results.png    Steering effect curves
+Outputs (one file per method/position combination):
+    outputs/{base}_steering_{task}_{dir_suffix}_{method}_{positions}_results.json
+    outputs/{base}_steering_{task}_{dir_suffix}_{method}_{positions}_{position}.png
 
     where {base} = {model_short_name}_{dataset}
+          {dir_suffix} = "{direction_type}_{metric}" for uncertainty, else "{direction_type}"
+          {method} = "probe" or "mean_diff"
+          {positions} = position(s) tested, joined by underscore (e.g., "final" or "final_question_mark")
 
 Shared parameters (must match across scripts):
     SEED, TRAIN_SPLIT
 
 Run after: identify_mc_correlate.py
+    + test_meta_transfer.py (if using DIRECTION_TYPE="metamcuncert")
 """
 
 import torch
@@ -74,6 +83,11 @@ ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
 INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
 METRIC = "logit_gap"  # Which metric's directions to test
 META_TASK = "confidence"  # "confidence" or "delegate"
+
+# Direction type to steer:
+# - "uncertainty": Steer uncertainty directions (from identify_mc_correlate.py)
+# - "metamcuncert": Steer MC uncertainty directions found from meta activations (test_meta_transfer.py)
+DIRECTION_TYPE = "uncertainty"
 
 # --- Quantization ---
 LOAD_IN_4BIT = False  # Set True for 70B+ models
@@ -200,15 +214,32 @@ def get_layers_from_transfer(
 # DIRECTION LOADING
 # =============================================================================
 
-def load_directions(base_name: str, metric: str) -> Dict[str, Dict[int, np.ndarray]]:
+def load_directions(
+    base_name: str,
+    metric: str,
+    direction_type: str = "uncertainty",
+    meta_task: str = "confidence",
+) -> Dict[str, Dict[int, np.ndarray]]:
     """
     Load all direction methods from npz file.
+
+    Args:
+        base_name: Base name for input files
+        metric: Uncertainty metric (used for direction_type="uncertainty")
+        direction_type: "uncertainty" or "metamcuncert"
+        meta_task: Meta task (used for direction_type="metamcuncert")
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
         e.g., {"probe": {0: arr, 1: arr, ...}, "mean_diff": {0: arr, 1: arr, ...}}
     """
-    path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+    if direction_type == "uncertainty":
+        path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+    elif direction_type == "metamcuncert":
+        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
+    else:
+        raise ValueError(f"Unknown direction type: {direction_type}")
+
     if not path.exists():
         raise FileNotFoundError(f"Directions file not found: {path}")
 
@@ -1142,6 +1173,7 @@ def main():
     print("=" * 70)
     print(f"\nModel: {MODEL}")
     print(f"Input: {INPUT_BASE_NAME}")
+    print(f"Direction type: {DIRECTION_TYPE}")
     print(f"Metric: {METRIC}")
     print(f"Meta-task: {META_TASK}")
     print(f"Questions: {NUM_QUESTIONS}")
@@ -1150,8 +1182,8 @@ def main():
     print(f"Positions: {PROBE_POSITIONS}")
 
     # Load directions
-    print("\nLoading directions...")
-    all_directions = load_directions(INPUT_BASE_NAME, METRIC)
+    print(f"\nLoading directions (type={DIRECTION_TYPE})...")
+    all_directions = load_directions(INPUT_BASE_NAME, METRIC, DIRECTION_TYPE, META_TASK)
     available_methods = list(all_directions.keys())
     print(f"  Found methods: {available_methods}")
 
@@ -1324,17 +1356,78 @@ def main():
         model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
         # Extract dataset name by removing model prefix from INPUT_BASE_NAME
         dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-        # Include adapter in output name if used
+        # Build direction suffix
+        dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
+        # Build position suffix
+        pos_suffix = "_".join(PROBE_POSITIONS)
+
+        # Save checkpoint per method
+        for method in methods:
+            if ADAPTER:
+                adapter_short = get_model_short_name(ADAPTER)
+                base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+            else:
+                base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+            checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
+
+            checkpoint_json = {
+                "config": get_config_dict(
+                    model=MODEL,
+                    input_base_name=INPUT_BASE_NAME,
+                    direction_type=DIRECTION_TYPE,
+                    metric=METRIC,
+                    meta_task=META_TASK,
+                    seed=SEED,
+                    load_in_4bit=LOAD_IN_4BIT,
+                    load_in_8bit=LOAD_IN_8BIT,
+                    num_questions=len(questions),
+                    use_transfer_split=USE_TRANSFER_SPLIT,
+                    multipliers=STEERING_MULTIPLIERS,
+                    method=method,
+                    positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_position.get(p)],
+                ),
+                "by_position": {},
+            }
+            for pos in PROBE_POSITIONS:
+                if all_analyses_by_position.get(pos) and method in all_analyses_by_position[pos]:
+                    analysis = all_analyses_by_position[pos][method]
+                    checkpoint_json["by_position"][pos] = {
+                        "per_layer": analysis["per_layer"],
+                        "summary": analysis["summary"],
+                    }
+            with open(checkpoint_path, "w") as f:
+                json.dump(checkpoint_json, f, indent=2)
+            print(f"  Checkpoint saved: {checkpoint_path.name}")
+
+    # Generate output filename components
+    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
+    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
+    # Build direction suffix (includes metric for uncertainty, just direction_type for others)
+    dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
+
+    # Build position suffix for filename
+    pos_suffix = "_".join(PROBE_POSITIONS)
+
+    def get_base_output(method: str) -> str:
+        """Get base output path for a specific method."""
         if ADAPTER:
             adapter_short = get_model_short_name(ADAPTER)
-            base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-        else:
-            base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-        checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
-        checkpoint_json = {
+            return f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+        return f"{model_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+
+    # Save JSON results - one file per method
+    print("\nSaving results...")
+    saved_files = []
+    for method in methods:
+        base_output = get_base_output(method)
+        results_path = OUTPUT_DIR / f"{base_output}_results.json"
+
+        output_json = {
             "config": get_config_dict(
                 model=MODEL,
                 input_base_name=INPUT_BASE_NAME,
+                direction_type=DIRECTION_TYPE,
                 metric=METRIC,
                 meta_task=META_TASK,
                 seed=SEED,
@@ -1342,107 +1435,43 @@ def main():
                 load_in_8bit=LOAD_IN_8BIT,
                 num_questions=len(questions),
                 use_transfer_split=USE_TRANSFER_SPLIT,
+                train_split=TRAIN_SPLIT,
+                num_controls_final=NUM_CONTROLS,
+                num_controls_nonfinal=NUM_CONTROLS_NONFINAL,
+                transfer_r2_threshold=TRANSFER_R2_THRESHOLD,
                 multipliers=STEERING_MULTIPLIERS,
-                positions_completed=[p for p in PROBE_POSITIONS if all_analyses_by_position.get(p)],
+                method=method,
+                positions_tested=PROBE_POSITIONS,
             ),
-            "by_position": {},
         }
-        for pos in PROBE_POSITIONS:
-            if all_analyses_by_position.get(pos):
-                checkpoint_json["by_position"][pos] = {}
-                for m, analysis in all_analyses_by_position[pos].items():
-                    checkpoint_json["by_position"][pos][m] = {
-                        "per_layer": analysis["per_layer"],
-                        "summary": analysis["summary"],
-                    }
-        with open(checkpoint_path, "w") as f:
-            json.dump(checkpoint_json, f, indent=2)
-        print(f"  Checkpoint saved: {checkpoint_path.name}")
 
-    # Generate output filename
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-    # Include adapter in output name if used
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-    else:
-        base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{METRIC}"
-
-    # Save JSON results
-    print("\nSaving results...")
-    results_path = OUTPUT_DIR / f"{base_output}_results.json"
-
-    output_json = {
-        "config": get_config_dict(
-            model=MODEL,
-            input_base_name=INPUT_BASE_NAME,
-            metric=METRIC,
-            meta_task=META_TASK,
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-            num_questions=len(questions),
-            use_transfer_split=USE_TRANSFER_SPLIT,
-            train_split=TRAIN_SPLIT,
-            num_controls_final=NUM_CONTROLS,
-            num_controls_nonfinal=NUM_CONTROLS_NONFINAL,
-            transfer_r2_threshold=TRANSFER_R2_THRESHOLD,
-            multipliers=STEERING_MULTIPLIERS,
-            methods_tested=methods,
-            positions_tested=PROBE_POSITIONS,
-        ),
-    }
-
-    # Per-position results
-    for position in PROBE_POSITIONS:
-        output_json[position] = {}
-        for method, analysis in all_analyses_by_position[position].items():
-            output_json[position][method] = {
+        # Per-position results for this method
+        for position in PROBE_POSITIONS:
+            analysis = all_analyses_by_position[position][method]
+            output_json[position] = {
                 "per_layer": analysis["per_layer"],
                 "summary": analysis["summary"],
             }
 
-    # Backward compatibility: keep "final" results at top level (if final was tested)
-    default_position = "final" if "final" in all_analyses_by_position else PROBE_POSITIONS[0]
-    for method, analysis in all_analyses_by_position[default_position].items():
-        output_json[method] = {
-            "per_layer": analysis["per_layer"],
-            "summary": analysis["summary"],
-        }
+        # Backward compatibility: keep default position results at top level
+        default_position = "final" if "final" in all_analyses_by_position else PROBE_POSITIONS[0]
+        analysis = all_analyses_by_position[default_position][method]
+        output_json["per_layer"] = analysis["per_layer"]
+        output_json["summary"] = analysis["summary"]
 
-    # Comparison summary (for default position, for backward compat)
-    if len(methods) >= 2:
-        default_analyses = all_analyses_by_position[default_position]
-        output_json["comparison"] = {
-            method: {
-                "n_significant_pooled": default_analyses[method]["summary"]["n_significant_pooled"],
-                "n_significant_fdr": default_analyses[method]["summary"]["n_significant_fdr"],
-                "n_sign_correct_pooled": default_analyses[method]["summary"]["n_sign_correct_pooled"],
-                "n_sign_correct_fdr": default_analyses[method]["summary"]["n_sign_correct_fdr"],
-                "best_layer": default_analyses[method]["summary"]["best_layer"],
-                "best_slope": default_analyses[method]["summary"]["best_slope"],
-            }
-            for method in methods
-        }
-        best_method = max(methods, key=lambda m: default_analyses[m]["summary"]["n_sign_correct_pooled"])
-        output_json["comparison"]["method_with_more_sign_correct"] = best_method
+        with open(results_path, "w") as f:
+            json.dump(output_json, f, indent=2)
+        print(f"  Saved {results_path.name}")
+        saved_files.append(results_path.name)
 
-    with open(results_path, "w") as f:
-        json.dump(output_json, f, indent=2)
-    print(f"  Saved {results_path}")
-
-    # Generate plots for each position
+    # Generate plots - one per method per position
     print("\nGenerating plots...")
-    for position in PROBE_POSITIONS:
-        for method in methods:
-            plot_path = OUTPUT_DIR / f"{base_output}_{position}_{method}.png"
+    for method in methods:
+        base_output = get_base_output(method)
+        for position in PROBE_POSITIONS:
+            plot_path = OUTPUT_DIR / f"{base_output}_{position}.png"
             plot_steering_results(all_analyses_by_position[position][method], method, plot_path)
-
-        if len(methods) >= 2:
-            comparison_path = OUTPUT_DIR / f"{base_output}_{position}_comparison.png"
-            plot_method_comparison(all_analyses_by_position[position], comparison_path)
+            saved_files.append(plot_path.name)
 
     # Print summary for each position
     for position in PROBE_POSITIONS:
@@ -1454,12 +1483,8 @@ def main():
     print("DONE")
     print("=" * 70)
     print(f"\nOutput files:")
-    print(f"  {results_path.name}")
-    for position in PROBE_POSITIONS:
-        for method in methods:
-            print(f"  {base_output}_{position}_{method}.png")
-        if len(methods) >= 2:
-            print(f"  {base_output}_{position}_comparison.png")
+    for f in saved_files:
+        print(f"  {f}")
 
 
 if __name__ == "__main__":

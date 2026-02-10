@@ -12,7 +12,10 @@
       "Bash(cat:*)",
       "Bash(head:*)",
       "Bash(wc:*)",
-      "Bash(codex:*)"
+      "Bash(codex:*)",
+      "Bash(source:*)",
+      "Bash(pip3 show:*)",
+      "Bash(python:*)"
     ]
   },
   "enableAllProjectMcpServers": false

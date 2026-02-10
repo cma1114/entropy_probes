@@ -15,8 +15,10 @@ Direction types and their relationships:
 - contrastive: Difference between high/low uncertainty activations (not a probe)
 
 Inputs:
-    outputs/{base}_mc_{metric}_directions.npz         MC uncertainty directions
-    outputs/{base}_nexttoken_{metric}_directions.npz  Next-token uncertainty directions
+    outputs/{base}_mc_{metric}_directions.npz               MC uncertainty directions
+    outputs/{base}_nexttoken_{metric}_directions.npz        Next-token uncertainty directions
+    outputs/{base}_meta_{task}_metaconfdir_directions.npz   Confidence directions
+    outputs/{base}_meta_{task}_metamcuncert_directions.npz  Meta→MC uncertainty directions
 
 Outputs:
     outputs/{base}_direction_analysis.json             Pairwise similarity metrics
@@ -92,6 +94,26 @@ def extract_dataset_from_npz(path: Path) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def strip_adapter_prefix(s: str) -> str:
+    """Strip adapter prefix from a string if present.
+
+    E.g., 'adapter-ect_20251222_SimpleMC' -> 'SimpleMC'
+    """
+    if s.startswith("adapter-"):
+        # Find the dataset part after adapter-xxx_
+        # Pattern: adapter-{name}_{dataset}
+        # The adapter name can contain underscores, so we look for known dataset patterns
+        # or just take everything after the first occurrence of a known dataset prefix
+        import re
+        # Look for common dataset name patterns
+        match = re.search(r'_(TriviaMC|PopMC|SimpleMC|GPQA|MMLU|ARC|Science)', s)
+        if match:
+            return s[match.start() + 1:]  # +1 to skip the underscore
+        # Fallback: try to find where the adapter ends (last contiguous alphanumeric block before dataset)
+        # This is fragile, so prefer metadata extraction
+    return s
 
 
 def extract_dataset_from_filename(filename: str, suffix: str) -> Optional[str]:
@@ -191,10 +213,7 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                     suffix = f"_{metric}_contrastive_{dir_type}_directions.npz"
                     if name.startswith(prefix) and name.endswith(suffix):
                         dataset = name[len(prefix):-len(suffix)]
-                        if "_adapter-" in dataset:
-                            parts = dataset.split("_", 1)
-                            if len(parts) > 1:
-                                dataset = parts[1]
+                        dataset = strip_adapter_prefix(dataset)
 
                 if dataset:
                     key = f"{dir_type}_{metric}_{dataset}"
@@ -219,10 +238,7 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 suffix = f"_{metric}_contrastive_directions.npz"
                 if name.startswith(prefix) and name.endswith(suffix):
                     dataset = name[len(prefix):-len(suffix)]
-                    if "_adapter-" in dataset:
-                        parts = dataset.split("_", 1)
-                        if len(parts) > 1:
-                            dataset = parts[1]
+                    dataset = strip_adapter_prefix(dataset)
 
             if dataset:
                 key = f"contrastive_{metric}_{dataset}"
@@ -370,9 +386,10 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             if key not in direction_files:
                 direction_files[key] = path
 
-    # Orthogonal directions from analyze_introspection_orthogonalization.py:
+    # Orthogonal directions from compute_orthogonal_directions.py:
     # {model}_{dataset}_orthogonal_directions.npz
-    # Contains: introspection_layer_N, surface_layer_N
+    # Contains: self_confidence_unique_layer_N, other_confidence_unique_layer_N
+    # (legacy: introspection_layer_N, surface_layer_N)
     orthogonal_pattern = f"{model_short}*_orthogonal_directions.npz"
     for path in output_dir.glob(orthogonal_pattern):
         dataset = extract_dataset_from_npz(path)
@@ -383,6 +400,7 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             suffix = "_orthogonal_directions.npz"
             if name.startswith(prefix) and name.endswith(suffix):
                 dataset = name[len(prefix):-len(suffix)]
+                dataset = strip_adapter_prefix(dataset)
 
         if dataset:
             key = f"orthogonal_{dataset}"
@@ -394,8 +412,9 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
 
     # Consensus directions from compare_directions_cross_dataset.py:
     # {model}_consensus_directions.npz or {model}_adapter-{name}_consensus_directions.npz
-    # Contains: d_self_layer_N, d_other_layer_N, d_introspection_layer_N,
-    #           d_surface_layer_N, d_contrast_layer_N, d_mc_{metric}_layer_N (averaged across datasets)
+    # Contains: d_self_confidence_layer_N, d_other_confidence_layer_N,
+    #           d_self_confidence_unique_layer_N, d_other_confidence_unique_layer_N,
+    #           d_contrast_layer_N, d_mc_{metric}_layer_N (averaged across datasets)
     consensus_pattern = f"{model_short}*_consensus_directions.npz"
     for path in output_dir.glob(consensus_pattern):
         # Use most recent if multiple exist
@@ -403,9 +422,9 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             direction_files["consensus"] = path
 
     # Meta confidence directions from test_meta_transfer.py:
-    # {model}_{dataset}_meta_confidence_metaconfdir_directions.npz (d_self)
-    # {model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz (d_other)
-    for conf_type, label in [("confidence", "d_self"), ("other_confidence", "d_other")]:
+    # {model}_{dataset}_meta_confidence_metaconfdir_directions.npz (d_self_confidence)
+    # {model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz (d_other_confidence)
+    for conf_type, label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence")]:
         pattern = f"{model_short}*_meta_{conf_type}_metaconfdir_directions.npz"
         for path in output_dir.glob(pattern):
             dataset = extract_dataset_from_npz(path)
@@ -416,6 +435,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 suffix = f"_meta_{conf_type}_metaconfdir_directions.npz"
                 if name.startswith(prefix) and name.endswith(suffix):
                     dataset = name[len(prefix):-len(suffix)]
+                    # Strip adapter prefix if present (e.g., "adapter-xyz_SimpleMC" -> "SimpleMC")
+                    dataset = strip_adapter_prefix(dataset)
 
             if dataset:
                 key = f"{label}_{dataset}"
@@ -425,27 +446,55 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
                 direction_files[key] = path
 
-    # Contrast directions from compute_contrast_direction.py:
-    # {model}_{dataset}_contrast_directions.npz
-    # Contains: contrast_layer_N (paired difference between self and other activations)
-    contrast_pattern = f"{model_short}*_contrast_directions.npz"
-    for path in output_dir.glob(contrast_pattern):
-        dataset = extract_dataset_from_npz(path)
-        if dataset is None:
-            # Try to extract from filename
-            name = path.name
-            prefix = f"{model_short}_"
-            suffix = "_contrast_directions.npz"
-            if name.startswith(prefix) and name.endswith(suffix):
-                dataset = name[len(prefix):-len(suffix)]
+    # selfVother_conf directions from compute_contrast_direction.py:
+    # {model}_{dataset}_selfVother_conf_directions.npz (new format)
+    # {model}_{dataset}_self_vs_other_confidence_directions.npz (legacy format)
+    # {model}_{dataset}_contrast_directions.npz (legacy format)
+    # Contains: selfVother_conf_layer_N or self_vs_other_confidence_layer_N or contrast_layer_N
+    for suffix_pattern in ["_selfVother_conf_directions.npz", "_self_vs_other_confidence_directions.npz", "_contrast_directions.npz"]:
+        pattern = f"{model_short}*{suffix_pattern}"
+        for path in output_dir.glob(pattern):
+            dataset = extract_dataset_from_npz(path)
+            if dataset is None:
+                # Try to extract from filename
+                name = path.name
+                prefix = f"{model_short}_"
+                if name.startswith(prefix) and name.endswith(suffix_pattern):
+                    dataset = name[len(prefix):-len(suffix_pattern)]
+                    dataset = strip_adapter_prefix(dataset)
 
-        if dataset:
-            key = f"contrast_{dataset}"
-        else:
-            key = "contrast"
+            if dataset:
+                key = f"selfVother_conf_{dataset}"
+            else:
+                key = "selfVother_conf"
 
-        if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
-            direction_files[key] = path
+            # Use most recent if multiple exist, prefer new format
+            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                direction_files[key] = path
+
+    # Meta→MC uncertainty directions from test_meta_transfer.py (with FIND_MC_UNCERTAINTY_DIRECTIONS=True):
+    # {model}_{dataset}_meta_confidence_metamcuncert_directions.npz
+    # {model}_{dataset}_meta_other_confidence_metamcuncert_directions.npz
+    for conf_type in ["confidence", "other_confidence"]:
+        pattern = f"{model_short}*_meta_{conf_type}_metamcuncert_directions.npz"
+        for path in output_dir.glob(pattern):
+            dataset = extract_dataset_from_npz(path)
+            if dataset is None:
+                # Try to extract from filename
+                name = path.name
+                prefix = f"{model_short}_"
+                suffix = f"_meta_{conf_type}_metamcuncert_directions.npz"
+                if name.startswith(prefix) and name.endswith(suffix):
+                    dataset = name[len(prefix):-len(suffix)]
+                    dataset = strip_adapter_prefix(dataset)
+
+            if dataset:
+                key = f"d_meta_mc_uncert_{conf_type}_{dataset}"
+            else:
+                key = f"d_meta_mc_uncert_{conf_type}"
+
+            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                direction_files[key] = path
 
     # Filter by dataset if specified
     if dataset_filter:
@@ -1034,6 +1083,93 @@ def main():
     else:
         print("\nNo direction pairs found for similarity analysis.")
 
+    # --- Self vs Other Metamcuncert Comparison (Introspection Test) ---
+    # Find same-method pairs: probe↔probe and mean_diff↔mean_diff
+    # Skip cross-method pairs (probe↔mean_diff) as they mix task AND method differences
+
+    def get_method(name: str) -> str:
+        if name.endswith("/probe"):
+            return "probe"
+        elif name.endswith("/mean_diff"):
+            return "mean_diff"
+        return "unknown"
+
+    def is_self_other_pair(n1: str, n2: str) -> bool:
+        """Check if this is a self-confidence vs other-confidence metamcuncert pair."""
+        has_self = "d_meta_mc_uncert_confidence" in n1 or "d_meta_mc_uncert_confidence" in n2
+        has_other = "d_meta_mc_uncert_other_confidence" in n1 or "d_meta_mc_uncert_other_confidence" in n2
+        # Must have one of each (not both self or both other)
+        return has_self and has_other
+
+    # Group by method, only keeping same-method comparisons
+    method_pairs = {"probe": None, "mean_diff": None}
+    for (n1, n2), layer_sims in pair_similarities.items():
+        if not is_self_other_pair(n1, n2):
+            continue
+        m1, m2 = get_method(n1), get_method(n2)
+        if m1 == m2 and m1 in method_pairs:
+            method_pairs[m1] = layer_sims
+
+    if any(v is not None for v in method_pairs.values()):
+        print("\n" + "-"*80)
+        print("SELF vs OTHER METAMCUNCERT (Introspection Test)")
+        print("-"*80)
+        print("""
+Comparing directions that predict MC uncertainty from SELF-confidence vs OTHER-confidence.
+Same method applied to both tasks - only the task differs.
+
+Key prediction:
+  - High cosine (~1): Same direction → both tasks use surface cues (question difficulty)
+  - Low cosine (~0): Different directions → self-confidence may use genuine introspection
+""")
+
+        for method, layer_sims in method_pairs.items():
+            if layer_sims is None:
+                continue
+
+            layer_cosines = sorted(layer_sims, key=lambda x: x[0])
+            print(f"  === {method.upper()} method: SELF-CONFIDENCE vs OTHER-CONFIDENCE ===")
+            print()
+            print(f"  {'Layer':<8s}  {'Cosine':>10s}")
+            print(f"  {'-'*8}  {'-'*10}")
+
+            for layer_idx, cos_val in layer_cosines:
+                marker = ""
+                if abs(cos_val) > 0.8:
+                    marker = " ← HIGH (same direction)"
+                elif abs(cos_val) < 0.3:
+                    marker = " ← LOW (different directions)"
+                print(f"  L{layer_idx:<6d}  {cos_val:>10.3f}{marker}")
+
+            all_cos = [c for _, c in layer_cosines]
+            early_cos = [c for l, c in layer_cosines if l <= 10]
+            late_cos = [c for l, c in layer_cosines if l >= 20]
+
+            print()
+            print(f"  Mean: {np.mean(all_cos):.3f}  |  Early (0-10): {np.mean(early_cos):.3f}  |  Late (20+): {np.mean(late_cos):.3f}")
+            print()
+
+        # Overall interpretation
+        probe_late = mean_diff_late = None
+        if method_pairs["probe"] is not None:
+            probe_late = np.mean([c for l, c in method_pairs["probe"] if l >= 20])
+        if method_pairs["mean_diff"] is not None:
+            mean_diff_late = np.mean([c for l, c in method_pairs["mean_diff"] if l >= 20])
+
+        print("  INTERPRETATION:")
+        if probe_late is not None and mean_diff_late is not None:
+            if mean_diff_late > 0.7 and probe_late < 0.5:
+                print("    Method-dependent divergence detected:")
+                print(f"    - mean_diff stays aligned ({mean_diff_late:.2f}) → shared surface cues")
+                print(f"    - probe diverges ({probe_late:.2f}) → unique component in self-confidence")
+                print("    Causal validation needed to determine if unique component matters.")
+            elif mean_diff_late > 0.7 and probe_late > 0.7:
+                print("    High alignment for both methods → surface cues dominate.")
+            elif mean_diff_late < 0.5 and probe_late < 0.5:
+                print("    Low alignment for both methods → different mechanisms for self vs other.")
+            else:
+                print(f"    Mixed pattern: probe={probe_late:.2f}, mean_diff={mean_diff_late:.2f}")
+
     # --- Logit Lens Summary ---
     if lm_head_weight is not None:
         # Pick representative layers: ~5 evenly spaced
@@ -1143,37 +1279,54 @@ def main():
                 # Get direction names from first available layer
                 first_layer = next(iter(layers_dict.keys()))
                 for direction_name in layers_dict[first_layer].keys():
-                    # Parse source key to extract components
-                    # Source format: {dir_type}_{metric}_{dataset} or {dir_type}_{metric}
-                    # We want output: {model}{_adapter}_{dataset}_{metric}_logit_lens_{dir_type}[_{direction_name}].png
-                    source_parts = source.split("_")
+                    # Build consistent filename: {output_prefix}_logit_lens_{direction_type}_{dataset}.png
+                    # Extract dataset from source (e.g., "d_self_confidence_SimpleMC" -> "SimpleMC")
+                    # or use source directly if no dataset embedded
 
-                    # Find metric in source (it's one of AVAILABLE_METRICS)
-                    metric_idx = None
-                    for i, part in enumerate(source_parts):
-                        if part in AVAILABLE_METRICS:
-                            metric_idx = i
-                            break
-
-                    if metric_idx is not None:
-                        dir_type = "_".join(source_parts[:metric_idx])
-                        metric = source_parts[metric_idx]
-                        dataset = "_".join(source_parts[metric_idx + 1:]) if metric_idx + 1 < len(source_parts) else ""
-
-                        # Build filename: {model}{_adapter}_{dataset}_{dir_type}_{metric}_logit_lens
-                        if dataset:
-                            base = f"{output_prefix}_{dataset}_{dir_type}_{metric}_logit_lens"
+                    # Determine the full direction type name
+                    if source.startswith("orthogonal_"):
+                        # orthogonal_SimpleMC + self_confidence_unique -> d_self_confidence_unique
+                        dataset = source.replace("orthogonal_", "")
+                        # Handle legacy names
+                        if direction_name == "introspection":
+                            dir_type = "d_self_confidence_unique"
+                        elif direction_name == "surface":
+                            dir_type = "d_other_confidence_unique"
                         else:
-                            base = f"{output_prefix}_{dir_type}_{metric}_logit_lens"
+                            dir_type = f"d_{direction_name}"
+                    elif source.startswith("selfVother_conf_"):
+                        # selfVother_conf_SimpleMC -> d_selfVother_conf
+                        dataset = source.replace("selfVother_conf_", "")
+                        dir_type = "d_selfVother_conf"
+                    elif source.startswith("self_vs_other_confidence_"):
+                        # Legacy: self_vs_other_confidence_SimpleMC -> d_selfVother_conf
+                        dataset = source.replace("self_vs_other_confidence_", "")
+                        dir_type = "d_selfVother_conf"
+                    elif source.startswith("contrast_"):
+                        # Legacy: contrast_SimpleMC -> d_selfVother_conf
+                        dataset = source.replace("contrast_", "")
+                        dir_type = "d_selfVother_conf"
+                    elif source == "consensus":
+                        # consensus + d_self_confidence -> d_self_confidence_consensus
+                        dataset = "consensus"
+                        dir_type = direction_name
+                    elif source.startswith("d_self_confidence_"):
+                        # d_self_confidence_SimpleMC + mean_diff -> d_self_confidence
+                        dataset = source.replace("d_self_confidence_", "")
+                        dir_type = "d_self_confidence"
+                    elif source.startswith("d_other_confidence_"):
+                        # d_other_confidence_SimpleMC + mean_diff -> d_other_confidence
+                        dataset = source.replace("d_other_confidence_", "")
+                        dir_type = "d_other_confidence"
                     else:
-                        # Fallback if we can't parse
-                        base = f"{output_prefix}_logit_lens_{source}"
+                        # Fallback: use source and direction_name as-is
+                        dataset = ""
+                        dir_type = f"{source}_{direction_name}" if direction_name not in source else source
 
-                    # Add direction_name suffix if it adds info
-                    if direction_name in source or source.endswith(f"_{direction_name}") or direction_name == "probe":
-                        filename = f"{base}.png"
+                    if dataset:
+                        filename = f"{output_prefix}_logit_lens_{dir_type}_{dataset}.png"
                     else:
-                        filename = f"{base}_{direction_name}.png"
+                        filename = f"{output_prefix}_logit_lens_{dir_type}.png"
 
                     plot_logit_lens_heatmap(
                         all_directions, all_layers, source, direction_name,

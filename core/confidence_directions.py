@@ -474,6 +474,174 @@ def compare_confidence_to_uncertainty(
     return results
 
 
+def find_mc_uncertainty_directions_from_meta(
+    meta_activations_by_layer: Dict[int, np.ndarray],
+    mc_uncertainty_values: np.ndarray,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    alpha: float = 1000.0,
+    n_components: int = 100,
+    mean_diff_quantile: float = 0.25,
+    n_bootstrap: int = 0,
+    seed: int = 42,
+) -> Dict:
+    """
+    Find directions in META-TASK activations that predict MC-TASK uncertainty.
+
+    This is a key test for introspection: can we find a direction in the model's
+    activations when it's being asked about confidence that predicts its actual
+    uncertainty during the direct MC task?
+
+    The resulting directions can be compared via cosine similarity to the original
+    d_mc_uncertainty (trained on MC activations → MC uncertainty) to test whether
+    the same geometric representation is used in both contexts.
+
+    Methods:
+    - "probe": Ridge regression to predict MC uncertainty from meta activations
+    - "mean_diff": mean(high MC uncertainty samples) - mean(low MC uncertainty samples)
+      computed on meta activations, sorted by MC uncertainty values
+
+    Args:
+        meta_activations_by_layer: {layer_idx: (n_samples, hidden_dim)} from meta-task
+        mc_uncertainty_values: (n_samples,) uncertainty values from MC task
+                               (e.g., logit_gap, entropy - from identify_mc_correlate.py)
+        train_idx: Indices for training
+        test_idx: Indices for testing
+        alpha: Ridge regularization strength
+        n_components: PCA components for probe
+        mean_diff_quantile: Quantile for mean_diff method (default 0.25)
+        n_bootstrap: Number of bootstrap iterations for confidence intervals (0 = no bootstrap)
+        seed: Random seed for reproducibility
+
+    Returns:
+        {
+            "directions": {"probe": {layer: dir}, "mean_diff": {layer: dir}},
+            "probes": {layer: {"scaler", "pca", "probe"}},
+            "fits": {"probe": {layer: metrics}, "mean_diff": {layer: metrics}},
+            "comparison": {layer: {"cosine_sim": float}}  # probe vs mean_diff
+        }
+    """
+    layers = sorted(meta_activations_by_layer.keys())
+    y = np.asarray(mc_uncertainty_values)
+
+    results = {
+        "directions": {"probe": {}, "mean_diff": {}},
+        "probes": {},
+        "fits": {"probe": {}, "mean_diff": {}},
+        "comparison": {}
+    }
+
+    for layer in tqdm(layers, desc="Finding MC uncertainty directions from meta activations"):
+        X = meta_activations_by_layer[layer]
+
+        # Split
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+
+        # Method 1: Probe-based direction
+        scaler, pca, probe = train_confidence_probe(
+            X_train, y_train,
+            alpha=alpha,
+            n_components=n_components
+        )
+
+        # Evaluate probe
+        train_result = evaluate_confidence_probe(X_train, y_train, scaler, pca, probe)
+        test_result = evaluate_confidence_probe(X_test, y_test, scaler, pca, probe)
+
+        probe_dir = extract_confidence_direction(scaler, pca, probe)
+
+        # Shuffled baseline for probe - use its own scaler/pca
+        rng_shuf = np.random.default_rng(seed + 12_345 + layer)
+        y_shuffled = rng_shuf.permutation(y_train)
+        scaler_shuf, pca_shuf, probe_shuffled = train_confidence_probe(
+            X_train, y_shuffled,
+            alpha=alpha,
+            n_components=n_components
+        )
+        X_test_shuf = pca_shuf.transform(scaler_shuf.transform(_as_float32(X_test)))
+        shuffled_preds = probe_shuffled.predict(X_test_shuf)
+        shuffled_r2 = _sanitize_r2(r2_score(y_test, shuffled_preds))
+
+        probe_fit = {
+            "train_r2": train_result["r2"],
+            "test_r2": test_result["r2"],
+            "test_mae": test_result["mae"],
+            "test_pearson": test_result["pearson"],
+            "test_spearman": test_result["spearman"],
+            "shuffled_r2": float(shuffled_r2),
+            "pca_variance_explained": float(pca.explained_variance_ratio_.sum()),
+        }
+
+        # Bootstrap confidence intervals for probe
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(seed + 10_000 + layer)
+            ci_low, ci_high = _bootstrap_r2_percentiles(y_test, test_result["predictions"], n_bootstrap, rng)
+            probe_fit["test_r2_ci_low"] = ci_low
+            probe_fit["test_r2_ci_high"] = ci_high
+            probe_fit["n_bootstrap"] = int(n_bootstrap)
+
+        results["directions"]["probe"][layer] = probe_dir
+        results["probes"][layer] = {
+            "scaler": scaler,
+            "pca": pca,
+            "probe": probe
+        }
+        results["fits"]["probe"][layer] = probe_fit
+
+        # Method 2: Mean-diff direction
+        mean_diff_dir, mean_diff_info = mean_diff_direction(
+            X_train, y_train,
+            quantile=mean_diff_quantile,
+        )
+
+        # Evaluate mean_diff on test set
+        test_projections = X_test @ mean_diff_dir
+        test_corr, _ = pearsonr(y_test, test_projections)
+        if not np.isfinite(test_corr):
+            test_corr = 0.0
+
+        # OLS mapping from projection -> y
+        proj_mean, y_mean = test_projections.mean(), y_test.mean()
+        proj_std, y_std = test_projections.std(), y_test.std()
+        if proj_std > 0 and y_std > 0:
+            b = test_corr * (y_std / proj_std)
+            y_pred_md = y_mean + (test_projections - proj_mean) * b
+        else:
+            y_pred_md = np.full_like(y_test, y_mean)
+
+        test_r2 = _sanitize_r2(r2_score(y_test, y_pred_md))
+        test_mae_md = float(mean_absolute_error(y_test, y_pred_md))
+
+        mean_diff_fit = {
+            "train_r2": mean_diff_info["r2"],
+            "test_r2": float(test_r2),
+            "test_mae": test_mae_md,
+            "test_pearson": float(test_corr),
+            "quantile": mean_diff_quantile,
+            "n_group": mean_diff_info.get("n_low", mean_diff_info.get("n_group", 0)),
+        }
+
+        # Bootstrap confidence intervals for mean_diff
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(seed + 20_000 + layer)
+            ci_low, ci_high = _bootstrap_r2_percentiles(y_test, y_pred_md, n_bootstrap, rng)
+            mean_diff_fit["test_r2_ci_low"] = ci_low
+            mean_diff_fit["test_r2_ci_high"] = ci_high
+            mean_diff_fit["n_bootstrap"] = int(n_bootstrap)
+
+        results["directions"]["mean_diff"][layer] = mean_diff_dir
+        results["fits"]["mean_diff"][layer] = mean_diff_fit
+
+        # Cosine similarity between methods
+        cos_sim = float(np.dot(probe_dir, mean_diff_dir))
+        results["comparison"][layer] = {"cosine_sim": cos_sim}
+
+    return results
+
+
 def cross_evaluate_directions(
     activations: np.ndarray,
     uncertainty_direction: np.ndarray,

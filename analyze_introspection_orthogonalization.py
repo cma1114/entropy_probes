@@ -1,16 +1,15 @@
 """
-Analysis: Isolating True Introspection from Surface Difficulty Cues.
+Analysis: Isolating unique self-confidence vs other-confidence signals.
 
 Orthogonalizes self-confidence directions with respect to other-confidence
-directions to isolate "pure introspection" (d_introspection) and "pure surface
-difficulty cues" (d_surface). Tests whether these residual directions still
-work for prediction, steering, and ablation.
+directions to isolate unique components. Tests whether these residual
+directions still work for prediction, steering, and ablation.
 
-Hypothesis:
-- d_self = introspection + surface difficulty
-- d_other = primarily surface difficulty
-- d_introspection = d_self - proj(d_self, d_other) = pure introspection
-- d_surface = d_other - proj(d_other, d_self) = pure surface cues
+Directions:
+- d_self_confidence = predicts stated self-confidence
+- d_other_confidence = predicts stated other-confidence
+- d_self_confidence_unique = d_self_confidence - proj(d_self_confidence, d_other_confidence)
+- d_other_confidence_unique = d_other_confidence - proj(d_other_confidence, d_self_confidence)
 
 Inputs:
     outputs/{base}_meta_confidence_metaconfdir_directions.npz    Self-confidence directions
@@ -117,7 +116,7 @@ OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Fixed seed offsets for direction types (replaces unstable hash(dt))
-DT_SEED_OFFSET = {"d_self": 11, "d_other": 22, "d_introspection": 33, "d_surface": 44}
+DT_SEED_OFFSET = {"d_self_confidence": 11, "d_other_confidence": 22, "d_self_confidence_unique": 33, "d_other_confidence_unique": 44}
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -227,10 +226,10 @@ class OnlineCorrelation:
 @dataclass
 class OrthogonalDirections:
     """Container for orthogonalized direction vectors at a single layer."""
-    d_self: np.ndarray
-    d_other: np.ndarray
-    d_introspection: np.ndarray
-    d_surface: np.ndarray
+    d_self_confidence: np.ndarray
+    d_other_confidence: np.ndarray
+    d_self_confidence_unique: np.ndarray
+    d_other_confidence_unique: np.ndarray
     cosine_similarity: float
     residual_norm: float
     degenerate: bool
@@ -355,8 +354,8 @@ def load_dataset(base_name: str) -> Dict:
 # =============================================================================
 
 def orthogonalize_directions(
-    d_self: np.ndarray,
-    d_other: np.ndarray,
+    d_self_confidence: np.ndarray,
+    d_other_confidence: np.ndarray,
     min_residual_norm: float = 0.1,
     layer: int = 0,
     seed: int = SEED
@@ -364,12 +363,12 @@ def orthogonalize_directions(
     """
     Compute orthogonalized directions via Gram-Schmidt projection.
 
-    d_introspection = d_self - proj(d_self, d_other)
-    d_surface = d_other - proj(d_other, d_self)
+    d_self_confidence_unique = d_self_confidence - proj(d_self_confidence, d_other_confidence)
+    d_other_confidence_unique = d_other_confidence - proj(d_other_confidence, d_self_confidence)
 
     Args:
-        d_self: Self-confidence direction (normalized)
-        d_other: Other-confidence direction (normalized)
+        d_self_confidence: Self-confidence direction (normalized)
+        d_other_confidence: Other-confidence direction (normalized)
         min_residual_norm: Minimum norm threshold for degenerate detection
         layer: Layer index (for layer-specific fallback seeds in degenerate cases)
         seed: Base seed (for reproducibility)
@@ -378,33 +377,33 @@ def orthogonalize_directions(
         OrthogonalDirections dataclass with all vectors and metadata
     """
     # Ensure unit vectors
-    d_self = d_self / np.linalg.norm(d_self)
-    d_other = d_other / np.linalg.norm(d_other)
+    d_self_confidence = d_self_confidence / np.linalg.norm(d_self_confidence)
+    d_other_confidence = d_other_confidence / np.linalg.norm(d_other_confidence)
 
     # Cosine similarity
-    cosine = float(np.dot(d_self, d_other))
+    cosine = float(np.dot(d_self_confidence, d_other_confidence))
 
-    # Gram-Schmidt: introspection = self with other removed
-    d_introspection = d_self - cosine * d_other
-    introspection_norm = np.linalg.norm(d_introspection)
+    # Gram-Schmidt: self_unique = self with other removed
+    d_self_confidence_unique = d_self_confidence - cosine * d_other_confidence
+    self_unique_norm = np.linalg.norm(d_self_confidence_unique)
 
-    # Gram-Schmidt: surface = other with self removed
-    d_surface = d_other - cosine * d_self
-    surface_norm = np.linalg.norm(d_surface)
+    # Gram-Schmidt: other_unique = other with self removed
+    d_other_confidence_unique = d_other_confidence - cosine * d_self_confidence
+    other_unique_norm = np.linalg.norm(d_other_confidence_unique)
 
-    # Note: introspection_norm == surface_norm by symmetry (both = sqrt(1 - cosine^2))
-    residual_norm = float(introspection_norm)
+    # Note: self_unique_norm == other_unique_norm by symmetry (both = sqrt(1 - cosine^2))
+    residual_norm = float(self_unique_norm)
     degenerate = residual_norm < min_residual_norm
 
-    # Normalize 
-    d_introspection = d_introspection / introspection_norm
-    d_surface = d_surface / surface_norm
+    # Normalize
+    d_self_confidence_unique = d_self_confidence_unique / self_unique_norm
+    d_other_confidence_unique = d_other_confidence_unique / other_unique_norm
 
     return OrthogonalDirections(
-        d_self=d_self.astype(np.float32),
-        d_other=d_other.astype(np.float32),
-        d_introspection=d_introspection.astype(np.float32),
-        d_surface=d_surface.astype(np.float32),
+        d_self_confidence=d_self_confidence.astype(np.float32),
+        d_other_confidence=d_other_confidence.astype(np.float32),
+        d_self_confidence_unique=d_self_confidence_unique.astype(np.float32),
+        d_other_confidence_unique=d_other_confidence_unique.astype(np.float32),
         cosine_similarity=cosine,
         residual_norm=residual_norm,
         degenerate=degenerate,
@@ -560,7 +559,7 @@ def compute_predictive_power_matrix(
 
     results = {"by_layer": {}, "summary": {}}
 
-    direction_types = ["d_self", "d_other", "d_introspection", "d_surface"]
+    direction_types = ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]
     tasks = ["self", "other"]
 
     for layer in tqdm(layers, desc="Computing predictive power"):
@@ -668,7 +667,7 @@ def run_steering_matrix(
             "summary": {...}
         }
     """
-    direction_types = ["d_self", "d_other", "d_introspection", "d_surface"]
+    direction_types = ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]
     tasks = ["self", "other"]
     n_dirs = len(direction_types)
     n_questions = len(questions)
@@ -1008,7 +1007,7 @@ def run_ablation_matrix(
     - Control corrs computed per-control (streaming), but without storing conf lists.
     - Controls kept on CPU, moved to GPU only in the current chunk.
     """
-    direction_types = ["d_self", "d_other", "d_introspection", "d_surface"]
+    direction_types = ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]
     tasks = ["self", "other"]
     n_dirs = len(direction_types)
 
@@ -1262,7 +1261,7 @@ def plot_orthogonalization_similarity(
     ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
     ax1.axhline(y=0.9, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Degenerate threshold')
     ax1.set_ylabel("Cosine Similarity")
-    ax1.set_title("cos(d_self, d_other) by Layer")
+    ax1.set_title("cos(d_self_confidence, d_other_confidence) by Layer")
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=GRID_ALPHA)
 
@@ -1278,7 +1277,7 @@ def plot_orthogonalization_similarity(
     ax2.set_xlabel("Layer")
     ax2.set_xticks(x)
     ax2.set_xticklabels(layers)
-    ax2.set_title(f"||d_self - proj(d_self, d_other)|| = sqrt(1 - cos²)")
+    ax2.set_title(f"||d_self_conf - proj(d_self_conf, d_other_conf)|| = sqrt(1 - cos²)")
     ax2.grid(True, alpha=GRID_ALPHA)
 
     save_figure(fig, output_path)
@@ -1291,7 +1290,7 @@ def plot_predictive_heatmap(
 ):
     """Plot 4x2 predictive power heatmap."""
     layers = sorted(predictive_results["by_layer"].keys())
-    direction_types = ["d_self", "d_other", "d_introspection", "d_surface"]
+    direction_types = ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]
     tasks = ["self", "other"]
 
     # Create heatmap data
@@ -1339,7 +1338,7 @@ def plot_causal_heatmap(
 ):
     """Plot 4x2 causal effect heatmaps for steering and ablation."""
     layers = sorted(steering_results["by_layer"].keys())
-    direction_types = ["d_self", "d_other", "d_introspection", "d_surface"]
+    direction_types = ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]
     tasks = ["self", "other"]
     n_dir = len(direction_types)
     n_task = len(tasks)
@@ -1511,14 +1510,14 @@ def main():
         causal_layers = non_degenerate
         print(f"\nCausal experiments on ALL {len(causal_layers)} non-degenerate layers")
     elif CAUSAL_LAYER_MODE == "top_k":
-        # Select top-k layers by d_introspection_self R² (the key hypothesis)
+        # Select top-k layers by d_self_confidence_unique R² (the key hypothesis)
         layer_r2 = [
-            (l, predictive_results["by_layer"][l][("d_introspection", "self")]["r2"])
+            (l, predictive_results["by_layer"][l][("d_self_confidence_unique", "self")]["r2"])
             for l in non_degenerate
         ]
         layer_r2.sort(key=lambda x: x[1], reverse=True)
         causal_layers = [l for l, _ in layer_r2[:CAUSAL_TOP_K]]
-        print(f"\nCausal experiments on TOP {len(causal_layers)} layers by d_introspection R²:")
+        print(f"\nCausal experiments on TOP {len(causal_layers)} layers by d_self_confidence_unique R²:")
         for l, r2 in layer_r2[:CAUSAL_TOP_K]:
             print(f"    Layer {l}: R²={r2:.3f}")
     elif CAUSAL_LAYER_MODE == "explicit":
@@ -1614,8 +1613,8 @@ def main():
     }
     for layer in layers:
         ortho = ortho_by_layer[layer]
-        save_data[f"introspection_layer_{layer}"] = ortho.d_introspection
-        save_data[f"surface_layer_{layer}"] = ortho.d_surface
+        save_data[f"self_confidence_unique_layer_{layer}"] = ortho.d_self_confidence_unique
+        save_data[f"other_confidence_unique_layer_{layer}"] = ortho.d_other_confidence_unique
         save_data[f"cosine_layer_{layer}"] = np.array([ortho.cosine_similarity])
         save_data[f"residual_norm_layer_{layer}"] = np.array([ortho.residual_norm])
     np.savez_compressed(directions_path, **save_data)
@@ -1699,9 +1698,9 @@ def main():
         "steering": steering_json,
         "ablation": ablation_json,
         "interpretation": {
-            "unique_introspection_exists": float(np.mean([1 - ortho_by_layer[l].cosine_similarity ** 2 for l in layers])) > 0.1,
-            "introspection_predictive": predictive_results["summary"].get("d_introspection_self", {}).get("max_r2", 0) > 0.05,
-            "surface_predictive": predictive_results["summary"].get("d_surface_other", {}).get("max_r2", 0) > 0.05,
+            "unique_component_exists": float(np.mean([1 - ortho_by_layer[l].cosine_similarity ** 2 for l in layers])) > 0.1,
+            "self_unique_predictive": predictive_results["summary"].get("d_self_confidence_unique_self", {}).get("max_r2", 0) > 0.05,
+            "other_unique_predictive": predictive_results["summary"].get("d_other_confidence_unique_other", {}).get("max_r2", 0) > 0.05,
         },
     }
 
@@ -1732,16 +1731,16 @@ def main():
 
     # Print full 4x2 predictive power summary
     print("\nPredictive Power (R²):")
-    print("                      self-task    other-task")
-    for dir_type in ["d_self", "d_other", "d_introspection", "d_surface"]:
+    print("                              self-task    other-task")
+    for dir_type in ["d_self_confidence", "d_other_confidence", "d_self_confidence_unique", "d_other_confidence_unique"]:
         self_pred = predictive_results["summary"].get(f"{dir_type}_self", {})
         other_pred = predictive_results["summary"].get(f"{dir_type}_other", {})
         self_r2 = f"{self_pred['max_r2']:.3f}" if self_pred else "N/A"
         other_r2 = f"{other_pred['max_r2']:.3f}" if other_pred else "N/A"
-        print(f"  {dir_type:18s}  {self_r2:8s}     {other_r2:8s}")
+        print(f"  {dir_type:28s}  {self_r2:8s}     {other_r2:8s}")
 
-    print(f"\nSteering with d_introspection on self-task: {steering_results['summary'].get('d_introspection_self', {}).get('n_significant_fdr', 0)} FDR-significant layers")
-    print(f"Ablating d_introspection on self-task: {ablation_results['summary'].get('d_introspection_self', {}).get('n_significant_fdr', 0)} FDR-significant layers")
+    print(f"\nSteering with d_self_confidence_unique on self-task: {steering_results['summary'].get('d_self_confidence_unique_self', {}).get('n_significant_fdr', 0)} FDR-significant layers")
+    print(f"Ablating d_self_confidence_unique on self-task: {ablation_results['summary'].get('d_self_confidence_unique_self', {}).get('n_significant_fdr', 0)} FDR-significant layers")
 
     print("\n" + "=" * 70)
     print("DONE")

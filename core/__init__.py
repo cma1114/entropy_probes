@@ -67,6 +67,7 @@ from .confidence_directions import (
     evaluate_confidence_probe,
     find_confidence_directions,
     find_confidence_directions_both_methods,
+    find_mc_uncertainty_directions_from_meta,
     compare_confidence_to_uncertainty,
     cross_evaluate_directions,
 )
@@ -177,6 +178,7 @@ __all__ = [
     "evaluate_confidence_probe",
     "find_confidence_directions",
     "find_confidence_directions_both_methods",
+    "find_mc_uncertainty_directions_from_meta",
     "compare_confidence_to_uncertainty",
     "cross_evaluate_directions",
     # probes

@@ -19,7 +19,11 @@ Inputs:
     outputs/{base}_mc_answer_results.json                  Answer accuracy per layer
     outputs/{base}_meta_{task}_metaconfdir_directions.npz  Confidence directions
     outputs/{base}_meta_{task}_metaconfdir_results.json    Confidence R^2 per layer
+    outputs/{base}_meta_{task}_metamcuncert_directions.npz Metamcuncert directions (if DIRECTION_TYPES includes "metamcuncert")
+    outputs/{base}_meta_{task}_metamcuncert_results.json   Metamcuncert R^2 per layer
     outputs/{base}_mc_dataset.json                         Question metadata
+
+    where {base} = {model_short}_{dataset} or {model_short}_adapter-{adapter_short}_{dataset}
 
 Outputs:
     outputs/{base}_cross_direction_{metric}_results.json   Effect matrix with CIs
@@ -27,6 +31,9 @@ Outputs:
 
 Shared parameters (must match across scripts):
     SEED
+
+Configuration:
+    ADAPTER: Optional path to PEFT/LoRA adapter (must match identify step if used)
 
 Run after: identify_mc_correlate.py, test_meta_transfer.py
 """
@@ -64,6 +71,7 @@ from tasks import (
 
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
 INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
 META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
 METRIC = "logit_gap"  # Uncertainty metric for uncertainty directions
@@ -78,7 +86,11 @@ BATCH_SIZE = 4
 NUM_QUESTIONS = 100
 
 # Direction types to test
-DIRECTION_TYPES = ["uncertainty", "answer", "confidence"]
+# - "uncertainty": MC uncertainty directions (d_mc from identify_mc_correlate.py)
+# - "answer": MC answer directions (A/B/C/D)
+# - "confidence": Stated confidence directions (d_confidence from test_meta_transfer.py)
+# - "metamcuncert": MC uncertainty directions found from meta activations (from test_meta_transfer.py)
+DIRECTION_TYPES = ["uncertainty", "answer", "confidence", "metamcuncert"]
 
 # Layer selection: only ablate/measure where directions are meaningful
 # Direction-specific thresholds (answer uses accuracy with chance=0.25, others use R²)
@@ -86,6 +98,7 @@ METRIC_THRESHOLDS = {
     "uncertainty": 0.3,   # R² threshold
     "answer": 0.35,       # Accuracy threshold (chance=0.25)
     "confidence": 0.3,    # R² threshold
+    "metamcuncert": 0.3,  # R² threshold
 }
 R2_THRESHOLD = 0.2  # Default fallback if direction not in METRIC_THRESHOLDS
 BUFFER_LAYERS = 1   # Measure at layers >= ablate_layer + buffer
@@ -237,6 +250,35 @@ def load_confidence_r2(base_name: str, meta_task: str) -> Dict[int, float]:
     return r2_by_layer
 
 
+def load_metamcuncert_r2(base_name: str, meta_task: str, metric: str = "logit_gap") -> Dict[int, float]:
+    """Load R^2 values for metamcuncert directions (meta→MC uncertainty).
+
+    These are directions in meta-task activations that predict MC-task uncertainty.
+    """
+    path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_results.json"
+    if not path.exists():
+        print(f"  Warning: {path} not found")
+        print(f"  -> Run test_meta_transfer.py with FIND_MC_UNCERTAINTY_DIRECTIONS=True")
+        return {}
+
+    with open(path) as f:
+        data = json.load(f)
+
+    r2_by_layer = {}
+    # Try probe method first, fall back to mean_diff
+    for method in ["probe", "mean_diff"]:
+        if method in data.get("results", {}):
+            for layer_str, layer_data in data["results"][method].items():
+                try:
+                    layer = int(layer_str)
+                    r2 = layer_data.get("test_r2", 0)
+                    r2_by_layer[layer] = max(r2_by_layer.get(layer, -999), r2)
+                except (ValueError, KeyError):
+                    continue
+
+    return r2_by_layer
+
+
 # =============================================================================
 # DIRECTION LOADING
 # =============================================================================
@@ -261,6 +303,8 @@ def load_directions_for_type(
         path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
     elif direction_type == "confidence":
         path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_directions.npz"
+    elif direction_type == "metamcuncert":
+        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -280,6 +324,8 @@ def load_directions_for_type(
         actual_method = method_map.get(method, method)
         prefix = f"{actual_method}_layer_"
     elif direction_type == "confidence":
+        prefix = f"{method}_layer_"
+    elif direction_type == "metamcuncert":
         prefix = f"{method}_layer_"
 
     # Collect layer -> key mapping, sorted by layer
@@ -374,6 +420,8 @@ def load_all_direction_info(
             r2_by_layer = load_answer_r2(base_name, meta_task)
         elif dir_type == "confidence":
             r2_by_layer = load_confidence_r2(base_name, meta_task)
+        elif dir_type == "metamcuncert":
+            r2_by_layer = load_metamcuncert_r2(base_name, meta_task, metric)
         else:
             r2_by_layer = {}
 
@@ -1274,6 +1322,7 @@ def main():
     print("\nLoading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
         MODEL,
+        adapter_path=ADAPTER,
         load_in_4bit=LOAD_IN_4BIT,
         load_in_8bit=LOAD_IN_8BIT,
     )
@@ -1725,14 +1774,21 @@ def main():
     # Extract dataset part from INPUT_BASE_NAME
     if "_" in INPUT_BASE_NAME:
         parts = INPUT_BASE_NAME.split("_", 1)
-        output_base = f"{model_short}_{parts[1]}" if len(parts) > 1 else f"{model_short}_{INPUT_BASE_NAME}"
+        dataset_name = parts[1] if len(parts) > 1 else INPUT_BASE_NAME
     else:
-        output_base = f"{model_short}_{INPUT_BASE_NAME}"
+        dataset_name = INPUT_BASE_NAME
+    # Include adapter in output name if used
+    if ADAPTER:
+        adapter_short = get_model_short_name(ADAPTER)
+        output_base = f"{model_short}_adapter-{adapter_short}_{dataset_name}"
+    else:
+        output_base = f"{model_short}_{dataset_name}"
 
     # Convert tuple keys to strings for JSON
     json_results = {
         "config": get_config_dict(
             model=MODEL,
+            adapter=ADAPTER,
             input_base=INPUT_BASE_NAME,
             metric=METRIC,
             meta_task=META_TASK,
