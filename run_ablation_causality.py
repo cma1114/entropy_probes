@@ -14,18 +14,18 @@ Tests all layers with pooled null distribution + FDR correction.
 Inputs:
     outputs/{base}_mc_{metric}_directions.npz            Uncertainty directions
     outputs/{base}_mc_answer_directions.npz              Answer directions (if DIRECTION_TYPE="answer")
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
-    outputs/{base}_meta_{task}_metamcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
-    outputs/{base}_mc_dataset.json                       Question metadata + metric values
+    outputs/{base}_meta_{task}_confdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
+    outputs/{base}_meta_{task}_mcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
+    outputs/{base}_mc_results.json                        Consolidated results (dataset + metrics)
 
-Outputs (one file per method/position combination):
-    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{positions}_results.json
-    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{positions}_{position}.png
+Outputs (one file per method, with per-position plots):
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_results.json
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{position}.png
 
-    where {base} = {model_short_name}_{dataset}
+    where {base} = {dataset} (model info is in directory path)
           {dir_suffix} = "{direction_type}_{metric}" for uncertainty, else "{direction_type}"
           {method} = "probe" or "mean_diff"
-          {positions} = position(s) tested, joined by underscore (e.g., "final" or "final_question_mark")
+          {position} = token position tested (e.g., "final")
 
 Shared parameters (must match across scripts):
     SEED, TRAIN_SPLIT
@@ -48,9 +48,15 @@ from core.model_utils import (
     load_model_and_tokenizer,
     should_use_chat_template,
     get_model_short_name,
+    get_model_dir_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.logging_utils import (
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+)
 from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA, CONDITION_COLORS
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
@@ -68,8 +74,11 @@ from tasks import (
     get_stated_confidence_signal,
     format_answer_or_delegate_prompt,
     get_answer_or_delegate_signal,
+    format_other_confidence_prompt,
+    get_other_confidence_signal,
     STATED_CONFIDENCE_OPTIONS,
     ANSWER_OR_DELEGATE_OPTIONS,
+    OTHER_CONFIDENCE_OPTIONS,
     find_mc_positions,
 )
 
@@ -80,9 +89,10 @@ from tasks import (
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+DATASET = "TriviaMC_difficulty_filtered"  # Dataset name (model prefix now in directory)
 METRIC = "logit_gap"  # Which metric's directions to test (for DIRECTION_TYPE="uncertainty")
 META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
 # Direction type to ablate:
 # - "uncertainty": Ablate uncertainty directions (from identify_mc_correlate.py)
@@ -164,14 +174,13 @@ BOOTSTRAP_CI_ALPHA = 0.05  # 95% CI
 
 # Layer selection from transfer results (for non-final positions)
 TRANSFER_R2_THRESHOLD = 0.3  # Layers with R² >= this are tested for non-final positions
-TRANSFER_RESULTS_PATH = None  # Auto-detect from INPUT_BASE_NAME if None
+TRANSFER_RESULTS_PATH = None  # Auto-detect from MODEL/DATASET if None
 
 # Control count for non-final positions (final uses NUM_CONTROLS)
 NUM_CONTROLS_NONFINAL = 10
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -181,7 +190,7 @@ torch.manual_seed(SEED)
 # TRANSFER RESULTS LOADING (for layer selection)
 # =============================================================================
 
-def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
+def load_transfer_results(base_name: str, meta_task: str, model_dir: str) -> Optional[Dict]:
     """
     Load transfer results JSON to get per-layer R² values.
 
@@ -189,7 +198,7 @@ def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
     """
     path = TRANSFER_RESULTS_PATH
     if path is None:
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+        path = find_output_file(f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json", model_dir=model_dir)
     else:
         path = Path(path)
 
@@ -261,16 +270,18 @@ def load_directions(
     base_name: str,
     direction_type: str = "uncertainty",
     metric: str = "entropy",
-    meta_task: str = "delegate"
+    meta_task: str = "delegate",
+    model_dir: str = None
 ) -> Dict[str, Dict[int, np.ndarray]]:
     """
     Load direction vectors based on direction type.
 
     Args:
-        base_name: Base name for input files
+        base_name: Base name for input files (dataset name)
         direction_type: "uncertainty", "answer", "confidence", or "metamcuncert"
         metric: Uncertainty metric (only used for direction_type="uncertainty")
         meta_task: Meta task (only used for direction_type="confidence" or "metamcuncert")
+        model_dir: Model directory name
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
@@ -279,13 +290,14 @@ def load_directions(
         For confidence/metamcuncert: {"probe": {...}, "mean_diff": {...}}
     """
     if direction_type == "uncertainty":
-        path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+        path = find_output_file(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir)
     elif direction_type == "answer":
-        path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
+        path = find_output_file(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
     elif direction_type == "confidence":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_directions.npz"
+        path = find_output_file(f"{base_name}_meta_{meta_task}_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     elif direction_type == "metamcuncert":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
+        # Consolidated file with keys like probe_{metric}_layer_0
+        path = find_output_file(f"{base_name}_meta_{meta_task}_mcuncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -363,8 +375,8 @@ def load_directions(
                     direction = direction / norm
                 methods["answer"][layer] = direction
 
-    elif direction_type in ("confidence", "metamcuncert"):
-        # Keys are like "probe_layer_0", "mean_diff_layer_5" (same format as uncertainty)
+    elif direction_type == "confidence":
+        # Keys are like "probe_layer_0", "mean_diff_layer_5"
         for key in data.files:
             if key.startswith("_"):
                 continue  # Skip metadata keys
@@ -388,17 +400,61 @@ def load_directions(
                 methods[method_name] = {}
             methods[method_name][layer] = direction
 
+    elif direction_type == "metamcuncert":
+        # Consolidated file with keys like "probe_{metric}_layer_0", "mean_diff_{metric}_layer_5"
+        # Filter by the requested metric
+        for key in data.files:
+            if key.startswith("_"):
+                continue  # Skip metadata keys
+
+            # Check if this key is for the requested metric
+            # Keys are like "probe_entropy_layer_0" or "mean_diff_logit_gap_layer_5"
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) != 2:
+                continue
+
+            method_metric, layer_str = parts
+            try:
+                layer = int(layer_str)
+            except ValueError:
+                continue
+
+            # Parse method and metric from "probe_entropy" or "mean_diff_logit_gap"
+            if method_metric.startswith("probe_"):
+                method_name = "probe"
+                key_metric = method_metric[6:]  # Remove "probe_"
+            elif method_metric.startswith("mean_diff_"):
+                method_name = "mean_diff"
+                key_metric = method_metric[10:]  # Remove "mean_diff_"
+            else:
+                continue
+
+            # Only include if metric matches
+            if key_metric != metric:
+                continue
+
+            direction = data[key].astype(np.float32)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+
+            if method_name not in methods:
+                methods[method_name] = {}
+            methods[method_name][layer] = direction
+
     return methods
 
 
-def load_dataset(base_name: str) -> Dict:
-    """Load dataset with questions and metric values."""
-    path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
+def load_dataset(base_name: str, model_dir: str) -> Dict:
+    """Load consolidated mc_results.json with questions and metric values."""
+    path = find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(f"Dataset file not found: {path}")
 
     with open(path, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Return nested dataset section for compatibility
+    return data["dataset"]
 
 
 # =============================================================================
@@ -411,6 +467,8 @@ def get_format_fn(meta_task: str):
         return format_stated_confidence_prompt
     elif meta_task == "delegate":
         return format_answer_or_delegate_prompt
+    elif meta_task == "other_confidence":
+        return format_other_confidence_prompt
     else:
         raise ValueError(f"Unknown meta_task: {meta_task}")
 
@@ -419,13 +477,15 @@ def get_signal_fn(meta_task: str):
     """Get signal extraction function for meta-task.
 
     Returns a function with signature (probs, mapping) -> float.
-    For confidence task, mapping is ignored.
+    For confidence/other_confidence tasks, mapping is ignored.
     """
     if meta_task == "confidence":
         # Wrap to match (probs, mapping) signature
         return lambda p, m: get_stated_confidence_signal(p)
     elif meta_task == "delegate":
         return get_answer_or_delegate_signal
+    elif meta_task == "other_confidence":
+        return lambda p, m: get_other_confidence_signal(p)
     else:
         raise ValueError(f"Unknown meta_task: {meta_task}")
 
@@ -436,6 +496,8 @@ def get_options(meta_task: str) -> List[str]:
         return list(STATED_CONFIDENCE_OPTIONS.keys())
     elif meta_task == "delegate":
         return ANSWER_OR_DELEGATE_OPTIONS
+    elif meta_task == "other_confidence":
+        return list(OTHER_CONFIDENCE_OPTIONS.keys())
     else:
         raise ValueError(f"Unknown meta_task: {meta_task}")
 
@@ -474,44 +536,6 @@ def _compute_confidence_used(meta_task: str, probs_row, logits_row, mapping, sig
         warnings.warn("CONFIDENCE_SIGNAL=logit_margin is only defined for META_TASK=delegate; falling back to prob.")
     conf = float(signal_fn(probs_row, mapping))
     return conf, None, None
-
-def _summarize_dist(values):
-    import numpy as _np
-    arr = _np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return {"n": 0}
-    return {
-        "n": int(arr.size),
-        "mean": float(_np.mean(arr)),
-        "std": float(_np.std(arr)),
-        "q05": float(_np.quantile(arr, 0.05)),
-        "q50": float(_np.quantile(arr, 0.50)),
-        "q95": float(_np.quantile(arr, 0.95)),
-        "min": float(_np.min(arr)),
-        "max": float(_np.max(arr)),
-    }
-
-def _report_signal_distributions(results: dict, meta_task: str):
-    try:
-        layer0 = results["layers"][0]
-        baseline_list = results["layer_results"][layer0]["baseline"]
-    except Exception:
-        return
-    conf_vals = [d.get("confidence") for d in baseline_list if isinstance(d, dict) and d.get("confidence") is not None]
-    p_answer_vals = [d.get("p_answer") for d in baseline_list if isinstance(d, dict) and d.get("p_answer") is not None]
-    margin_vals = [d.get("logit_margin") for d in baseline_list if isinstance(d, dict) and d.get("logit_margin") is not None]
-    print() 
-    print("  Signal distributions (baseline):")
-    if meta_task == "delegate":
-        s = _summarize_dist(p_answer_vals)
-        if s.get("n", 0) > 0:
-            print(f"    P(Answer): n={s['n']} mean={s['mean']:+.4f} std={s['std']:.4f} q05={s['q05']:+.4f} q50={s['q50']:+.4f} q95={s['q95']:+.4f} min={s['min']:+.4f} max={s['max']:+.4f}")
-        s = _summarize_dist(margin_vals)
-        if s.get("n", 0) > 0:
-            print(f"    logit_margin: n={s['n']} mean={s['mean']:+.4f} std={s['std']:.4f} q05={s['q05']:+.4f} q50={s['q50']:+.4f} q95={s['q95']:+.4f} min={s['min']:+.4f} max={s['max']:+.4f}")
-    s = _summarize_dist(conf_vals)
-    if s.get("n", 0) > 0:
-        print(f"    confidence (used): n={s['n']} mean={s['mean']:+.4f} std={s['std']:.4f} q05={s['q05']:+.4f} q50={s['q50']:+.4f} q95={s['q95']:+.4f} min={s['min']:+.4f} max={s['max']:+.4f}")
 
 def run_ablation_for_method(
     model,
@@ -1056,7 +1080,7 @@ def _bootstrap_corr(x: np.ndarray, y: np.ndarray, idx: np.ndarray) -> np.ndarray
     return out
 
 
-def analyze_ablation_results(results: Dict, metric: str) -> Dict:
+def analyze_ablation_results(results: Dict, metric: str, base_name: str) -> Dict:
     """Compute ablation effect statistics.
 
     Adds **bootstrap CIs + bootstrap BH-FDR** over questions (cheap, no extra model runs),
@@ -1070,9 +1094,9 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
     # Determine quantization string
     quant_str = "4bit" if LOAD_IN_4BIT else ("8bit" if LOAD_IN_8BIT else "none")
 
-    # Extract model short name and dataset name for metadata
+    # Extract model short name for metadata
     model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
+    dataset_name = base_name  # Already just the dataset name
 
     analysis = {
         "confidence_signal": results.get("confidence_signal", CONFIDENCE_SIGNAL),
@@ -1363,55 +1387,6 @@ def analyze_ablation_results(results: Dict, metric: str) -> Dict:
         "best_abs_delta": float(per[best_layer_abs_delta]["correlation_change"]),
     }
 
-    # Optional: print Δconf diagnostics for biggest +Δcorr and biggest -Δcorr
-    if PRINT_DELTA_DIAGNOSTICS and len(layers) > 0:
-        top_inc = sorted(layers, key=lambda l: per[l]["correlation_change"], reverse=True)[:DELTA_DIAGNOSTIC_TOPK]
-        top_dec = sorted(layers, key=lambda l: per[l]["correlation_change"])[:DELTA_DIAGNOSTIC_TOPK]
-
-        def _fmt_deciles(arr):
-            def _fmt_one(x):
-                if x is None:
-                    return "None"
-                try:
-                    if x != x:  # NaN
-                        return "nan"
-                except Exception:
-                    return "None"
-                return f"{x:+.3f}"
-            return "[" + ", ".join(_fmt_one(x) for x in arr) + "]"
-
-        def _print_layer(l):
-            d = per[l]
-            lo_d, hi_d = d["delta_corr_ci95"]
-            print(
-                f"    L{l:>3}  corr {d['baseline_correlation']:+.3f} -> {d['ablated_correlation']:+.3f}  "
-                f"(Δ={d['correlation_change']:+.3f}, ΔCI=[{lo_d:+.3f},{hi_d:+.3f}], "
-                f"bootFDR={d['p_value_bootstrap_fdr']:.3g})"
-            )
-            print(
-                f"         conf mean {d['baseline_confidence_mean']:.3f} -> {d['ablated_confidence_mean']:.3f}  "
-                f"(Δmean={d['delta_conf_mean']:+.4f}, Δstd={d['delta_conf_std']:.4f})"
-            )
-            print(
-                f"         corr(Δconf, metric*s) pearson={d['delta_conf_corr_metric']:+.3f} "
-                f"spearman={d['delta_conf_spearman_metric']:+.3f}  "
-                f"(ctrl mean={d['control_delta_conf_corr_metric_mean']:+.3f}±{d['control_delta_conf_corr_metric_std']:.3f}, "
-                f"p_pooled={d['p_value_delta_corr_pooled']:.3g})"
-            )
-            print(
-                f"         ablated≈{d['affine_slope']:.3f}*baseline+{d['affine_intercept']:+.3f}  "
-                f"corr(baseline,ablated)={d['baseline_to_ablated_conf_corr']:.4f}  "
-                f"corr(resid, metric*s)={d['residual_corr_metric']:+.3f}"
-            )
-            print(f"         mean Δconf by metric decile: {_fmt_deciles(d['delta_conf_mean_by_metric_decile'])}")
-
-        print("\n  [Δconf diagnostics] Layers with biggest +Δcorr:")
-        for l in top_inc:
-            _print_layer(l)
-        print("\n  [Δconf diagnostics] Layers with biggest -Δcorr:")
-        for l in top_dec:
-            _print_layer(l)
-
     return analysis
 
 
@@ -1675,106 +1650,40 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     save_figure(fig, output_path)
 
 
-def print_summary(analyses: Dict[str, Dict]):
-    """Print summary of ablation results (with bootstrap CIs + bootstrap BH-FDR)."""
-    print("\n" + "=" * 90)
-    print("ABLATION CAUSALITY TEST RESULTS")
-    print("=" * 90)
-    desc = DIRECTION_DESCRIPTIONS.get(DIRECTION_TYPE, {})
-    print(f"\nDirection type: {DIRECTION_TYPE} (trained on: {desc.get('trained_on', 'unknown')})")
-    print(f"Dependent variable: correlation(stated_confidence, {METRIC})")
-    print(f"Interpretation: {desc.get('interpretation', 'unknown')}")
-    print("\nKey question: Does ablating the direction HURT calibration?")
-    print("Expected: correlation should DECREASE (negative Δcorr)")
-    print("Significance & CIs: bootstrap over questions + BH-FDR across layers")
-
-    for method, analysis in analyses.items():
-        layers = analysis.get("layers", [])
-        per = analysis.get("per_layer", {})
-
-        print(f"\n{method.upper()} directions ({len(layers)} layers):")
-        print("-" * 90)
-        print(
-            f"{'Layer':>5}  {'Base':>7}  {'BaseCI':>17}  {'Abl':>7}  {'AblCI':>17}  "
-            f"{'Δ':>7}  {'ΔCI':>17}  {'bootFDR':>8}  {'Hurt?':>6}"
-        )
-        print("-" * 90)
-
-        if not layers:
-            print("  (no layers)")
-            continue
-
-        # Sort by Δ (ascending) for readability
-        sorted_layers = sorted(layers, key=lambda l: per[l]["correlation_change"])
-
-        for layer in sorted_layers:
-            d = per[layer]
-            base = d["baseline_correlation"]
-            ablt = d["ablated_correlation"]
-            delta = d["correlation_change"]
-            bci = d["baseline_corr_ci95"]
-            aci = d["ablated_corr_ci95"]
-            dci = d["delta_corr_ci95"]
-            pfdr = d["p_value_bootstrap_fdr"]
-
-            hurt = "YES" if (delta < 0 and pfdr < 0.05) else "no"
-            print(
-                f"{layer:>5}  {base:>+7.4f}  [{bci[0]:>+7.4f},{bci[1]:>+7.4f}]  "
-                f"{ablt:>+7.4f}  [{aci[0]:>+7.4f},{aci[1]:>+7.4f}]  "
-                f"{delta:>+7.4f}  [{dci[0]:>+7.4f},{dci[1]:>+7.4f}]  "
-                f"{pfdr:>8.2g}  {hurt:>6}"
-            )
-
-        # Summary counts
-        n_hurt = sum(
-            1
-            for l in layers
-            if per[l]["correlation_change"] < 0 and per[l]["p_value_bootstrap_fdr"] < 0.05
-        )
-        n_helped = sum(
-            1
-            for l in layers
-            if per[l]["correlation_change"] > 0 and per[l]["p_value_bootstrap_fdr"] < 0.05
-        )
-
-        print("-" * 90)
-        print(f"Summary: {n_hurt} layers where ablation HURT calibration (boot FDR<0.05)")
-        if n_helped > 0:
-            print(f"         {n_helped} layers where ablation HELPED calibration (unexpected)")
-
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    print("=" * 70)
-    print("ABLATION CAUSALITY TEST")
-    print("=" * 70)
-    print(f"\nModel: {MODEL}")
-    print(f"Input: {INPUT_BASE_NAME}")
-    print(f"Direction type: {DIRECTION_TYPE}")
-    desc = DIRECTION_DESCRIPTIONS.get(DIRECTION_TYPE, {})
-    print(f"  Trained on: {desc.get('trained_on', 'unknown')}")
-    if DIRECTION_TYPE == "uncertainty":
-        print(f"  Metric: {METRIC}")
-    print(f"Meta-task: {META_TASK}")
-    print(f"Dependent variable: correlation(stated_confidence, {METRIC})")
-    print(f"Interpretation: {desc.get('interpretation', 'unknown')}")
-    print(f"Questions: {NUM_QUESTIONS}")
-    print(f"Controls: {NUM_CONTROLS} (final), {NUM_CONTROLS_NONFINAL} (non-final)")
-    print(f"Bootstrap: {BOOTSTRAP_N} resamples (CI={int((1-BOOTSTRAP_CI_ALPHA)*100)}%)")
+    # Model directory for organizing outputs
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    base_name = DATASET  # Dataset name (model prefix now in directory)
+
+    # Setup output naming
+    model_short = get_model_short_name(MODEL)
+
+    config = {
+        "model": MODEL.split("/")[-1],
+        "dataset": DATASET,
+        "task": META_TASK,
+        "direction_type": DIRECTION_TYPE,
+    }
+    print_run_header("run_ablation_causality.py", 3, "Ablation necessity test", config)
+
+    # Key findings for console output
+    key_findings = {}
+    output_files = []
 
     # Load directions based on direction type
-    print("\nLoading directions...")
-    print(f"  Direction type: {DIRECTION_TYPE}")
+    print("Loading directions...")
     all_directions = load_directions(
-        INPUT_BASE_NAME,
+        base_name,
         direction_type=DIRECTION_TYPE,
         metric=METRIC,
-        meta_task=META_TASK
+        meta_task=META_TASK,
+        model_dir=model_dir
     )
     available_methods = list(all_directions.keys())
-    print(f"  Found methods: {available_methods}")
 
     # Filter to requested methods (with name mapping for equivalent methods)
     # mean_diff and centroid are conceptually equivalent (difference of class means)
@@ -1786,20 +1695,14 @@ def main():
                 methods.append(m)
             elif m in METHOD_ALIASES and METHOD_ALIASES[m] in available_methods:
                 methods.append(METHOD_ALIASES[m])
-                print(f"  Note: '{m}' not found, using '{METHOD_ALIASES[m]}' instead")
         if not methods:
             raise ValueError(f"No matching methods found. Available: {available_methods}, requested: {METHODS}")
-        print(f"  Using methods: {methods}")
     else:
         methods = available_methods
 
-    for method in methods:
-        layers = sorted(all_directions[method].keys())
-        print(f"  {method}: {len(layers)} layers ({min(layers)}-{max(layers)})")
-
     # Load dataset
-    print("\nLoading dataset...")
-    dataset = load_dataset(INPUT_BASE_NAME)
+    print("Loading dataset...")
+    dataset = load_dataset(base_name, model_dir)
     all_data = dataset["data"]
 
     if USE_TRANSFER_SPLIT:
@@ -1812,57 +1715,25 @@ def main():
         data_items = [all_data[i] for i in test_idx]
         # Keep original indices for trial_index in delegate prompt formatting
         original_indices = test_idx
-        print(f"  Using transfer test split: {len(data_items)} questions (from {n_total} total, seed={SEED})")
     else:
         # Legacy behavior: first NUM_QUESTIONS
         data_items = all_data[:NUM_QUESTIONS]
         # Original indices are just 0..NUM_QUESTIONS-1
         original_indices = np.arange(len(data_items))
-        print(f"  Using first {len(data_items)} questions (legacy mode)")
 
     # Extract questions (each item has question, options, correct_answer, etc.)
     questions = data_items
     # Extract metric values from each item
     metric_values = np.array([item[METRIC] for item in data_items])
-    print(f"  Questions: {len(questions)}")
-    print(f"  {METRIC}: mean={metric_values.mean():.3f}, std={metric_values.std():.3f}")
 
     # Load transfer results for layer selection (non-final positions)
-    transfer_data = load_transfer_results(INPUT_BASE_NAME, META_TASK)
-    if transfer_data is not None:
-        print(f"\nLoaded transfer results for layer selection")
-        # Preview what layers would be selected FOR EACH (POSITION, METHOD) combination
-        for pos in PROBE_POSITIONS:
-            if pos == "final":
-                print(f"  {pos}: all layers (no R² filter)")
-            else:
-                for method in methods:
-                    pos_layers = get_layers_from_transfer(transfer_data, METRIC, pos, TRANSFER_R2_THRESHOLD, method)
-                    if pos_layers:
-                        print(f"  {pos}/{method}: {len(pos_layers)} layers with {METRIC} R²≥{TRANSFER_R2_THRESHOLD}: {pos_layers}")
-                    else:
-                        # Try fallback to final
-                        fallback_layers = get_layers_from_transfer(transfer_data, METRIC, "final", TRANSFER_R2_THRESHOLD, method)
-                        if fallback_layers:
-                            print(f"  {pos}/{method}: no position-specific data, using final: {len(fallback_layers)} layers")
-                        else:
-                            print(f"  {pos}/{method}: WARNING - no layers found, will use ALL layers")
-    else:
-        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_results.json"
-        print(f"\nNo transfer results found - will use all layers for all positions")
-        print(f"  Expected: {expected_path}")
+    transfer_data = load_transfer_results(base_name, META_TASK, model_dir)
 
     # Determine base layers (all available)
     all_available_layers = sorted(all_directions[methods[0]].keys())
 
-    # Layer selection depends on position - will be set per-position below
-    if LAYERS is not None:
-        print(f"\nExplicit LAYERS override: {len(LAYERS)} layers")
-    else:
-        print(f"\nLayer selection: all layers for final, R²≥{TRANSFER_R2_THRESHOLD} for non-final")
-
     # Load model
-    print("\nLoading model...")
+    print("Loading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
         MODEL,
         adapter_path=ADAPTER,
@@ -1870,8 +1741,6 @@ def main():
         load_in_8bit=LOAD_IN_8BIT,
     )
     use_chat_template = should_use_chat_template(MODEL, tokenizer)
-    print(f"  Use chat template: {use_chat_template}")
-    print(f"  Device: {DEVICE}")
 
     # Run ablation for each method and position
     # Structure: {position: {method: analysis}}
@@ -1879,17 +1748,11 @@ def main():
     all_analyses_by_pos = {pos: {} for pos in PROBE_POSITIONS}
 
     for position in PROBE_POSITIONS:
-        print(f"\n{'='*70}")
-        print(f"POSITION: {position}")
-        print(f"{'='*70}")
-
         # Determine number of controls for this position
         position_num_controls = NUM_CONTROLS if position == "final" else NUM_CONTROLS_NONFINAL
 
         for method in methods:
-            print(f"\n{'='*60}")
-            print(f"ABLATION EXPERIMENT: {method.upper()} @ {position}")
-            print(f"{'='*60}")
+            print(f"Running ablation: {method} @ {position}...")
 
             # Determine layers for this position AND method
             if LAYERS is not None:
@@ -1913,19 +1776,8 @@ def main():
                     method_layers = all_available_layers
 
                 if not method_layers:
-                    print("\n" + "!"*70)
-                    print("!!! WARNING: FALLING BACK TO ALL LAYERS !!!")
-                    print(f"!!! No layers meet R²≥{TRANSFER_R2_THRESHOLD} threshold for {method}/{METRIC}")
-                    print(f"!!! This will test {len(all_available_layers)} layers instead of ~50")
-                    print(f"!!! Check that METRIC and method match transfer results")
-                    print("!"*70)
-                    print("Continuing in 3 seconds (Ctrl+C to abort)...")
-                    import time
-                    time.sleep(3)
+                    print(f"  Warning: No layers meet R²≥{TRANSFER_R2_THRESHOLD} for {method}/{METRIC}, using all {len(all_available_layers)} layers")
                     method_layers = all_available_layers
-
-            print(f"  Layers: {len(method_layers)} (range {min(method_layers)}-{max(method_layers)})")
-            print(f"  Controls: {position_num_controls}")
 
             results = run_ablation_for_method(
                 model=model,
@@ -1942,42 +1794,27 @@ def main():
             )
             all_results_by_pos[position][method] = results
 
-            # Report signal distributions
-            _report_signal_distributions(results, META_TASK)
-
             # Analyze results
-            print(f"\n  Analyzing results...")
-            analysis = analyze_ablation_results(results, METRIC)
+            analysis = analyze_ablation_results(results, METRIC, base_name)
             all_analyses_by_pos[position][method] = analysis
 
-            summary = analysis["summary"]
-            print(f"  Significant layers (bootstrap FDR): {summary.get('n_significant_bootstrap_fdr', 0)}")
-            print(f"  Best |Δcorr| layer: {summary.get('best_layer_abs_delta')} (Δ={summary.get('best_abs_delta', 0.0):+.3f})")
-
         # Incremental save after each position completes (crash protection) - one per method
-        model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-        # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-        dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-        # Include direction type in output name to distinguish different ablation experiments
+        # Include direction type to distinguish uncertainty/answer/confidence/metamcuncert
         dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-        # Build position suffix
-        pos_suffix = "_".join(PROBE_POSITIONS)
 
         for method in methods:
-            if ADAPTER:
-                adapter_short = get_model_short_name(ADAPTER)
-                base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-            else:
-                base_output = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-            checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
+            checkpoint_base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}"
+            checkpoint_path = get_output_path(f"{checkpoint_base}_checkpoint.json", model_dir=model_dir, working=True)
 
             checkpoint_json = {
                 "config": get_config_dict(
                     model=MODEL,
-                    input_base_name=INPUT_BASE_NAME,
+                    dataset=base_name,
+                    model_dir=model_dir,
                     direction_type=DIRECTION_TYPE,
                     metric=METRIC,
                     meta_task=META_TASK,
+                    confidence_signal=CONFIDENCE_SIGNAL,
                     num_questions=len(questions),
                     use_transfer_split=USE_TRANSFER_SPLIT,
                     seed=SEED,
@@ -1997,23 +1834,14 @@ def main():
                     }
             with open(checkpoint_path, "w") as f:
                 json.dump(checkpoint_json, f, indent=2)
-            print(f"  Checkpoint saved: {checkpoint_path.name}")
 
-    # Generate output filename (include DIRECTION_TYPE for clarity)
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
+    # Generate output filename
+    # Include direction type to distinguish uncertainty/answer/confidence/metamcuncert
     dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-    # Build position suffix for filename
-    pos_suffix = "_".join(PROBE_POSITIONS)
 
     def get_base_output(method: str) -> str:
-        """Get base output path for a specific method."""
-        if ADAPTER:
-            adapter_short = get_model_short_name(ADAPTER)
-            base = f"{model_short}_adapter-{adapter_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-        else:
-            base = f"{model_short}_{dataset_name}_ablation_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+        """Get base output path for a specific method (without position - added per file)."""
+        base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}"
         # Add confidence signal to filename when non-default (for delegate task)
         if META_TASK == "delegate" and CONFIDENCE_SIGNAL != "prob":
             base += f"_{CONFIDENCE_SIGNAL}"
@@ -2021,18 +1849,19 @@ def main():
 
     # Save JSON results - one file per method
     print("\nSaving results...")
-    saved_files = []
     for method in methods:
-        base_output = get_base_output(method)
-        results_path = OUTPUT_DIR / f"{base_output}_results.json"
+        method_base_output = get_base_output(method)
+        results_path = get_output_path(f"{method_base_output}_results.json", model_dir=model_dir)
 
         output_json = {
             "config": get_config_dict(
                 model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
+                dataset=base_name,
+                model_dir=model_dir,
                 direction_type=DIRECTION_TYPE,
                 metric=METRIC,
                 meta_task=META_TASK,
+                confidence_signal=CONFIDENCE_SIGNAL,
                 num_questions=len(questions),
                 use_transfer_split=USE_TRANSFER_SPLIT,
                 seed=SEED,
@@ -2072,28 +1901,32 @@ def main():
         with open(results_path, "w") as f:
             json.dump(output_json, f, indent=2)
         print(f"  Saved {results_path.name}")
-        saved_files.append(results_path.name)
+        output_files.append(results_path)
 
     # Generate plots - one per method per position
     print("\nGenerating plots...")
     for method in methods:
-        base_output = get_base_output(method)
+        method_base_output = get_base_output(method)
         for position in PROBE_POSITIONS:
-            plot_path = OUTPUT_DIR / f"{base_output}_{position}.png"
+            plot_path = get_output_path(f"{method_base_output}_{position}.png", model_dir=model_dir)
             plot_ablation_results(all_analyses_by_pos[position][method], method, plot_path)
-            saved_files.append(plot_path.name)
+            output_files.append(plot_path)
 
-    # Print summary for each position
+    # Collect key findings
     for position in PROBE_POSITIONS:
-        print(f"\n--- Position: {position} ---")
-        print_summary(all_analyses_by_pos[position])
+        for method in methods:
+            if method in all_analyses_by_pos[position]:
+                analysis = all_analyses_by_pos[position][method]
+                summary = analysis.get("summary", {})
+                n_sig = summary.get("n_significant_bootstrap_fdr", 0)
+                total = len(analysis.get("layers", []))
+                best_layer = summary.get("best_layer_abs_delta")
+                if n_sig > 0:
+                    key_findings[f"{position}/{method}"] = f"{n_sig}/{total} sig, best L{best_layer}"
 
-    print("\n" + "=" * 70)
-    print("DONE")
-    print("=" * 70)
-    print(f"\nOutput files:")
-    for f in saved_files:
-        print(f"  {f}")
+    # Console output
+    print_key_findings(key_findings)
+    print_run_footer(output_files)
 
 
 if __name__ == "__main__":

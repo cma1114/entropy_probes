@@ -5,12 +5,16 @@ which layers pass all causal tests for a given metric, identifying layers with
 consistent causal involvement.
 
 Inputs:
-    outputs/{base}_ablation_{task}_{metric}_results.json    Ablation results per task
-    outputs/{base}_steering_{task}_{metric}_results.json    Steering results per task
+    outputs/{model_dir}/results/{dataset}_ablation_{task}_{metric}_results.json
+    outputs/{model_dir}/results/{dataset}_steering_{task}_{metric}_results.json
+
+    where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    e.g., "Llama-3.3-70B-Instruct" or "Llama-3.3-70B-Instruct_4bit"
 
 Outputs:
-    outputs/{base}_causal_synthesis.json    Per-layer pass/fail and intersection analysis
-    outputs/{base}_causal_synthesis.png     Layer x test pass/fail visualization
+    outputs/{model_dir}/results/{dataset}_causal_synthesis_{metric}_{method}.json
+    outputs/{model_dir}/results/{dataset}_causal_synthesis_{metric}_{method}.png
+    outputs/{model_dir}/results/{dataset}_causal_synthesis_{metric}_{method}_summary.txt
 
 Run after: run_ablation_causality.py, run_steering_causality.py
 """
@@ -22,30 +26,38 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.model_utils import get_model_dir_name
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-MODEL_PREFIX = "Llama-3.3-70B-Instruct"
+# --- Model & Data ---
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+ADAPTER = None  # Optional: path to PEFT/LoRA adapter
 DATASET = "TriviaMC"
+
+# --- Quantization ---
+LOAD_IN_4BIT = False  # Set True for 70B+ models
+LOAD_IN_8BIT = False
 METRIC = "top_logit"  # Which metric's directions to analyze
 METHOD = "mean_diff"  # Which direction method to analyze
 P_THRESHOLD = 0.05    # Significance threshold for all tests
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
 
 def load_causal_test_results(
-    model_prefix: str,
     dataset: str,
     metric: str,
     method: str,
+    model_dir: str = None,
 ) -> Dict[str, Dict]:
     """
     Load all 4 causal test result files and extract per-layer data.
@@ -59,17 +71,17 @@ def load_causal_test_results(
         }
     """
     tests = {
-        "ablation_confidence": f"{model_prefix}_{dataset}_ablation_confidence_{metric}_results.json",
-        "ablation_delegate": f"{model_prefix}_{dataset}_ablation_delegate_{metric}_results.json",
-        "steering_confidence": f"{model_prefix}_{dataset}_steering_confidence_{metric}_results.json",
-        "steering_delegate": f"{model_prefix}_{dataset}_steering_delegate_{metric}_results.json",
+        "ablation_confidence": f"{dataset}_ablation_confidence_{metric}_results.json",
+        "ablation_delegate": f"{dataset}_ablation_delegate_{metric}_results.json",
+        "steering_confidence": f"{dataset}_steering_confidence_{metric}_results.json",
+        "steering_delegate": f"{dataset}_steering_delegate_{metric}_results.json",
     }
 
     results = {}
     files_loaded = {}
 
     for test_name, filename in tests.items():
-        filepath = OUTPUT_DIR / filename
+        filepath = find_output_file(filename, model_dir=model_dir)
         if not filepath.exists():
             raise FileNotFoundError(f"Missing required file: {filepath}")
 
@@ -98,9 +110,9 @@ def load_causal_test_results(
 
 
 def load_transfer_results(
-    model_prefix: str,
     dataset: str,
     metric: str,
+    model_dir: str = None,
 ) -> Optional[Dict[str, Dict]]:
     """
     Load transfer results for context (R² values).
@@ -113,9 +125,9 @@ def load_transfer_results(
     """
     transfer_results = {}
 
-    for task in ["confidence", "delegate"]:
-        filename = f"{model_prefix}_{dataset}_meta_{task}_results.json"
-        filepath = OUTPUT_DIR / filename
+    for task in ["confidence", "delegate", "other_confidence"]:
+        filename = f"{dataset}_meta_{task}_transfer_results_{PROBE_POSITION}.json"
+        filepath = find_output_file(filename, model_dir=model_dir)
 
         if not filepath.exists():
             print(f"  Warning: Transfer file not found: {filepath}")
@@ -134,9 +146,10 @@ def load_transfer_results(
 
         for layer_str, layer_data in per_layer.items():
             layer = int(layer_str)
-            # Use d2m_separate_r2 as the primary transfer metric
+            # Use separate_r2 (current) or d2m_separate_r2 (legacy) as the primary transfer metric
+            r2 = layer_data.get("separate_r2") or layer_data.get("d2m_separate_r2") or layer_data.get("centered_r2") or layer_data.get("d2m_centered_r2")
             transfer_results[task][layer] = {
-                "d2m_r2": layer_data.get("d2m_separate_r2", layer_data.get("d2m_centered_r2")),
+                "d2m_r2": r2,
             }
 
     return transfer_results if transfer_results else None
@@ -352,10 +365,11 @@ LAYERS PASSING ALL 4 TESTS:
 
             # Add transfer R² if available
             if transfer_results:
-                for task in ["confidence", "delegate"]:
+                for task in ["confidence", "delegate", "other_confidence"]:
                     if task in transfer_results and layer in transfer_results[task]:
                         r2 = transfer_results[task][layer]["d2m_r2"]
-                        detail_text += f"  Transfer {task[:4]:4s}:  R²={r2:.3f}\n"
+                        label = task[:4] if task != "other_confidence" else "othr"
+                        detail_text += f"  Transfer {label:4s}:  R²={r2:.3f}\n"
             detail_text += "\n"
     else:
         detail_text = "NO MID-LAYERS PASS ALL 4 TESTS\n\n"
@@ -437,10 +451,10 @@ def write_summary(
                 lines.append(f"  {test:25s}: p={p:.6f}, Z={z:+.3f}")
 
             if transfer_results:
-                for task in ["confidence", "delegate"]:
+                for task in ["confidence", "delegate", "other_confidence"]:
                     if task in transfer_results and layer in transfer_results[task]:
                         r2 = transfer_results[task][layer]["d2m_r2"]
-                        lines.append(f"  transfer_{task:10s} R²:       {r2:.4f}")
+                        lines.append(f"  transfer_{task:16s} R²: {r2:.4f}")
     else:
         lines.append("NO MID-LAYERS PASS ALL 4 TESTS")
         lines.append("")
@@ -463,9 +477,14 @@ def write_summary(
 # =============================================================================
 
 def main():
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     print("=" * 60)
     print("CAUSAL TEST SYNTHESIS")
     print("=" * 60)
+    print(f"Model: {MODEL}")
+    print(f"Model dir: {model_dir}")
+    print(f"Dataset: {DATASET}")
     print(f"Metric: {METRIC}")
     print(f"Method: {METHOD}")
     print(f"Threshold: p < {P_THRESHOLD}")
@@ -475,7 +494,7 @@ def main():
     print("Loading causal test results...")
     try:
         results, files_loaded = load_causal_test_results(
-            MODEL_PREFIX, DATASET, METRIC, METHOD
+            DATASET, METRIC, METHOD, model_dir=model_dir
         )
         for test_name, filepath in files_loaded.items():
             print(f"  {test_name}: {filepath}")
@@ -485,7 +504,7 @@ def main():
 
     # Load transfer results (optional)
     print("\nLoading transfer results (for context)...")
-    transfer_results = load_transfer_results(MODEL_PREFIX, DATASET, METRIC)
+    transfer_results = load_transfer_results(DATASET, METRIC, model_dir=model_dir)
 
     # Compute layer status
     print("\nAnalyzing layer status...")
@@ -500,13 +519,16 @@ def main():
     print(f"  Mid-layers (>10) passing all 4: {mid_passing if mid_passing else 'None'}")
 
     # Generate outputs
-    base_output = f"{MODEL_PREFIX}_{DATASET}_causal_synthesis_{METRIC}_{METHOD}"
+    base_output = f"{DATASET}_causal_synthesis_{METRIC}_{METHOD}"
 
     # JSON output
-    json_path = OUTPUT_DIR / f"{base_output}.json"
+    json_path = get_output_path(f"{base_output}.json", model_dir=model_dir)
     output_json = {
         "config": get_config_dict(
-            model_prefix=MODEL_PREFIX,
+            model=MODEL,
+            adapter=ADAPTER,
+            load_in_4bit=LOAD_IN_4BIT,
+            load_in_8bit=LOAD_IN_8BIT,
             dataset=DATASET,
             metric=METRIC,
             method=METHOD,
@@ -524,14 +546,14 @@ def main():
     print(f"\n  Saved: {json_path}")
 
     # Visualization
-    plot_path = OUTPUT_DIR / f"{base_output}.png"
+    plot_path = get_output_path(f"{base_output}.png", model_dir=model_dir)
     plot_synthesis_results(
         layer_status, transfer_results, plot_path,
         METRIC, METHOD, P_THRESHOLD
     )
 
     # Text summary
-    summary_path = OUTPUT_DIR / f"{base_output}_summary.txt"
+    summary_path = get_output_path(f"{base_output}_summary.txt", model_dir=model_dir)
     write_summary(
         layer_status, transfer_results, files_loaded, summary_path,
         METRIC, METHOD, P_THRESHOLD

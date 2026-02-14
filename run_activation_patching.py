@@ -10,7 +10,7 @@ toward target's. This is more robust than steering to non-linear encodings:
 if uncertainty is encoded categorically, steering won't work but patching will.
 
 Inputs:
-    outputs/{base}_mc_dataset.json                   MC dataset with scored questions
+    outputs/{base}_mc_results.json                    Consolidated results (dataset + metrics)
 
 Outputs:
     outputs/{base}_activation_patching_results.json   Per-layer patching effect sizes
@@ -42,10 +42,16 @@ import random
 from core.model_utils import (
     load_model_and_tokenizer,
     should_use_chat_template,
-    get_model_short_name,
+    get_model_dir_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.logging_utils import (
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+)
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 from core.steering import (
     BatchPatchingHook,
@@ -73,8 +79,8 @@ from tasks import (
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Set to adapter path if using fine-tuned model
-DATASET_NAME = "SimpleMC"
-META_TASK = "confidence"  # "confidence" or "delegate"
+DATASET = "SimpleMC"  # Dataset name (model prefix now in directory)
+META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
 METRIC = "logit_gap"  # Metric for selecting pairs
 AVAILABLE_METRICS = ["entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
@@ -91,8 +97,7 @@ PATCHING_LAYERS = None       # None = auto-select based on probe transfer
 INTERVENTION_POSITION = "final"  # "final", "question_mark", "question_newline", "options_newline"
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -100,8 +105,9 @@ random.seed(SEED)
 
 # Option tokens (cached at startup)
 META_OPTIONS = list(STATED_CONFIDENCE_OPTIONS.keys())
+OTHER_META_OPTIONS = list(OTHER_CONFIDENCE_OPTIONS.keys())
 DELEGATE_OPTIONS = ANSWER_OR_DELEGATE_OPTIONS
-_CACHED_TOKEN_IDS = {"meta_options": None, "delegate_options": None}
+_CACHED_TOKEN_IDS = {"meta_options": None, "other_meta_options": None, "delegate_options": None}
 
 
 def initialize_token_cache(tokenizer):
@@ -109,19 +115,23 @@ def initialize_token_cache(tokenizer):
     _CACHED_TOKEN_IDS["meta_options"] = [
         tokenizer.encode(opt, add_special_tokens=False)[0] for opt in META_OPTIONS
     ]
+    _CACHED_TOKEN_IDS["other_meta_options"] = [
+        tokenizer.encode(opt, add_special_tokens=False)[0] for opt in OTHER_META_OPTIONS
+    ]
     _CACHED_TOKEN_IDS["delegate_options"] = [
         tokenizer.encode(opt, add_special_tokens=False)[0] for opt in DELEGATE_OPTIONS
     ]
 
 
 def get_output_prefix() -> str:
-    """Generate output filename prefix."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    task_suffix = "_delegate" if META_TASK == "delegate" else ""
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}_{DATASET_NAME}_patching{task_suffix}")
-    return str(OUTPUT_DIR / f"{model_short}_{DATASET_NAME}_patching{task_suffix}")
+    """Generate output filename prefix (without directory)."""
+    if META_TASK == "delegate":
+        task_suffix = "_delegate"
+    elif META_TASK == "other_confidence":
+        task_suffix = "_other_confidence"
+    else:
+        task_suffix = ""
+    return f"{DATASET}_patching{task_suffix}"
 
 
 # =============================================================================
@@ -258,6 +268,9 @@ def format_meta_prompt_for_question(
             question, tokenizer, use_chat_template, trial_idx
         )
         return prompt, options, mapping
+    elif META_TASK == "other_confidence":
+        prompt, options = format_other_confidence_prompt(question, tokenizer, use_chat_template)
+        return prompt, options, None
     else:
         prompt, options = format_stated_confidence_prompt(question, tokenizer, use_chat_template)
         return prompt, options, None
@@ -274,6 +287,8 @@ def compute_confidence_from_logits(
 
     if META_TASK == "delegate":
         options = DELEGATE_OPTIONS
+    elif META_TASK == "other_confidence":
+        options = OTHER_META_OPTIONS
     else:
         options = META_OPTIONS
 
@@ -339,6 +354,8 @@ def run_patching_experiment(
     # Get option token IDs
     if META_TASK == "delegate":
         option_token_ids = _CACHED_TOKEN_IDS["delegate_options"]
+    elif META_TASK == "other_confidence":
+        option_token_ids = _CACHED_TOKEN_IDS["other_meta_options"]
     else:
         option_token_ids = _CACHED_TOKEN_IDS["meta_options"]
 
@@ -1492,6 +1509,9 @@ All Layers Summary:
 def main():
     global METRIC
 
+    # Get model directory for centralized path management
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     parser = argparse.ArgumentParser(description="Run activation patching experiments")
     parser.add_argument("--metric", type=str, default=METRIC, choices=AVAILABLE_METRICS,
                         help=f"Metric for pair selection (default: {METRIC})")
@@ -1518,13 +1538,15 @@ def main():
 
     # Paths for input data
     # We load from run_introspection_experiment.py outputs
-    introspection_prefix = str(OUTPUT_DIR / f"{get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)}_{DATASET_NAME}_introspection")
+    introspection_prefix = f"{DATASET}_introspection"
     if META_TASK == "delegate":
         introspection_prefix += "_delegate"
+    elif META_TASK == "other_confidence":
+        introspection_prefix += "_other_confidence"
 
-    paired_data_path = f"{introspection_prefix}_paired_data.json"
-    direct_activations_path = f"{introspection_prefix}_direct_activations.npz"
-    probe_results_path = f"{introspection_prefix}_{METRIC}_results.json"
+    paired_data_path = find_output_file(f"{introspection_prefix}_paired_data.json", model_dir=model_dir)
+    direct_activations_path = find_output_file(f"{introspection_prefix}_direct_activations.npz", model_dir=model_dir)
+    probe_results_path = find_output_file(f"{introspection_prefix}_{METRIC}_results.json", model_dir=model_dir)
 
     # Load paired data
     print(f"\nLoading paired data from {paired_data_path}...")
@@ -1633,7 +1655,7 @@ def main():
         results["config"] = get_config_dict(
             model=MODEL,
             adapter=ADAPTER,
-            dataset=DATASET_NAME,
+            dataset=DATASET,
             meta_task=META_TASK,
             metric=METRIC,
             seed=SEED,
@@ -1648,7 +1670,7 @@ def main():
         all_results[direction] = results
 
         # Save individual results
-        results_path = f"{output_prefix}_{METRIC}_patching_{direction}_results.json"
+        results_path = get_output_path(f"{output_prefix}_{METRIC}_patching_{direction}_results.json", model_dir=model_dir)
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2, default=json_serializer)
         print(f"\nSaved results to {results_path}")
@@ -1658,7 +1680,7 @@ def main():
         analysis["direction"] = direction
         all_analyses[direction] = analysis
 
-        analysis_path = f"{output_prefix}_{METRIC}_patching_{direction}_analysis.json"
+        analysis_path = get_output_path(f"{output_prefix}_{METRIC}_patching_{direction}_analysis.json", model_dir=model_dir)
         with open(analysis_path, "w") as f:
             json.dump(analysis, f, indent=2)
         print(f"Saved analysis to {analysis_path}")
@@ -1667,7 +1689,7 @@ def main():
     print_bidirectional_summary(all_analyses)
 
     # Plot combined results
-    plot_path = f"{output_prefix}_{METRIC}_patching_bidirectional.png"
+    plot_path = get_output_path(f"{output_prefix}_{METRIC}_patching_bidirectional.png", model_dir=model_dir)
     plot_bidirectional_results(all_analyses, all_results, plot_path)
 
     print("\n✓ Activation patching experiment complete!")
@@ -1826,7 +1848,7 @@ def main():
                 "config": get_config_dict(
                     model=MODEL,
                     adapter=ADAPTER,
-                    dataset=DATASET_NAME,
+                    dataset=DATASET,
                     meta_task=META_TASK,
                     metric=METRIC,
                     seed=SEED,

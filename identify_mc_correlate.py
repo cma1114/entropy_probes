@@ -9,18 +9,18 @@ Inputs:
     data/{dataset}_difficulty_filtered.jsonl            (alternative) Filtered MC questions
 
 Outputs:
-    outputs/{base}_mc_activations.npz                  Cached activations + metrics
-    outputs/{base}_mc_dataset.json                     Question metadata + metric values
-    outputs/{base}_mc_{metric}_directions.npz          Direction vectors per metric
-    outputs/{base}_mc_{metric}_probes.joblib           Trained probe objects per metric
-    outputs/{base}_mc_{metric}_results.json            Per-layer R², CIs, statistics
-    outputs/{base}_mc_answer_directions.npz            Answer directions (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_answer_probes.joblib             Answer probe objects (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_answer_results.json              Answer accuracy (if FIND_ANSWER_DIRECTIONS)
-    outputs/{base}_mc_distributions.png                Metric distributions (one row per metric)
-    outputs/{base}_mc_directions.png                   4-panel directions summary
+    outputs/{model_dir}/results/{dataset}_mc_results.json              Consolidated results
+    outputs/{model_dir}/results/{dataset}_mc_distributions.png         Metric distributions
+    outputs/{model_dir}/results/{dataset}_mc_directions.png            4-panel summary
+    outputs/{model_dir}/working/{dataset}_mc_activations.npz           Cached activations
+    outputs/{model_dir}/working/{dataset}_mc_{metric}_directions.npz   Direction vectors
+    outputs/{model_dir}/working/{dataset}_mc_{metric}_probes.joblib    Trained probes
+    outputs/{model_dir}/working/{dataset}_mc_answer_directions.npz     Answer directions
+    outputs/{model_dir}/working/{dataset}_mc_answer_probes.joblib      Answer probes
+    outputs/{model_dir}/working/{dataset}_mc_run.log                   Detailed log
 
-    where {base} = {model_short_name}_{dataset}
+    where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    e.g., "Llama-3.1-8B-Instruct" or "Llama-3.1-8B-Instruct_4bit_adapter-lora"
 
 Shared parameters (must match across scripts):
     SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
@@ -41,14 +41,21 @@ from sklearn.model_selection import train_test_split
 from core import (
     load_model_and_tokenizer,
     get_model_short_name,
+    get_model_dir_name,
     should_use_chat_template,
     BatchedExtractor,
     compute_mc_metrics,
     find_directions,
     METRIC_INFO,
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+    format_r2_with_ci,
+    format_best_layer,
 )
 from core.directions import probe_direction  # For saving probe objects
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
 from core.plotting import plot_metric_distributions, plot_directions_summary
 from core.questions import load_questions
 from core.answer_directions import (
@@ -88,46 +95,7 @@ FIND_ANSWER_DIRECTIONS = True   # Find answer (A/B/C/D) directions from MC activ
 ANSWER_PCA_COMPONENTS = 256     # More components for 4-class classification
 
 # --- Output ---
-OUTPUT_DIR = Path(__file__).parent / "outputs"
-
-# =============================================================================
-# DIAGNOSTIC PRINTING
-# =============================================================================
-
-
-def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: int):
-    """Print diagnostic summary."""
-    print("\n" + "=" * 80)
-    print("DIAGNOSTIC SUMMARY")
-    print("=" * 80)
-
-    # Distribution stats for each metric
-    for metric_name, values in metrics_dict.items():
-        variance = values.var()
-        iqr = np.percentile(values, 75) - np.percentile(values, 25)
-        print(f"\n{metric_name.upper()} Distribution:")
-        print(f"  Mean: {values.mean():.3f}, Std: {values.std():.3f}, Variance: {variance:.4f}")
-        print(f"  Median: {np.median(values):.3f}, IQR: {iqr:.3f}")
-        print(f"  Range: [{values.min():.3f}, {values.max():.3f}]")
-
-    # Early vs late layer comparison
-    print(f"\nLayer R² Comparison (early vs late):")
-    for metric_name, results in all_results.items():
-        layers = sorted(results["fits"]["probe"].keys())
-        n_layers = len(layers)
-        early_layers = layers[:n_layers // 4]
-        late_layers = layers[3 * n_layers // 4:]
-
-        for method in ["probe", "mean_diff"]:
-            fits = results["fits"][method]
-            early_r2 = np.mean([fits[l]["r2"] for l in early_layers])
-            late_r2 = np.mean([fits[l]["r2"] for l in late_layers])
-            r2_increase = late_r2 - early_r2
-
-            print(f"  {metric_name}/{method:<10}: early={early_r2:.3f}, late={late_r2:.3f}, Δ={r2_increase:+.3f}")
-
-    print("=" * 80)
-
+# Paths are constructed via get_output_path() which routes to outputs/results/ or outputs/working/
 
 # =============================================================================
 # MAIN
@@ -135,27 +103,38 @@ def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: 
 
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    # Model directory for organizing outputs
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    base_name = DATASET  # Model prefix now in directory, not filename
 
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_name = f"{model_short}_adapter-{adapter_short}_{DATASET}"
-    else:
-        base_name = f"{model_short}_{DATASET}"
+    # Setup logging
+    logger = setup_run_logger(None, base_name, "mc", model_dir=model_dir)
+    config = {
+        "model": MODEL,
+        "dataset": DATASET,
+        "metrics": METRICS,
+    }
+    print_run_header("identify_mc_correlate.py", 1, "Find MC uncertainty directions", config)
 
-    print(f"Model: {MODEL}")
-    if ADAPTER:
-        print(f"Adapter: {ADAPTER}")
-    print(f"Dataset: {DATASET}")
-    print(f"Metrics: {METRICS}")
-    print(f"Questions: {NUM_QUESTIONS}")
-    print(f"Bootstrap iterations: {N_BOOTSTRAP}")
-    print(f"Output base: {base_name}")
-    print()
+    # Log full config to file
+    logger.section("Configuration")
+    logger.dict({
+        "model": MODEL,
+        "adapter": ADAPTER,
+        "dataset": DATASET,
+        "metrics": METRICS,
+        "num_questions": NUM_QUESTIONS,
+        "seed": SEED,
+        "batch_size": BATCH_SIZE,
+        "n_bootstrap": N_BOOTSTRAP,
+        "probe_alpha": PROBE_ALPHA,
+        "probe_pca_components": PROBE_PCA_COMPONENTS,
+        "train_split": TRAIN_SPLIT,
+        "mean_diff_quantile": MEAN_DIFF_QUANTILE,
+        "find_answer_directions": FIND_ANSWER_DIRECTIONS,
+    })
 
     # Load model
-    print("Loading model...")
     model, tokenizer, num_layers = load_model_and_tokenizer(
         MODEL,
         adapter_path=ADAPTER,
@@ -163,13 +142,11 @@ def main():
         load_in_8bit=LOAD_IN_8BIT,
     )
     use_chat_template = should_use_chat_template(MODEL, tokenizer)
-    print(f"  Layers: {num_layers}")
-    print(f"  Chat template: {use_chat_template}")
+    logger.info(f"Model loaded: {num_layers} layers, chat_template={use_chat_template}")
 
     # Load questions
-    print(f"\nLoading questions from {DATASET}...")
     questions = load_questions(DATASET, num_questions=NUM_QUESTIONS, seed=SEED)
-    print(f"  Loaded {len(questions)} questions")
+    logger.info(f"Loaded {len(questions)} questions")
 
     random.seed(SEED)
     random.shuffle(questions)
@@ -177,10 +154,7 @@ def main():
     # Get option token IDs
     option_keys = list(questions[0]["options"].keys())
     option_token_ids = [tokenizer.encode(k, add_special_tokens=False)[0] for k in option_keys]
-    print(f"  Option tokens: {dict(zip(option_keys, option_token_ids))}")
-
-    # Extract activations and probabilities
-    print(f"\nExtracting activations (batch_size={BATCH_SIZE})...")
+    logger.info(f"Option tokens: {dict(zip(option_keys, option_token_ids))}")
 
     all_activations = {layer: [] for layer in range(num_layers)}
     all_probs = []
@@ -219,14 +193,12 @@ def main():
                 all_predicted.append(option_keys[np.argmax(p)])
 
     # Stack activations
-    print("\nStacking activations...")
     activations_by_layer = {
         layer: np.stack(acts) for layer, acts in all_activations.items()
     }
-    print(f"  Shape per layer: {activations_by_layer[0].shape}")
+    logger.info(f"Activation shape per layer: {activations_by_layer[0].shape}")
 
     # Compute ALL metrics (not just requested ones, for dataset file)
-    print("\nComputing all metrics...")
     all_probs_arr = np.array(all_probs)
     all_logits_arr = np.array(all_logits)
     all_metrics = compute_mc_metrics(all_probs_arr, all_logits_arr, metrics=None)  # All metrics
@@ -255,7 +227,6 @@ def main():
         metadata.append(item)
 
     accuracy = correct_count / len(questions)
-    print(f"\nMC ACCURACY: {correct_count}/{len(questions)} correct ({accuracy:.1%})")
 
     # Per-position accuracy breakdown
     position_correct = {}
@@ -265,71 +236,74 @@ def main():
         position_total[ans] = position_total.get(ans, 0) + 1
         if item["is_correct"]:
             position_correct[ans] = position_correct.get(ans, 0) + 1
-    per_pos_strs = []
+
+    # Log accuracy details
+    logger.section("MC Accuracy")
+    logger.info(f"Overall: {correct_count}/{len(questions)} ({accuracy:.1%})")
     for pos in sorted(position_total.keys()):
         pos_acc = position_correct.get(pos, 0) / position_total[pos]
-        per_pos_strs.append(f"{pos}={pos_acc:.0%}")
-    print(f"  Per-position: {', '.join(per_pos_strs)}")
+        logger.info(f"  Position {pos}: {pos_acc:.1%}")
 
-    print(f"\nMETRIC DISTRIBUTIONS:")
+    # Log metric distributions
+    logger.section("Metric Distributions")
     for metric, values in all_metrics.items():
-        print(f"  {metric}: mean={values.mean():.3f}, std={values.std():.3f}, "
-              f"range=[{values.min():.3f}, {values.max():.3f}]")
+        logger.info(f"{metric}: mean={values.mean():.3f}, std={values.std():.3f}, "
+                   f"range=[{values.min():.3f}, {values.max():.3f}]")
 
-    # Save activations file
-    activations_path = OUTPUT_DIR / f"{base_name}_mc_activations.npz"
-    print(f"\nSaving activations to {activations_path}...")
+    # Save activations file (binary cache - not consolidated)
+    activations_path = get_output_path(f"{base_name}_mc_activations.npz", model_dir=model_dir)
     act_save = {f"layer_{i}": activations_by_layer[i] for i in range(num_layers)}
     for m_name, m_values in all_metrics.items():
         act_save[m_name] = m_values
     np.savez_compressed(activations_path, **act_save)
 
-    # Save dataset JSON
-    dataset_path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
-    print(f"Saving dataset to {dataset_path}...")
-    dataset_json = {
+    # Build consolidated results JSON (will be saved at the end)
+    consolidated_results = {
+        "format_version": 2,
         "config": get_config_dict(
             model=MODEL,
             adapter=ADAPTER,
             dataset=DATASET,
             num_questions=len(questions),
             seed=SEED,
+            train_split=TRAIN_SPLIT,
+            probe_alpha=PROBE_ALPHA,
+            pca_components=PROBE_PCA_COMPONENTS,
+            n_bootstrap=N_BOOTSTRAP,
+            mean_diff_quantile=MEAN_DIFF_QUANTILE,
+            find_answer_directions=FIND_ANSWER_DIRECTIONS,
             load_in_4bit=LOAD_IN_4BIT,
             load_in_8bit=LOAD_IN_8BIT,
         ),
-        "stats": {
-            "accuracy": accuracy,
-            "correct_count": correct_count,
-            "total_count": len(questions),
-            "per_position_accuracy": {
-                pos: position_correct.get(pos, 0) / position_total[pos]
-                for pos in sorted(position_total.keys())
+        "dataset": {
+            "stats": {
+                "accuracy": accuracy,
+                "correct_count": correct_count,
+                "total_count": len(questions),
+                "per_position_accuracy": {
+                    pos: position_correct.get(pos, 0) / position_total[pos]
+                    for pos in sorted(position_total.keys())
+                },
             },
+            "data": metadata,
         },
-        "data": metadata,
+        "metrics": {},  # Will be populated below
     }
-    # Add metric stats
+    # Add metric stats to dataset section
     for m_name, m_values in all_metrics.items():
-        dataset_json["stats"][f"{m_name}_mean"] = float(m_values.mean())
-        dataset_json["stats"][f"{m_name}_std"] = float(m_values.std())
-
-    with open(dataset_path, "w") as f:
-        json.dump(dataset_json, f, indent=2)
+        consolidated_results["dataset"]["stats"][f"{m_name}_mean"] = float(m_values.mean())
+        consolidated_results["dataset"]["stats"][f"{m_name}_std"] = float(m_values.std())
 
     # Find directions for each metric
-    print("\n" + "=" * 60)
-    print("FINDING DIRECTIONS")
-    print("=" * 60)
-
     metrics_to_analyze = {m: all_metrics[m] for m in METRICS}
     all_results = {}
+    key_findings = {}  # For console summary
 
     for metric in METRICS:
-        print(f"\n--- {metric.upper()} ({N_BOOTSTRAP} bootstrap iterations) ---")
         target_values = metrics_to_analyze[metric]
+        logger.section(f"Direction Finding: {metric.upper()}")
 
-        # Step 1: Run parallel direction finding WITH bootstrap for R² confidence intervals
-        # This is fast because it uses all CPU cores
+        # Run parallel direction finding WITH bootstrap for R² confidence intervals
         results = find_directions(
             activations_by_layer,
             target_values,
@@ -340,46 +314,42 @@ def main():
             probe_train_split=TRAIN_SPLIT,
             mean_diff_quantile=MEAN_DIFF_QUANTILE,
             seed=SEED,
-            return_scaler=True,  # Save scaler info (fast, parallelizable)
+            return_scaler=True,
         )
 
         all_results[metric] = results
 
-        # Print summary per method
+        # Log per-layer results to file
         for method in ["probe", "mean_diff"]:
+            logger.info(f"\n{method.upper()} per-layer R²:")
             fits = results["fits"][method]
+            for layer in sorted(fits.keys()):
+                r2 = fits[layer]["r2"]
+                ci_lo = fits[layer].get("r2_ci_low")
+                ci_hi = fits[layer].get("r2_ci_high")
+                corr = fits[layer].get("corr", 0)
+                ci_str = f" [{ci_lo:.3f}, {ci_hi:.3f}]" if ci_lo is not None else ""
+                logger.info(f"  Layer {layer:2d}: R²={r2:.4f}{ci_str}, r={corr:.3f}")
+
+            # Find best layer for key findings
             best_layer = max(fits.keys(), key=lambda l: fits[l]["r2"])
             best_r2 = fits[best_layer]["r2"]
-            best_corr = fits[best_layer]["corr"]
+            ci_lo = fits[best_layer].get("r2_ci_low")
+            ci_hi = fits[best_layer].get("r2_ci_high")
+            key_findings[f"{metric}/{method}"] = format_best_layer(
+                method, best_layer, best_r2, ci_lo, ci_hi
+            )
 
-            # Use [lo, hi] CI if available, fall back to ±std
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                ci_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_str = f" [{best_r2 - 1.96*fits[best_layer]['r2_std']:.3f}, {best_r2 + 1.96*fits[best_layer]['r2_std']:.3f}]"
-            else:
-                ci_str = ""
-
-            print(f"  {method:12s}: best L{best_layer:2d} R²={best_r2:.3f}{ci_str}, r={best_corr:.3f}")
-
-        # Method comparison
-        if results["comparison"]:
-            mid_layer = num_layers // 2
-            cos_sim = results["comparison"][mid_layer]["cosine_sim"]
-            print(f"  probe vs mean_diff cosine similarity (layer {mid_layer}): {cos_sim:.3f}")
-
-        # Step 2: Fit probes separately (no bootstrap) to save objects for transfer tests
-        # This is fast because it's just one fit per layer, no bootstrap iterations
-        print(f"  Fitting probe objects for transfer tests...")
+        # Fit probes separately for transfer tests
         probe_objects = {}
-        for layer in tqdm(range(num_layers), desc="Fitting probes", leave=False):
+        for layer in tqdm(range(num_layers), desc=f"Fitting {metric} probes", leave=False):
             X = activations_by_layer[layer]
             _, info = probe_direction(
                 X, target_values,
                 alpha=PROBE_ALPHA,
                 pca_components=PROBE_PCA_COMPONENTS,
-                bootstrap_splits=None,  # No bootstrap - just fit once
-                return_probe=True,  # Get the actual objects
+                bootstrap_splits=None,
+                return_probe=True,
             )
             probe_objects[layer] = {
                 "scaler": info["scaler"],
@@ -387,9 +357,9 @@ def main():
                 "ridge": info["ridge"],
             }
 
-        # Save directions file for this metric (npz for directions, joblib for probes)
-        directions_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
-        probes_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_probes.joblib"
+        # Save directions (binary cache - not consolidated)
+        directions_path = get_output_path(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir)
+        probes_path = get_output_path(f"{base_name}_mc_{metric}_probes.joblib", model_dir=model_dir)
 
         dir_save = {
             "_metadata_dataset": DATASET,
@@ -398,39 +368,21 @@ def main():
         }
         probe_save = {
             "metadata": {"dataset": DATASET, "model": MODEL, "metric": metric},
-            "probes": probe_objects,  # Use the separately-fit probe objects
+            "probes": probe_objects,
         }
 
         for method in ["probe", "mean_diff"]:
             for layer in range(num_layers):
                 dir_save[f"{method}_layer_{layer}"] = results["directions"][method][layer]
-                # Save scaler info for probe method (from parallel results)
                 if method == "probe" and "scaler_scale" in results["fits"][method][layer]:
                     dir_save[f"{method}_scaler_scale_{layer}"] = results["fits"][method][layer]["scaler_scale"]
                     dir_save[f"{method}_scaler_mean_{layer}"] = results["fits"][method][layer]["scaler_mean"]
 
         np.savez(directions_path, **dir_save)
         joblib.dump(probe_save, probes_path)
-        print(f"  Saved directions: {directions_path}")
-        print(f"  Saved probes: {probes_path}")
 
-        # Save results JSON for this metric
-        results_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_results.json"
-        results_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                dataset=DATASET,
-                metric=metric,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                probe_alpha=PROBE_ALPHA,
-                pca_components=PROBE_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
+        # Add to consolidated results
+        metric_results = {
             "metric_stats": {
                 "mean": float(target_values.mean()),
                 "std": float(target_values.std()),
@@ -443,47 +395,54 @@ def main():
             "results": {},
         }
         for method in ["probe", "mean_diff"]:
-            results_json["results"][method] = {}
+            metric_results["results"][method] = {}
             for layer in range(num_layers):
                 layer_info = {}
                 for k, v in results["fits"][method][layer].items():
-                    # Skip numpy arrays (scaler_scale, scaler_mean) - those go in .npz
                     if isinstance(v, np.ndarray):
                         continue
-                    # Convert numpy scalars to Python types
                     if isinstance(v, np.floating):
                         layer_info[k] = float(v)
                     elif isinstance(v, np.integer):
                         layer_info[k] = int(v)
                     else:
                         layer_info[k] = v
-                results_json["results"][method][layer] = layer_info
+                metric_results["results"][method][layer] = layer_info
 
-        with open(results_path, "w") as f:
-            json.dump(results_json, f, indent=2)
-        print(f"  Saved results: {results_path}")
+        consolidated_results["metrics"][metric] = metric_results
 
-    # Diagnostic summary
-    print_diagnostic_summary(metrics_to_analyze, all_results, num_layers)
+    # Log diagnostic summary
+    logger.section("Diagnostic Summary")
+    for metric_name, results in all_results.items():
+        layers = sorted(results["fits"]["probe"].keys())
+        n_layers = len(layers)
+        early_layers = layers[:n_layers // 4]
+        late_layers = layers[3 * n_layers // 4:]
+
+        for method in ["probe", "mean_diff"]:
+            fits = results["fits"][method]
+            early_r2 = np.mean([fits[l]["r2"] for l in early_layers])
+            late_r2 = np.mean([fits[l]["r2"] for l in late_layers])
+            r2_increase = late_r2 - early_r2
+            logger.info(f"{metric_name}/{method}: early={early_r2:.3f}, late={late_r2:.3f}, delta={r2_increase:+.3f}")
 
     # =========================================================================
     # ANSWER DIRECTIONS
     # =========================================================================
     answer_results = None
     if FIND_ANSWER_DIRECTIONS:
-        print("\n" + "=" * 60)
-        print("FINDING ANSWER DIRECTIONS")
-        print("=" * 60)
+        logger.section("Answer Directions")
 
         # Extract model answers from already-available metadata
         model_answers = [q["predicted_answer"] for q in metadata]
-        print(f"\n  Answer distribution: {dict(zip(*np.unique(model_answers, return_counts=True)))}")
+        answer_dist = dict(zip(*np.unique(model_answers, return_counts=True)))
+        logger.info(f"Answer distribution: {answer_dist}")
 
         # Encode answers to integers
         encoded_answers, answer_mapping = encode_answers(model_answers)
-        print(f"  Answer mapping: {answer_mapping}")
+        logger.info(f"Answer mapping: {answer_mapping}")
 
-        # Create train/test split (same seed and split ratio as uncertainty directions)
+        # Create train/test split
         indices = np.arange(len(metadata))
         train_idx, test_idx = train_test_split(
             indices,
@@ -493,10 +452,9 @@ def main():
         )
         train_idx = np.sort(train_idx)
         test_idx = np.sort(test_idx)
-        print(f"  Train/test split: {len(train_idx)}/{len(test_idx)}")
+        logger.info(f"Train/test split: {len(train_idx)}/{len(test_idx)}")
 
         # Find answer directions using both methods
-        print(f"\n  Training MC answer classifiers ({N_BOOTSTRAP} bootstrap iterations)...")
         answer_results = find_answer_directions_both_methods(
             activations_by_layer,
             encoded_answers,
@@ -508,11 +466,24 @@ def main():
             train_split=TRAIN_SPLIT,
         )
 
-        # Save directions
-        answer_dir_path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
-        print(f"\n  Saving answer directions to {answer_dir_path}...")
+        # Log per-layer results
+        for method in ["probe", "centroid"]:
+            logger.info(f"\n{method.upper()} per-layer accuracy:")
+            fits = answer_results["fits"][method]
+            for layer in sorted(fits.keys()):
+                acc = fits[layer]["test_accuracy"]
+                std = fits[layer].get("test_accuracy_std", 0)
+                logger.info(f"  Layer {layer:2d}: {acc:.1%} +/- {std:.1%}")
+
+            # Add to key findings
+            best_layer = max(fits.keys(), key=lambda l: fits[l]["test_accuracy"])
+            best_acc = fits[best_layer]["test_accuracy"]
+            key_findings[f"answer/{method}"] = f"{method}: {best_acc:.1%} at layer {best_layer} (chance=25%)"
+
+        # Save directions (binary cache)
+        answer_dir_path = get_output_path(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
         dir_save = {
-            "_metadata_input_base": base_name,
+            "_metadata_input_base": f"{model_dir}/{base_name}",
             "_metadata_n_classes": len(answer_mapping),
             "_metadata_answer_mapping": json.dumps(answer_mapping),
         }
@@ -521,12 +492,11 @@ def main():
                 dir_save[f"{method}_layer_{layer}"] = answer_results["directions"][method][layer]
         np.savez(answer_dir_path, **dir_save)
 
-        # Save probe objects
-        answer_probes_path = OUTPUT_DIR / f"{base_name}_mc_answer_probes.joblib"
-        print(f"  Saving answer probes to {answer_probes_path}...")
+        # Save probe objects (binary cache)
+        answer_probes_path = get_output_path(f"{base_name}_mc_answer_probes.joblib", model_dir=model_dir)
         probe_save = {
             "metadata": {
-                "input_base": base_name,
+                "input_base": f"{model_dir}/{base_name}",
                 "n_classes": len(answer_mapping),
                 "answer_mapping": answer_mapping,
                 "train_split": TRAIN_SPLIT,
@@ -537,34 +507,20 @@ def main():
         }
         joblib.dump(probe_save, answer_probes_path)
 
-        # Save results JSON
-        answer_results_path = OUTPUT_DIR / f"{base_name}_mc_answer_results.json"
-        print(f"  Saving answer results to {answer_results_path}...")
-        answer_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                dataset=DATASET,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                n_pca_components=ANSWER_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                n_classes=len(answer_mapping),
-                answer_mapping=answer_mapping,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
+        # Add to consolidated results
+        answer_section = {
             "stats": {
                 "n_samples": len(metadata),
                 "n_train": len(train_idx),
                 "n_test": len(test_idx),
-                "answer_distribution": {k: int(v) for k, v in zip(*np.unique(model_answers, return_counts=True))},
+                "answer_distribution": {k: int(v) for k, v in answer_dist.items()},
+                "answer_mapping": answer_mapping,
             },
             "results": {},
             "comparison": {},
         }
         for method in ["probe", "centroid"]:
-            answer_json["results"][method] = {}
+            answer_section["results"][method] = {}
             for layer in range(num_layers):
                 layer_info = {}
                 for k, v in answer_results["fits"][method][layer].items():
@@ -574,39 +530,28 @@ def main():
                         layer_info[k] = int(v)
                     else:
                         layer_info[k] = v
-                answer_json["results"][method][layer] = layer_info
+                answer_section["results"][method][layer] = layer_info
         for layer in range(num_layers):
-            answer_json["comparison"][layer] = {
+            answer_section["comparison"][layer] = {
                 "cosine_sim": float(answer_results["comparison"][layer]["cosine_sim"])
             }
-        with open(answer_results_path, "w") as f:
-            json.dump(answer_json, f, indent=2)
 
-        # Summary
-        fits = answer_results["fits"]
-        for method in ["probe", "centroid"]:
-            method_fits = fits[method]
-            layers = sorted(method_fits.keys())
-            best_layer = max(layers, key=lambda l: method_fits[l]["test_accuracy"])
-            best_acc = method_fits[best_layer]["test_accuracy"]
-            std_str = ""
-            if "test_accuracy_std" in method_fits[best_layer]:
-                std_str = f" +/- {method_fits[best_layer]['test_accuracy_std']:.1%}"
-            print(f"  {method}: best L{best_layer}, accuracy={best_acc:.1%}{std_str} (chance=25%)")
+        consolidated_results["answer"] = answer_section
+
+    # =========================================================================
+    # SAVE CONSOLIDATED JSON
+    # =========================================================================
+    results_path = get_output_path(f"{base_name}_mc_results.json", model_dir=model_dir)
+    with open(results_path, "w") as f:
+        json.dump(consolidated_results, f, indent=2)
 
     # =========================================================================
     # CONSOLIDATED PLOTS
     # =========================================================================
-    print("\n" + "=" * 60)
-    print("GENERATING CONSOLIDATED PLOTS")
-    print("=" * 60)
-
-    # Figure 1: Metric distributions (one row per metric in METRICS)
     metrics_to_plot = {m: all_metrics[m] for m in METRICS}
     metric_info_map = {m: METRIC_INFO[m] for m in METRICS}
 
-    distributions_path = OUTPUT_DIR / f"{base_name}_mc_distributions.png"
-    print(f"\nPlotting metric distributions...")
+    distributions_path = get_output_path(f"{base_name}_mc_distributions.png", model_dir=model_dir)
     plot_metric_distributions(
         metrics_to_plot,
         metadata,
@@ -615,55 +560,40 @@ def main():
         title_prefix="MC",
     )
 
-    # Figure 2: Directions summary (4-panel)
-    directions_path = OUTPUT_DIR / f"{base_name}_mc_directions.png"
-    print(f"Plotting directions summary...")
+    directions_plot_path = get_output_path(f"{base_name}_mc_directions.png", model_dir=model_dir)
     plot_directions_summary(
         all_results,
         answer_results,
         metrics_to_plot,
         metadata,
         metric_info_map,
-        directions_path,
+        directions_plot_path,
         title_prefix="MC",
     )
 
-    # Final summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
+    # =========================================================================
+    # CONSOLE SUMMARY
+    # =========================================================================
+    # Add accuracy to key findings
+    key_findings["MC Accuracy"] = f"{accuracy:.1%} ({correct_count}/{len(questions)})"
 
+    print_key_findings(key_findings)
+
+    # Build output file list
+    output_files = [
+        results_path,
+        activations_path,
+        distributions_path,
+        directions_plot_path,
+    ]
     for metric in METRICS:
-        print(f"\n{metric}:")
-        info = METRIC_INFO[metric]
-        print(f"  (higher = {info['higher_means']}, linear={info['linear']})")
-
-        for method in ["probe", "mean_diff"]:
-            fits = all_results[metric]["fits"][method]
-            best_layer = max(fits.keys(), key=lambda l: fits[l]["r2"])
-            best_r2 = fits[best_layer]["r2"]
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                ci_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_str = f" [{best_r2 - 1.96*fits[best_layer]['r2_std']:.3f}, {best_r2 + 1.96*fits[best_layer]['r2_std']:.3f}]"
-            else:
-                ci_str = ""
-            corr_str = f", r={fits[best_layer]['corr']:.3f}" if "corr" in fits[best_layer] else ""
-            print(f"  {method:12s}: best L{best_layer:2d} R²={best_r2:.3f}{ci_str}{corr_str}")
-
-    print("\nOutput files:")
-    print(f"  {base_name}_mc_activations.npz")
-    print(f"  {base_name}_mc_dataset.json")
-    for metric in METRICS:
-        print(f"  {base_name}_mc_{metric}_directions.npz")
-        print(f"  {base_name}_mc_{metric}_probes.joblib")
-        print(f"  {base_name}_mc_{metric}_results.json")
+        output_files.append(get_output_path(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir))
+        output_files.append(get_output_path(f"{base_name}_mc_{metric}_probes.joblib", model_dir=model_dir))
     if FIND_ANSWER_DIRECTIONS:
-        print(f"  {base_name}_mc_answer_directions.npz")
-        print(f"  {base_name}_mc_answer_probes.joblib")
-        print(f"  {base_name}_mc_answer_results.json")
-    print(f"  {base_name}_mc_distributions.png")
-    print(f"  {base_name}_mc_directions.png")
+        output_files.append(get_output_path(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir))
+        output_files.append(get_output_path(f"{base_name}_mc_answer_probes.joblib", model_dir=model_dir))
+
+    print_run_footer(output_files, logger.log_file)
 
 
 if __name__ == "__main__":

@@ -17,17 +17,17 @@ Inputs:
     outputs/{base}_mc_{metric}_results.json                Uncertainty R^2 per layer
     outputs/{base}_mc_answer_directions.npz                Answer directions
     outputs/{base}_mc_answer_results.json                  Answer accuracy per layer
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz  Confidence directions
-    outputs/{base}_meta_{task}_metaconfdir_results.json    Confidence R^2 per layer
-    outputs/{base}_meta_{task}_metamcuncert_directions.npz Metamcuncert directions (if DIRECTION_TYPES includes "metamcuncert")
-    outputs/{base}_meta_{task}_metamcuncert_results.json   Metamcuncert R^2 per layer
-    outputs/{base}_mc_dataset.json                         Question metadata
+    outputs/{base}_meta_{task}_confdir_directions_{pos}.npz  Confidence directions
+    outputs/{base}_meta_{task}_confdir_results_{pos}.json    Confidence R^2 per layer
+    outputs/{base}_meta_{task}_mcuncert_directions_{pos}.npz Metamcuncert directions (if DIRECTION_TYPES includes "metamcuncert")
+    outputs/{base}_meta_{task}_mcuncert_results_{pos}.json  Metamcuncert R^2 per layer (contains all metrics)
+    outputs/{base}_mc_results.json                          Consolidated results (dataset + metrics)
 
     where {base} = {model_short}_{dataset} or {model_short}_adapter-{adapter_short}_{dataset}
 
 Outputs:
-    outputs/{base}_cross_direction_{metric}_results.json   Effect matrix with CIs
-    outputs/{base}_cross_direction_{metric}_results.png    Propagation heatmaps + flow diagram
+    outputs/{model_dir}/results/{dataset}_{task}_cross_direction_{metric}_results.json   Effect matrix with CIs
+    outputs/{model_dir}/results/{dataset}_{task}_cross_direction_{metric}_*.png          Plots (heatmaps, flow, etc.)
 
 Shared parameters (must match across scripts):
     SEED
@@ -49,8 +49,14 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 import matplotlib.gridspec as gridspec
 
-from core.model_utils import load_model_and_tokenizer, get_model_short_name, should_use_chat_template, DEVICE
-from core.config_utils import get_config_dict
+from core.model_utils import load_model_and_tokenizer, get_model_dir_name, should_use_chat_template, DEVICE
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.logging_utils import (
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+)
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA, DPI
 from core.steering_experiments import (
     pretokenize_prompts,
@@ -71,9 +77,10 @@ from tasks import (
 
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+ADAPTER = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"#None  # Optional: path to PEFT/LoRA adapter
+DATASET = "TriviaMC_difficulty_filtered"  # Dataset name (model prefix now in directory)
 META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 METRIC = "logit_gap"  # Uncertainty metric for uncertainty directions
 
 # --- Quantization ---
@@ -82,7 +89,7 @@ LOAD_IN_8BIT = False
 
 # --- Experiment ---
 SEED = 42  # Must match across scripts
-BATCH_SIZE = 4
+BATCH_SIZE = 2#4
 NUM_QUESTIONS = 100
 
 # Direction types to test
@@ -114,8 +121,7 @@ COMPUTE_NORMALIZED_PROJECTIONS = True  # Enable normalized projection computatio
 PRESERVE_NORM = True  # Rescale ablated activations to preserve original magnitude (avoids LayerNorm artifacts)
 
 # Per-sample data saving (for correlation analysis)
-SAVE_PER_SAMPLE_DATA = True  # Save per-sample projections for uncertainty->confidence
-PER_SAMPLE_PAIRS = [("uncertainty", "confidence")]  # Which ablate->measure pairs to save
+SAVE_PER_SAMPLE_DATA = True  # Save per-sample projections for all direction pairs
 
 # Control experiment: ablate random directions to establish baseline
 N_CONTROL_DIRECTIONS = 3  # Random directions per ablation layer
@@ -129,8 +135,7 @@ BOOTSTRAP_CI_ALPHA = 0.05
 EXPANDED_BATCH_TARGET = 48  # Expand batches to this size for GPU efficiency
 
 # --- Output ---
-OUTPUT_DIR = Path(__file__).parent / "outputs"
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -155,13 +160,13 @@ class DirectionInfo:
 # R^2 LOADING (D→M: meta-task transfer performance)
 # =============================================================================
 
-def load_uncertainty_r2(base_name: str, meta_task: str, metric: str = "logit_gap") -> Dict[int, float]:
+def load_uncertainty_r2(base_name: str, meta_task: str, metric: str = "logit_gap", model_dir: str = None) -> Dict[int, float]:
     """Load D→M R^2 for uncertainty directions from meta-transfer results.
 
     This is the transfer performance: how well uncertainty directions (trained on MC task)
     predict uncertainty from meta-task activations.
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+    path = find_output_file(f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         print(f"  -> Run test_meta_transfer.py first to generate this file")
@@ -172,14 +177,15 @@ def load_uncertainty_r2(base_name: str, meta_task: str, metric: str = "logit_gap
 
     r2_by_layer = {}
 
-    # Structure: transfer[metric]["per_layer"][layer]["d2m_centered_r2"]
+    # Structure: transfer[metric]["per_layer"][layer]["centered_r2"]
     transfer = data.get("transfer", {})
     if metric in transfer and "per_layer" in transfer[metric]:
         per_layer = transfer[metric]["per_layer"]
         for layer_str, layer_data in per_layer.items():
             try:
                 layer = int(layer_str)
-                r2 = layer_data.get("d2m_centered_r2", 0)
+                # Check for centered_r2 (current) or d2m_centered_r2 (legacy)
+                r2 = layer_data.get("centered_r2") or layer_data.get("d2m_centered_r2", 0)
                 r2_by_layer[layer] = r2
             except (ValueError, KeyError):
                 continue
@@ -187,13 +193,13 @@ def load_uncertainty_r2(base_name: str, meta_task: str, metric: str = "logit_gap
     return r2_by_layer
 
 
-def load_answer_r2(base_name: str, meta_task: str) -> Dict[int, float]:
+def load_answer_r2(base_name: str, meta_task: str, model_dir: str = None) -> Dict[int, float]:
     """Load D→M accuracy for answer directions from meta-transfer results.
 
     This is the transfer performance: how well answer directions (trained on MC task)
     predict which answer from meta-task activations.
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+    path = find_output_file(f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         print(f"  -> Run test_meta_transfer.py first to generate this file")
@@ -203,29 +209,25 @@ def load_answer_r2(base_name: str, meta_task: str) -> Dict[int, float]:
         data = json.load(f)
 
     r2_by_layer = {}
-    # Structure: answer_transfer.d2m_by_position[position][layer]["centered_accuracy"]
+    # Structure: answer_transfer.d2m[layer]["centered_accuracy"]
+    # (Per-position file, so no position nesting)
     answer_transfer = data.get("answer_transfer", {})
-    d2m_by_pos = answer_transfer.get("d2m_by_position", {})
+    d2m = answer_transfer.get("d2m", {})
 
-    # Use "final" position (current default), fall back to "centered" or "last"
-    for pos in ["final", "centered", "last"]:
-        if pos in d2m_by_pos and d2m_by_pos[pos]:
-            for layer_str, layer_data in d2m_by_pos[pos].items():
-                try:
-                    layer = int(layer_str)
-                    # Key is "centered_accuracy" not nested
-                    acc = layer_data.get("centered_accuracy", 0)
-                    r2_by_layer[layer] = max(r2_by_layer.get(layer, -999), acc)
-                except (ValueError, KeyError):
-                    continue
-            break  # Use first available position
+    for layer_str, layer_data in d2m.items():
+        try:
+            layer = int(layer_str)
+            acc = layer_data.get("centered_accuracy", 0)
+            r2_by_layer[layer] = acc
+        except (ValueError, KeyError):
+            continue
 
     return r2_by_layer
 
 
-def load_confidence_r2(base_name: str, meta_task: str) -> Dict[int, float]:
+def load_confidence_r2(base_name: str, meta_task: str, model_dir: str = None) -> Dict[int, float]:
     """Load R^2 values for confidence directions from meta-task results."""
-    path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_results.json"
+    path = find_output_file(f"{base_name}_meta_{meta_task}_confdir_results_{PROBE_POSITION}.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         print(f"  -> Run test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True")
@@ -250,12 +252,13 @@ def load_confidence_r2(base_name: str, meta_task: str) -> Dict[int, float]:
     return r2_by_layer
 
 
-def load_metamcuncert_r2(base_name: str, meta_task: str, metric: str = "logit_gap") -> Dict[int, float]:
+def load_mcuncert_r2(base_name: str, meta_task: str, metric: str = "logit_gap", model_dir: str = None) -> Dict[int, float]:
     """Load R^2 values for metamcuncert directions (meta→MC uncertainty).
 
     These are directions in meta-task activations that predict MC-task uncertainty.
+    File contains all metrics - we extract the specified one.
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_results.json"
+    path = find_output_file(f"{base_name}_meta_{meta_task}_mcuncert_results_{PROBE_POSITION}.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         print(f"  -> Run test_meta_transfer.py with FIND_MC_UNCERTAINTY_DIRECTIONS=True")
@@ -265,10 +268,15 @@ def load_metamcuncert_r2(base_name: str, meta_task: str, metric: str = "logit_ga
         data = json.load(f)
 
     r2_by_layer = {}
+
+    # Structure: {"metrics": {"logit_gap": {"results": {"probe": {0: {...}, ...}}}}}
+    metric_data = data.get("metrics", {}).get(metric, {})
+    results = metric_data.get("results", {})
+
     # Try probe method first, fall back to mean_diff
     for method in ["probe", "mean_diff"]:
-        if method in data.get("results", {}):
-            for layer_str, layer_data in data["results"][method].items():
+        if method in results:
+            for layer_str, layer_data in results[method].items():
                 try:
                     layer = int(layer_str)
                     r2 = layer_data.get("test_r2", 0)
@@ -288,7 +296,8 @@ def load_directions_for_type(
     direction_type: str,
     metric: str = "logit_gap",
     meta_task: str = "confidence",
-    method: str = "probe"
+    method: str = "probe",
+    model_dir: str = None
 ) -> Dict[int, np.ndarray]:
     """Load direction vectors for a specific type and method.
 
@@ -298,13 +307,14 @@ def load_directions_for_type(
     direction to evolve through the network.
     """
     if direction_type == "uncertainty":
-        path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+        path = find_output_file(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir)
     elif direction_type == "answer":
-        path = OUTPUT_DIR / f"{base_name}_mc_answer_directions.npz"
+        path = find_output_file(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
     elif direction_type == "confidence":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metaconfdir_directions.npz"
+        path = find_output_file(f"{base_name}_meta_{meta_task}_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     elif direction_type == "metamcuncert":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
+        # Consolidated file with keys like probe_{metric}_layer_0
+        path = find_output_file(f"{base_name}_meta_{meta_task}_mcuncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -326,7 +336,8 @@ def load_directions_for_type(
     elif direction_type == "confidence":
         prefix = f"{method}_layer_"
     elif direction_type == "metamcuncert":
-        prefix = f"{method}_layer_"
+        # Consolidated file: keys are like probe_{metric}_layer_0
+        prefix = f"{method}_{metric}_layer_"
 
     # Collect layer -> key mapping, sorted by layer
     layer_keys = []
@@ -401,27 +412,28 @@ def load_all_direction_info(
     metric: str,
     meta_task: str,
     r2_threshold: float,
-    method: str = "probe"
+    method: str = "probe",
+    model_dir: str = None
 ) -> Dict[str, DirectionInfo]:
     """Load directions and R^2 curves for all direction types."""
     all_info = {}
 
     for dir_type in direction_types:
         # Load directions
-        directions = load_directions_for_type(base_name, dir_type, metric, meta_task, method)
+        directions = load_directions_for_type(base_name, dir_type, metric, meta_task, method, model_dir=model_dir)
         if not directions:
             print(f"  {dir_type}: no directions found")
             continue
 
         # Load R^2 curve (D→M transfer performance on meta-task)
         if dir_type == "uncertainty":
-            r2_by_layer = load_uncertainty_r2(base_name, meta_task, metric)
+            r2_by_layer = load_uncertainty_r2(base_name, meta_task, metric, model_dir=model_dir)
         elif dir_type == "answer":
-            r2_by_layer = load_answer_r2(base_name, meta_task)
+            r2_by_layer = load_answer_r2(base_name, meta_task, model_dir=model_dir)
         elif dir_type == "confidence":
-            r2_by_layer = load_confidence_r2(base_name, meta_task)
+            r2_by_layer = load_confidence_r2(base_name, meta_task, model_dir=model_dir)
         elif dir_type == "metamcuncert":
-            r2_by_layer = load_metamcuncert_r2(base_name, meta_task, metric)
+            r2_by_layer = load_mcuncert_r2(base_name, meta_task, metric, model_dir=model_dir)
         else:
             r2_by_layer = {}
 
@@ -445,10 +457,19 @@ def load_all_direction_info(
                 sorted_r2 = sorted(r2_by_layer.items(), key=lambda x: x[1], reverse=True)
                 print(f"    Top 5 layers by R²: {sorted_r2[:5]}")
             if not r2_by_layer:
+                # Show correct expected file for each direction type
+                if dir_type in ["uncertainty", "answer"]:
+                    expected = f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json"
+                elif dir_type == "confidence":
+                    expected = f"{base_name}_meta_{meta_task}_confdir_results_{PROBE_POSITION}.json"
+                elif dir_type == "metamcuncert":
+                    expected = f"{base_name}_meta_{meta_task}_mcuncert_results_{PROBE_POSITION}.json"
+                else:
+                    expected = f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json"
                 raise ValueError(
                     f"Failed to load R² values for {dir_type}.\n"
                     f"  This script requires test_meta_transfer.py to be run first.\n"
-                    f"  Expected file: {base_name}_meta_{meta_task}_results.json"
+                    f"  Expected file: {expected}"
                 )
             # Fall back to all available layers if we have R² but none meet threshold
             meaningful_layers = sorted(directions.keys())
@@ -482,16 +503,18 @@ def load_all_direction_info(
 # DATASET LOADING
 # =============================================================================
 
-def load_questions(base_name: str, num_questions: int) -> List[Dict]:
-    """Load question data from MC dataset."""
-    path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
+def load_questions(base_name: str, num_questions: int, model_dir: str = None) -> List[Dict]:
+    """Load question data from consolidated mc_results.json."""
+    path = find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found: {path}")
 
     with open(path) as f:
         data = json.load(f)
 
-    questions = data.get("data", data.get("questions", data.get("items", [])))
+    # Handle consolidated format (data is in data["dataset"]["data"])
+    dataset = data.get("dataset", data)
+    questions = dataset.get("data", dataset.get("questions", dataset.get("items", [])))
     if not questions:
         raise ValueError(f"No questions loaded from {path}")
 
@@ -1233,11 +1256,14 @@ def plot_diagonal_effects(
 # =============================================================================
 
 def main():
+    # Get model directory for centralized path management
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     print("=" * 70)
     print("CROSS-DIRECTION CAUSAL FLOW ANALYSIS")
     print("=" * 70)
     print(f"\nModel: {MODEL}")
-    print(f"Input: {INPUT_BASE_NAME}")
+    print(f"Dataset: {DATASET}")
     print(f"Metric: {METRIC}")
     print(f"Meta-task: {META_TASK}")
     print(f"Direction types: {DIRECTION_TYPES}")
@@ -1250,7 +1276,7 @@ def main():
     # Load all direction info
     print("\nLoading directions and R^2 curves...")
     direction_info = load_all_direction_info(
-        INPUT_BASE_NAME, DIRECTION_TYPES, METRIC, META_TASK, R2_THRESHOLD
+        DATASET, DIRECTION_TYPES, METRIC, META_TASK, R2_THRESHOLD, model_dir=model_dir
     )
 
     if len(direction_info) < 2:
@@ -1315,7 +1341,7 @@ def main():
 
     # Load questions
     print("\nLoading questions...")
-    questions = load_questions(INPUT_BASE_NAME, NUM_QUESTIONS)
+    questions = load_questions(DATASET, NUM_QUESTIONS, model_dir=model_dir)
     print(f"  Loaded {len(questions)} questions")
 
     # Load model
@@ -1444,10 +1470,8 @@ def main():
 
             print(f"  Measuring at layers: {extract_layers}")
 
-            # Check if we need per-sample data for this ablation type
-            need_per_sample = SAVE_PER_SAMPLE_DATA and any(
-                ablate_type == pair[0] for pair in PER_SAMPLE_PAIRS
-            )
+            # Check if we need per-sample data
+            need_per_sample = SAVE_PER_SAMPLE_DATA
 
             # Run forward passes
             baseline_acts, ablated_acts = run_with_ablation_and_extraction(
@@ -1523,8 +1547,8 @@ def main():
                     key = (ablate_type, ablate_layer, measure_type, measure_layer)
                     results[key] = effect
 
-                    # Save per-sample data if this pair is requested
-                    if SAVE_PER_SAMPLE_DATA and (ablate_type, measure_type) in PER_SAMPLE_PAIRS:
+                    # Save per-sample data if enabled
+                    if SAVE_PER_SAMPLE_DATA:
                         # Get baseline projection onto ablated direction at ablation layer
                         if ablate_layer in baseline_acts:
                             baseline_ablate_proj = compute_projection(
@@ -1770,26 +1794,14 @@ def main():
 
     # Save results
     print("\nSaving results...")
-    model_short = get_model_short_name(MODEL, LOAD_IN_4BIT, LOAD_IN_8BIT)
-    # Extract dataset part from INPUT_BASE_NAME
-    if "_" in INPUT_BASE_NAME:
-        parts = INPUT_BASE_NAME.split("_", 1)
-        dataset_name = parts[1] if len(parts) > 1 else INPUT_BASE_NAME
-    else:
-        dataset_name = INPUT_BASE_NAME
-    # Include adapter in output name if used
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        output_base = f"{model_short}_adapter-{adapter_short}_{dataset_name}"
-    else:
-        output_base = f"{model_short}_{dataset_name}"
+    output_base = f"{DATASET}_{META_TASK}"
 
     # Convert tuple keys to strings for JSON
     json_results = {
         "config": get_config_dict(
             model=MODEL,
             adapter=ADAPTER,
-            input_base=INPUT_BASE_NAME,
+            dataset=DATASET,
             metric=METRIC,
             meta_task=META_TASK,
             direction_types=DIRECTION_TYPES,
@@ -1859,7 +1871,7 @@ def main():
             str_key = f"{key[0]}_L{key[1]}_to_{key[2]}_L{key[3]}"
             json_results["results"][str_key] = value
 
-    json_path = OUTPUT_DIR / f"{output_base}_cross_direction_{METRIC}_results.json"
+    json_path = get_output_path(f"{output_base}_cross_direction_{METRIC}_results.json", model_dir=model_dir)
     with open(json_path, "w") as f:
         json.dump(json_results, f, indent=2)
     print(f"  Saved: {json_path}")
@@ -1875,26 +1887,26 @@ def main():
             npz_data[f"{prefix}_ablated_measure_proj"] = data["ablated_measure_proj"]
             npz_data[f"{prefix}_delta_measure_proj"] = data["delta_measure_proj"]
 
-        npz_path = OUTPUT_DIR / f"{output_base}_cross_direction_{METRIC}_per_sample.npz"
+        npz_path = get_output_path(f"{output_base}_cross_direction_{METRIC}_per_sample.npz", model_dir=model_dir)
         np.savez(npz_path, **npz_data)
         print(f"  Saved per-sample data: {npz_path}")
         print(f"    Pairs saved: {list(per_sample_data.keys())}")
 
     # Plot R^2 curves
-    r2_plot_path = OUTPUT_DIR / f"{output_base}_cross_direction_r2_curves.png"
+    r2_plot_path = get_output_path(f"{output_base}_cross_direction_r2_curves.png", model_dir=model_dir)
     plot_r2_curves(direction_info, R2_THRESHOLD, r2_plot_path)
 
     # Plot propagation heatmaps
-    heatmap_path = OUTPUT_DIR / f"{output_base}_cross_direction_{METRIC}_heatmaps.png"
+    heatmap_path = get_output_path(f"{output_base}_cross_direction_{METRIC}_heatmaps.png", model_dir=model_dir)
     plot_propagation_heatmaps(results, direction_info, heatmap_path)
 
     # Plot flow summary
-    flow_path = OUTPUT_DIR / f"{output_base}_cross_direction_{METRIC}_flow.png"
+    flow_path = get_output_path(f"{output_base}_cross_direction_{METRIC}_flow.png", model_dir=model_dir)
     plot_flow_summary(results, direction_info, flow_path,
                       control_mean_delta=control_mean if control_mean is not None else None)
 
     # Plot diagonal effects heatmaps
-    diag_path = OUTPUT_DIR / f"{output_base}_cross_direction_{METRIC}_diagonal.png"
+    diag_path = get_output_path(f"{output_base}_cross_direction_{METRIC}_diagonal.png", model_dir=model_dir)
     plot_diagonal_effects(results, direction_info, diag_path)
 
     # Print interpretation

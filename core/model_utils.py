@@ -69,6 +69,29 @@ def get_model_short_name(
     return short
 
 
+def get_model_dir_name(
+    model_name: str,
+    adapter: Optional[str] = None,
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
+) -> str:
+    """
+    Get directory name for model outputs: model short name + optional quantization + optional adapter.
+
+    Used for organizing outputs into model-specific directories.
+
+    Examples:
+        "meta-llama/Llama-3.1-8B-Instruct"                  -> "Llama-3.1-8B-Instruct"
+        "meta-llama/Llama-3.1-8B-Instruct", 4bit=True       -> "Llama-3.1-8B-Instruct_4bit"
+        "meta-llama/Llama-3.1-8B-Instruct", adapter="lora"  -> "Llama-3.1-8B-Instruct_adapter-lora"
+    """
+    model_short = get_model_short_name(model_name, load_in_4bit, load_in_8bit)
+    if adapter:
+        adapter_short = get_model_short_name(adapter)
+        return f"{model_short}_adapter-{adapter_short}"
+    return model_short
+
+
 def get_run_name(
     base_model: str,
     dataset: str,

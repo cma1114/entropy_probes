@@ -12,11 +12,11 @@ Directions:
 - d_other_confidence_unique = d_other_confidence - proj(d_other_confidence, d_self_confidence)
 
 Inputs:
-    outputs/{base}_meta_confidence_metaconfdir_directions.npz    Self-confidence directions
-    outputs/{base}_meta_other_confidence_metaconfdir_directions.npz  Other-confidence directions
+    outputs/{base}_meta_confidence_confdir_directions.npz    Self-confidence directions
+    outputs/{base}_meta_other_confidence_confdir_directions.npz  Other-confidence directions
     outputs/{base}_meta_confidence_activations.npz               Self-confidence activations
     outputs/{base}_meta_other_confidence_activations.npz         Other-confidence activations
-    outputs/{base}_mc_dataset.json                               Question metadata + metric values
+    outputs/{base}_mc_results.json                                Consolidated results (dataset + metrics)
 
 Outputs:
     outputs/{base}_orthogonal_directions.npz                     d_introspection + d_surface vectors
@@ -49,10 +49,10 @@ from sklearn.metrics import r2_score
 from core.model_utils import (
     load_model_and_tokenizer,
     should_use_chat_template,
-    get_model_short_name,
+    get_model_dir_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
 from core.plotting import save_figure, GRID_ALPHA
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
@@ -78,9 +78,10 @@ from tasks import (
 
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###None 
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+ADAPTER = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###None
+DATASET = "TriviaMC_difficulty_filtered"  # Dataset name (model prefix now in directory)
 METRIC = "logit_gap"  # Uncertainty metric for correlation measurement
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
 # --- Quantization ---
 LOAD_IN_4BIT = False
@@ -112,8 +113,7 @@ CAUSAL_TOP_K = 8             # Number of top layers by R² (if mode="top_k")
 CAUSAL_EXPLICIT_LAYERS = []  # Explicit layer list (if mode="explicit")
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 # Fixed seed offsets for direction types (replaces unstable hash(dt))
 DT_SEED_OFFSET = {"d_self_confidence": 11, "d_other_confidence": 22, "d_self_confidence_unique": 33, "d_other_confidence_unique": 44}
@@ -239,7 +239,7 @@ class OrthogonalDirections:
 # DIRECTION LOADING
 # =============================================================================
 
-def load_confidence_directions(base_name: str, task: str, method: str) -> Dict[int, np.ndarray]:
+def load_confidence_directions(base_name: str, task: str, method: str, model_dir: str = None) -> Dict[int, np.ndarray]:
     """
     Load confidence directions from meta-task confidence direction finding.
 
@@ -247,11 +247,12 @@ def load_confidence_directions(base_name: str, task: str, method: str) -> Dict[i
         base_name: Base name for input files
         task: "confidence" or "other_confidence"
         method: "probe" or "mean_diff"
+        model_dir: Model directory for path routing
 
     Returns:
         Dict mapping layer -> normalized direction vector
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{task}_metaconfdir_directions.npz"
+    path = find_output_file(f"{base_name}_meta_{task}_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(
             f"Confidence directions not found: {path}\n"
@@ -287,7 +288,7 @@ def load_confidence_directions(base_name: str, task: str, method: str) -> Dict[i
     return directions
 
 
-def load_meta_activations(base_name: str, task: str, position: str = "final") -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+def load_meta_activations(base_name: str, task: str, position: str = "final", model_dir: str = None) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
     """
     Load cached meta-task activations.
 
@@ -295,12 +296,13 @@ def load_meta_activations(base_name: str, task: str, position: str = "final") ->
         base_name: Base name for input files
         task: "confidence" or "other_confidence"
         position: Token position to load (default "final")
+        model_dir: Model directory for path routing
 
     Returns:
         activations_by_layer: {layer: (n_samples, hidden_dim)}
         confidences: (n_samples,) stated confidence values
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{task}_activations.npz"
+    path = find_output_file(f"{base_name}_meta_{task}_activations.npz", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(
             f"Meta-task activations not found: {path}\n"
@@ -339,14 +341,16 @@ def load_meta_activations(base_name: str, task: str, position: str = "final") ->
     return activations, confidences
 
 
-def load_dataset(base_name: str) -> Dict:
-    """Load dataset with questions and metric values."""
-    path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
+def load_dataset(base_name: str, model_dir: str = None) -> Dict:
+    """Load consolidated mc_results.json with questions and metric values."""
+    path = find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(f"Dataset file not found: {path}")
 
     with open(path, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Return nested dataset section for compatibility
+    return data["dataset"]
 
 
 # =============================================================================
@@ -1407,50 +1411,47 @@ def plot_causal_heatmap(
 # =============================================================================
 
 def main():
+    # Get model directory for centralized path management
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     print("=" * 70)
     print("INTROSPECTION VS SURFACE DIFFICULTY ANALYSIS")
     print("=" * 70)
     print(f"\nModel: {MODEL}")
     if ADAPTER:
         print(f"Adapter: {ADAPTER}")
-    print(f"Input: {INPUT_BASE_NAME}")
+    print(f"Dataset: {DATASET}")
     print(f"Method: {METHOD}")
     print(f"Metric: {METRIC}")
 
     # Define checkpoint paths early for resumability
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_orthogonal"
-    else:
-        base_output = f"{model_short}_{dataset_name}_orthogonal"
+    base_output = f"{DATASET}_orthogonal"
 
-    # Checkpoint files for resumability
-    steering_checkpoint = OUTPUT_DIR / f"{base_output}_steering_checkpoint.json"
-    ablation_checkpoint = OUTPUT_DIR / f"{base_output}_ablation_checkpoint.json"
+    # Checkpoint files for resumability (working/ dir since these are machine data)
+    steering_checkpoint = get_output_path(f"{base_output}_steering_checkpoint.json", model_dir=model_dir, working=True)
+    ablation_checkpoint = get_output_path(f"{base_output}_ablation_checkpoint.json", model_dir=model_dir, working=True)
     print(f"\nCheckpoint files:")
     print(f"  Steering: {steering_checkpoint.name}")
     print(f"  Ablation: {ablation_checkpoint.name}")
 
     # Load directions
     print("\nLoading confidence directions...")
-    d_self_by_layer = load_confidence_directions(INPUT_BASE_NAME, "confidence", METHOD)
-    d_other_by_layer = load_confidence_directions(INPUT_BASE_NAME, "other_confidence", METHOD)
+    d_self_by_layer = load_confidence_directions(DATASET, "confidence", METHOD, model_dir=model_dir)
+    d_other_by_layer = load_confidence_directions(DATASET, "other_confidence", METHOD, model_dir=model_dir)
 
     layers = sorted(set(d_self_by_layer.keys()) & set(d_other_by_layer.keys()))
     print(f"  Found {len(layers)} common layers")
 
     # Load activations
     print("\nLoading meta-task activations...")
-    self_activations, self_confidences = load_meta_activations(INPUT_BASE_NAME, "confidence")
-    other_activations, other_confidences = load_meta_activations(INPUT_BASE_NAME, "other_confidence")
+    self_activations, self_confidences = load_meta_activations(DATASET, "confidence", model_dir=model_dir)
+    other_activations, other_confidences = load_meta_activations(DATASET, "other_confidence", model_dir=model_dir)
     print(f"  Self-confidence: {len(self_confidences)} samples")
     print(f"  Other-confidence: {len(other_confidences)} samples")
 
     # Load dataset for metric values
     print("\nLoading dataset...")
-    dataset = load_dataset(INPUT_BASE_NAME)
+    dataset = load_dataset(DATASET, model_dir=model_dir)
     all_data = dataset["data"]
     metric_values = np.array([item[METRIC] for item in all_data])
 
@@ -1605,10 +1606,10 @@ def main():
 
     # Save directions (base_output computed at start of main())
     print("\nSaving orthogonal directions...")
-    directions_path = OUTPUT_DIR / f"{base_output}_directions.npz"
+    directions_path = get_output_path(f"{base_output}_directions.npz", model_dir=model_dir)
     save_data = {
         "_metadata_model": MODEL,
-        "_metadata_dataset": INPUT_BASE_NAME,
+        "_metadata_dataset": DATASET,
         "_metadata_method": METHOD,
     }
     for layer in layers:
@@ -1622,7 +1623,7 @@ def main():
 
     # Save JSON results
     print("\nSaving results JSON...")
-    results_path = OUTPUT_DIR / f"{base_output}_analysis_results.json"
+    results_path = get_output_path(f"{base_output}_analysis_results.json", model_dir=model_dir)
 
     # Convert predictive results to JSON-serializable format
     predictive_json = {"by_layer": {}, "summary": predictive_results["summary"]}
@@ -1664,7 +1665,7 @@ def main():
         "config": get_config_dict(
             model=MODEL,
             adapter=ADAPTER,
-            input_base_name=INPUT_BASE_NAME,
+            dataset=DATASET,
             metric=METRIC,
             method=METHOD,
             seed=SEED,
@@ -1711,14 +1712,14 @@ def main():
     # Generate plots
     print("\nGenerating plots...")
 
-    similarity_path = OUTPUT_DIR / f"{base_output}_similarity.png"
+    similarity_path = get_output_path(f"{base_output}_similarity.png", model_dir=model_dir)
     plot_orthogonalization_similarity(ortho_by_layer, similarity_path)
 
-    predictive_path = OUTPUT_DIR / f"{base_output}_predictive.png"
+    predictive_path = get_output_path(f"{base_output}_predictive.png", model_dir=model_dir)
     plot_predictive_heatmap(predictive_results, ortho_by_layer, predictive_path)
 
-    steering_path = OUTPUT_DIR / f"{base_output}_steering.png"
-    ablation_path = OUTPUT_DIR / f"{base_output}_ablation.png"
+    steering_path = get_output_path(f"{base_output}_steering.png", model_dir=model_dir)
+    ablation_path = get_output_path(f"{base_output}_ablation.png", model_dir=model_dir)
     plot_causal_heatmap(steering_results, ablation_results, steering_path, ablation_path)
 
     # Final summary

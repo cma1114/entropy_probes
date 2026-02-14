@@ -8,7 +8,7 @@ Usage:
 Example:
     python plot_ablation_effect.py uncertainty confidence 14
 
-Configure INPUT_BASE_NAME below to specify which results file to use.
+Configure MODEL, DATASET below to specify which results file to use.
 
 This loads the cross-direction results JSON and plots:
 - Panel 1: Raw projections for baseline (all layers) and ablated (post-ablation)
@@ -22,16 +22,21 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
+from core.config_utils import get_output_path, find_output_file
+from core.model_utils import get_model_dir_name
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# Input base name - determines which results file to load
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+ADAPTER = None
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+DATASET = "TriviaMC_difficulty_filtered"
 METRIC = "logit_gap"
 
-# Output directory
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 
 def load_results(results_path: Path) -> dict:
@@ -220,11 +225,13 @@ def main():
     args = parser.parse_args()
 
     # Build results path from configuration
-    results_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_cross_direction_{METRIC}_results.json"
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    results_filename = f"{DATASET}_cross_direction_{METRIC}_results.json"
+    results_path = find_output_file(results_filename, model_dir=model_dir)
 
     if not results_path.exists():
-        print(f"Error: Results file not found: {results_path}")
-        print(f"Edit INPUT_BASE_NAME and METRIC in this script to point to the correct file.")
+        print(f"Error: Results file not found: {results_filename}")
+        print(f"Edit MODEL, DATASET, and METRIC in this script to point to the correct file.")
         sys.exit(1)
 
     print(f"Loading: {results_path}")
@@ -270,7 +277,7 @@ def main():
         output_path = Path(args.output)
     elif not args.no_show:
         # Auto-generate output path following codebase convention
-        output_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_cross_direction_{METRIC}_ablation_effect.png"
+        output_path = get_output_path(f"{DATASET}_cross_direction_{METRIC}_ablation_effect.png", model_dir=model_dir)
 
     # Plot
     plot_ablation_effect(

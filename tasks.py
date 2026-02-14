@@ -429,7 +429,7 @@ def response_to_confidence(
     """
     Convert a meta response to a confidence value.
 
-    For confidence task: Uses STATED_CONFIDENCE_MIDPOINTS lookup
+    For confidence/other_confidence tasks: Uses STATED_CONFIDENCE_MIDPOINTS lookup
     For delegate task: Uses P(Answer) from the probability distribution,
                        accounting for alternating mapping
 
@@ -437,7 +437,7 @@ def response_to_confidence(
         response: The model's response ("1", "2", or S-Z for confidence)
         probs: Probability array [P("1"), P("2")] for delegate, or [P(S)...P(Z)] for confidence
         mapping: For delegate task, the mapping {"1": "Answer"/"Delegate", "2": ...}
-        task_type: "confidence" or "delegate"
+        task_type: "confidence", "other_confidence", or "delegate"
     """
     if task_type == "delegate":
         # For delegate task, confidence = P(Answer)

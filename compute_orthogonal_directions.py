@@ -9,14 +9,14 @@ This is just Gram-Schmidt projection - takes seconds, not hours.
 Processes all datasets in DATASETS list in one run.
 
 Inputs (for each dataset):
-    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz    (d_self_confidence)
-    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other_confidence)
+    outputs/{model}_{dataset}_meta_confidence_confdir_directions.npz    (d_self_confidence)
+    outputs/{model}_{dataset}_meta_other_confidence_confdir_directions.npz  (d_other_confidence)
 
 Outputs (for each dataset):
     outputs/{model}_{dataset}_orthogonal_directions.npz
 
 Configuration:
-    MODEL_SHORT: Model name (e.g., "Llama-3.1-8B-Instruct")
+    MODEL: Full model path (e.g., "meta-llama/Llama-3.1-8B-Instruct")
     ADAPTER: Optional path to PEFT/LoRA adapter (must match identify step)
     DATASETS: List of dataset names to process
 
@@ -28,14 +28,18 @@ Run after:
 import numpy as np
 from pathlib import Path
 
-from core.model_utils import get_model_short_name
+from core.model_utils import get_model_dir_name
+from core.config_utils import get_output_path, find_output_file
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-MODEL_SHORT = "Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter (must match identify step if used)
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 DATASETS = [
     "TriviaMC_difficulty_filtered",
     "PopMC_0_difficulty_filtered",
@@ -44,22 +48,20 @@ DATASETS = [
 METHOD = "mean_diff"  # "probe" or "mean_diff" - must match what you want to orthogonalize
 MIN_RESIDUAL_NORM = 0.1  # Flag layers where d_self_confidence ≈ d_other_confidence
 
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 
-def get_base_name(dataset: str) -> str:
-    """Get base name for a dataset, including adapter if configured."""
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        return f"{MODEL_SHORT}_adapter-{adapter_short}_{dataset}"
-    return f"{MODEL_SHORT}_{dataset}"
+def get_model_dir() -> str:
+    """Get model directory name for the configured model."""
+    return get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 
-def load_directions(base_name: str, task: str, method: str) -> dict[int, np.ndarray]:
+def load_directions(dataset: str, task: str, method: str, model_dir: str = None) -> dict[int, np.ndarray]:
     """Load direction vectors from meta confidence direction file."""
-    path = OUTPUT_DIR / f"{base_name}_meta_{task}_metaconfdir_directions.npz"
+    filename = f"{dataset}_meta_{task}_confdir_directions_{PROBE_POSITION}.npz"
+    path = find_output_file(filename, model_dir=model_dir)
     if not path.exists():
-        raise FileNotFoundError(f"Not found: {path}")
+        raise FileNotFoundError(f"Not found: {filename}")
 
     data = np.load(path)
     directions = {}
@@ -114,17 +116,17 @@ def orthogonalize(d_self_confidence: np.ndarray, d_other_confidence: np.ndarray)
     }
 
 
-def process_dataset(base_name: str) -> bool:
+def process_dataset(dataset: str, model_dir: str = None) -> bool:
     """Process a single dataset. Returns True if successful."""
     print(f"\n{'='*60}")
-    print(f"Dataset: {base_name}")
+    print(f"Dataset: {dataset}")
     print(f"Method: {METHOD}")
 
     # Load directions
     print("\nLoading directions...")
     try:
-        d_self_conf_by_layer = load_directions(base_name, "confidence", METHOD)
-        d_other_conf_by_layer = load_directions(base_name, "other_confidence", METHOD)
+        d_self_conf_by_layer = load_directions(dataset, "confidence", METHOD, model_dir=model_dir)
+        d_other_conf_by_layer = load_directions(dataset, "other_confidence", METHOD, model_dir=model_dir)
     except FileNotFoundError as e:
         print(f"  SKIPPED: {e}")
         return False
@@ -135,8 +137,8 @@ def process_dataset(base_name: str) -> bool:
     # Orthogonalize
     print("\nOrthogonalizing...")
     save_data = {
-        "_metadata_model": base_name.split("_")[0],
-        "_metadata_dataset": "_".join(base_name.split("_")[1:]),
+        "_metadata_model": MODEL,
+        "_metadata_dataset": dataset,
         "_metadata_method": METHOD,
     }
 
@@ -156,7 +158,7 @@ def process_dataset(base_name: str) -> bool:
             n_degenerate += 1
 
     # Save
-    output_path = OUTPUT_DIR / f"{base_name}_orthogonal_directions.npz"
+    output_path = get_output_path(f"{dataset}_orthogonal_directions.npz", model_dir=model_dir)
     np.savez_compressed(output_path, **save_data)
     print(f"\nSaved: {output_path.name}")
 
@@ -168,9 +170,12 @@ def process_dataset(base_name: str) -> bool:
 
 
 def main():
-    print(f"Model: {MODEL_SHORT}")
+    model_dir = get_model_dir()
+
+    print(f"Model: {MODEL}")
     if ADAPTER:
         print(f"Adapter: {ADAPTER}")
+    print(f"Model dir: {model_dir}")
     print(f"Datasets: {DATASETS}")
     print(f"Method: {METHOD}")
 
@@ -178,8 +183,7 @@ def main():
     n_skipped = 0
 
     for dataset in DATASETS:
-        base_name = get_base_name(dataset)
-        if process_dataset(base_name):
+        if process_dataset(dataset, model_dir=model_dir):
             n_success += 1
         else:
             n_skipped += 1

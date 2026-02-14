@@ -28,9 +28,9 @@ from core import (
     DEVICE,
     load_model_and_tokenizer,
     get_run_name,
-    get_model_short_name,
 )
-from core.config_utils import get_config_dict
+from core.model_utils import get_model_dir_name
+from core.config_utils import get_config_dict, get_output_path, find_output_file
 
 # =============================================================================
 # CONFIGURATION
@@ -54,21 +54,16 @@ MAX_PROMPT_LENGTH = 500
 CHECKPOINT_INTERVAL = 500
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 
-def get_output_prefix() -> str:
-    """Generate output filename prefix based on config."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}_nexttoken")
-    return str(OUTPUT_DIR / f"{model_short}_nexttoken")
+def get_model_dir() -> str:
+    """Get model directory name for the configured model."""
+    return get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 
 def load_diverse_texts(num_samples: int) -> List[str]:
@@ -342,15 +337,16 @@ def stratify_and_sample(
 
 
 def main():
+    model_dir = get_model_dir()
+
     print(f"Device: {DEVICE}")
+    print(f"Model: {MODEL}")
+    print(f"Model dir: {model_dir}")
     print(f"Batch Size: {BATCH_SIZE}")
 
-    output_prefix = get_output_prefix()
-    print(f"Output prefix: {output_prefix}")
-
-    samples_raw_path = Path(f"{output_prefix}_samples_raw.json")
-    checkpoint_path = Path(f"{output_prefix}_checkpoint.json")
-    final_output = Path(f"{output_prefix}_entropy_dataset.json")
+    samples_raw_path = get_output_path("nexttoken_samples_raw.json", model_dir=model_dir, working=True)
+    checkpoint_path = get_output_path("nexttoken_checkpoint.json", model_dir=model_dir, working=True)
+    final_output = get_output_path("nexttoken_entropy_dataset.json", model_dir=model_dir, working=True)
 
     # Load model
     model, tokenizer, num_layers = load_model_and_tokenizer(

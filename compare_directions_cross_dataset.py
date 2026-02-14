@@ -16,12 +16,12 @@ Direction Types:
     d_meta_mc_uncert              - predicts MC uncertainty from meta-task activations (metamcuncert)
 
 Inputs:
-    outputs/{model}_{dataset}_meta_confidence_metaconfdir_directions.npz     (d_self_confidence)
-    outputs/{model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz  (d_other_confidence)
+    outputs/{model}_{dataset}_meta_confidence_confdir_directions.npz     (d_self_confidence)
+    outputs/{model}_{dataset}_meta_other_confidence_confdir_directions.npz  (d_other_confidence)
     outputs/{model}_{dataset}_orthogonal_directions.npz   (d_self_confidence_unique, d_other_confidence_unique)
     outputs/{model}_{dataset}_selfVother_conf_directions.npz  (d_selfVother_conf)
     outputs/{model}_{dataset}_mc_{metric}_directions.npz  (d_mc_{metric})
-    outputs/{model}_{dataset}_meta_confidence_metamcuncert_directions.npz  (d_meta_mc_uncert)
+    outputs/{model}_{dataset}_meta_confidence_mcuncert_directions.npz  (d_meta_mc_uncert, consolidated)
 
 Outputs:
     outputs/{model}_cross_dataset_comparison.json
@@ -42,14 +42,18 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from core.model_utils import get_model_short_name
+from core.model_utils import get_model_dir_name
+from core.config_utils import get_output_path, find_output_file
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-MODEL_SHORT = "Llama-3.1-8B-Instruct"
-ADAPTER = None #"Tristan-Day/ect_20251222_215412_v0uei7y1_2000"###
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+ADAPTER = None  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
 # Datasets to compare
 DATASETS = [
@@ -58,23 +62,12 @@ DATASETS = [
     "SimpleMC",
 ]
 
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 
-def get_output_prefix() -> str:
-    """Get output filename prefix, including adapter if configured."""
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        return f"{MODEL_SHORT}_adapter-{adapter_short}"
-    return MODEL_SHORT
-
-
-def get_base_name(dataset: str) -> str:
-    """Get base name for a dataset, including adapter if configured."""
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        return f"{MODEL_SHORT}_adapter-{adapter_short}_{dataset}"
-    return f"{MODEL_SHORT}_{dataset}"
+def get_model_dir() -> str:
+    """Get model directory name for the configured model."""
+    return get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 # All direction types
 # MC_METRIC should match the METRICS setting in identify_mc_correlate.py
@@ -103,13 +96,13 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return v
 
 
-def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
+def load_all_directions(dataset: str, model_dir: str = None) -> dict[str, dict[int, np.ndarray]]:
     """
     Load all direction types from their respective source files.
 
     Args:
-        base_name: Full base name including model and adapter if applicable
-                   (e.g., "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered")
+        dataset: Dataset name (e.g., "TriviaMC_difficulty_filtered")
+        model_dir: Model directory name for routing to correct output location
 
     Returns:
         {"d_self_confidence": {layer: vec}, "d_other_confidence": {layer: vec}, ...}
@@ -117,7 +110,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
     directions = {dt: {} for dt in DIRECTION_TYPES}
 
     # d_self_confidence from meta_confidence directions
-    self_path = OUTPUT_DIR / f"{base_name}_meta_confidence_metaconfdir_directions.npz"
+    self_path = find_output_file(f"{dataset}_meta_confidence_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     if self_path.exists():
         data = np.load(self_path)
         for key in data.files:
@@ -126,7 +119,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                 directions["d_self_confidence"][layer] = normalize(data[key])
 
     # d_other_confidence from meta_other_confidence directions
-    other_path = OUTPUT_DIR / f"{base_name}_meta_other_confidence_metaconfdir_directions.npz"
+    other_path = find_output_file(f"{dataset}_meta_other_confidence_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     if other_path.exists():
         data = np.load(other_path)
         for key in data.files:
@@ -135,7 +128,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                 directions["d_other_confidence"][layer] = normalize(data[key])
 
     # d_self_confidence_unique, d_other_confidence_unique from orthogonal directions
-    ortho_path = OUTPUT_DIR / f"{base_name}_orthogonal_directions.npz"
+    ortho_path = find_output_file(f"{dataset}_orthogonal_directions.npz", model_dir=model_dir)
     if ortho_path.exists():
         data = np.load(ortho_path)
         for key in data.files:
@@ -157,7 +150,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                     directions["d_other_confidence_unique"][layer] = normalize(data[key])
 
     # d_selfVother_conf from selfVother_conf directions
-    svo_path = OUTPUT_DIR / f"{base_name}_selfVother_conf_directions.npz"
+    svo_path = find_output_file(f"{dataset}_selfVother_conf_directions.npz", model_dir=model_dir)
     if svo_path.exists():
         data = np.load(svo_path)
         for key in data.files:
@@ -170,7 +163,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
             ("_self_vs_other_confidence_directions.npz", "self_vs_other_confidence_layer_"),
             ("_contrast_directions.npz", "contrast_layer_"),
         ]:
-            legacy_path = OUTPUT_DIR / f"{base_name}{legacy_suffix}"
+            legacy_path = find_output_file(f"{dataset}{legacy_suffix}", model_dir=model_dir)
             if legacy_path.exists():
                 data = np.load(legacy_path)
                 for key in data.files:
@@ -180,7 +173,7 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                 break
 
     # d_mc_{metric} from mc directions (from identify_mc_correlate.py)
-    mc_path = OUTPUT_DIR / f"{base_name}_mc_{MC_METRIC}_directions.npz"
+    mc_path = find_output_file(f"{dataset}_mc_{MC_METRIC}_directions.npz", model_dir=model_dir)
     if mc_path.exists():
         data = np.load(mc_path)
         for key in data.files:
@@ -188,19 +181,21 @@ def load_all_directions(base_name: str) -> dict[str, dict[int, np.ndarray]]:
                 layer = int(key.replace("mean_diff_layer_", ""))
                 directions[f"d_mc_{MC_METRIC}"][layer] = normalize(data[key])
 
-    # d_meta_mc_uncert from metamcuncert directions (meta activations → MC uncertainty)
-    mmu_path = OUTPUT_DIR / f"{base_name}_meta_confidence_metamcuncert_directions.npz"
+    # d_meta_mc_uncert from metamcuncert directions (meta activations -> MC uncertainty)
+    # Consolidated format with keys like mean_diff_{metric}_layer_0
+    mmu_path = find_output_file(f"{dataset}_meta_confidence_mcuncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     if mmu_path.exists():
         data = np.load(mmu_path)
+        prefix = f"mean_diff_{MC_METRIC}_layer_"
         for key in data.files:
-            if key.startswith("mean_diff_layer_"):
-                layer = int(key.replace("mean_diff_layer_", ""))
+            if key.startswith(prefix):
+                layer = int(key.replace(prefix, ""))
                 directions["d_meta_mc_uncert"][layer] = normalize(data[key])
 
     # Check we have at least some directions
     has_any = any(len(d) > 0 for d in directions.values())
     if not has_any:
-        raise FileNotFoundError(f"No direction files found for {base_name}")
+        raise FileNotFoundError(f"No direction files found for {dataset}")
 
     return directions
 
@@ -419,21 +414,21 @@ def plot_cross_dataset_similarity(
 
 
 def main():
-    print(f"Model: {MODEL_SHORT}")
+    model_dir = get_model_dir()
+
+    print(f"Model: {MODEL}")
     if ADAPTER:
         print(f"Adapter: {ADAPTER}")
+    print(f"Model dir: {model_dir}")
     print(f"Datasets: {DATASETS}")
     print(f"Direction types: {DIRECTION_TYPES}")
-
-    output_prefix = get_output_prefix()
 
     # Load all directions
     print("\nLoading directions...")
     all_directions = {}
     for ds in DATASETS:
         try:
-            base_name = get_base_name(ds)
-            all_directions[ds] = load_all_directions(base_name)
+            all_directions[ds] = load_all_directions(ds, model_dir=model_dir)
             counts = {dt: len(all_directions[ds][dt]) for dt in DIRECTION_TYPES}
             present = [f"{dt}={counts[dt]}" for dt in DIRECTION_TYPES if counts[dt] > 0]
             print(f"  {ds}: {', '.join(present)}")
@@ -471,9 +466,9 @@ def main():
                 print(f"    {dtype}: mean={np.mean(values):.3f}, std={np.std(values):.3f}")
 
     # Save consensus directions
-    consensus_path = OUTPUT_DIR / f"{output_prefix}_consensus_directions.npz"
+    consensus_path = get_output_path("consensus_directions.npz", model_dir=model_dir)
     save_data = {
-        "_metadata_model": MODEL_SHORT,
+        "_metadata_model": MODEL,
         "_metadata_adapter": ADAPTER,
         "_metadata_datasets": json.dumps(DATASETS),
         "_metadata_direction_types": json.dumps(DIRECTION_TYPES),
@@ -488,8 +483,10 @@ def main():
     # Save JSON results
     results = {
         "config": {
-            "model": MODEL_SHORT,
+            "model": MODEL,
             "adapter": ADAPTER,
+            "load_in_4bit": LOAD_IN_4BIT,
+            "load_in_8bit": LOAD_IN_8BIT,
             "datasets": DATASETS,
             "direction_types": DIRECTION_TYPES,
         },
@@ -525,13 +522,13 @@ def main():
         },
     }
 
-    results_path = OUTPUT_DIR / f"{output_prefix}_cross_dataset_comparison.json"
+    results_path = get_output_path("cross_dataset_comparison.json", model_dir=model_dir)
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Saved results: {results_path.name}")
 
     # Plot
-    plot_path = OUTPUT_DIR / f"{output_prefix}_cross_dataset_similarity.png"
+    plot_path = get_output_path("cross_dataset_similarity.png", model_dir=model_dir)
     plot_cross_dataset_similarity(pairwise, alignment, plot_path)
 
     print("\nDone!")

@@ -15,7 +15,14 @@
       "Bash(codex:*)",
       "Bash(source:*)",
       "Bash(pip3 show:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(for script in analyze_directions.py analyze_introspection_orthogonalization.py analyze_uncertainty_confidence_relationship.py compare_direction_similarity.py compare_directions_cross_dataset.py)",
+      "Bash(do python3 -m py_compile \"$script\")",
+      "Bash(echo:*)",
+      "Bash(done)",
+      "Bash(for:*)",
+      "Bash(do python3 -m py_compile \"$f\")",
+      "Bash(do echo \"=== $f ===\" grep -n \"get_model_dir_name\\\\|model_dir.*=\" \"$f\")"
     ]
   },
   "enableAllProjectMcpServers": false

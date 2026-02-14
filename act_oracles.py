@@ -25,7 +25,9 @@ import seaborn as sns
 import sys
 
 from core import get_model_short_name
+from core.model_utils import get_model_dir_name
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
+from core.config_utils import get_output_path, find_output_file, glob_outputs
 
 # Lazy imports for heavy dependencies (torch, peft)
 # Only imported when running full interpretation, not for analysis-only mode
@@ -96,7 +98,7 @@ TARGET_CONCEPTS = {
 }
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 # Activation Oracle adapter paths
 AO_ADAPTERS = {
@@ -922,61 +924,59 @@ def generate_text_summary(analysis: Dict, output_path: str) -> None:
 # Path utilities
 # =============================================================================
 
-def get_model_prefix() -> str:
-    """Get model prefix for filenames."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return f"{model_short}_adapter-{adapter_short}"
-    return model_short
+def get_model_dir() -> str:
+    """Get model directory name for file routing."""
+    return get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 
-def find_directions_file() -> Path:
+def find_directions_file(model_dir: str = None) -> Path:
     """
     Find available directions file.
     """
+    if model_dir is None:
+        model_dir = get_model_dir()
+
     if DIRECTIONS_FILE is not None:
-        path = Path(DIRECTIONS_FILE)
-        if not path.is_absolute():
-            path = OUTPUT_DIR / path
+        # Try to find specified file via centralized path management
+        path = find_output_file(DIRECTIONS_FILE, model_dir=model_dir)
         if path.exists():
             return path
-        raise FileNotFoundError(f"Specified directions file not found: {path}")
+        raise FileNotFoundError(f"Specified directions file not found: {DIRECTIONS_FILE}")
 
-    model_prefix = get_model_prefix()
     task_suffix = f"_{META_TASK}" if META_TASK else ""
 
+    # New patterns (model prefix no longer in filename)
     patterns = []
     if DIRECTION_TYPE:
-        patterns.append(f"{model_prefix}_{DATASET_NAME}_{METRIC}{task_suffix}_{DIRECTION_TYPE}_directions.npz")
+        patterns.append(f"{DATASET_NAME}_{METRIC}{task_suffix}_{DIRECTION_TYPE}_directions.npz")
     else:
         for dt in ["calibration", "contrastive"]:
-            patterns.append(f"{model_prefix}_{DATASET_NAME}_{METRIC}{task_suffix}_{dt}_directions.npz")
+            patterns.append(f"{DATASET_NAME}_{METRIC}{task_suffix}_{dt}_directions.npz")
 
-    patterns.append(f"{model_prefix}_{DATASET_NAME}_introspection{task_suffix}_{METRIC}_directions.npz")
-    patterns.append(f"{model_prefix}_{DATASET_NAME}_introspection{task_suffix}_{METRIC}_probe_directions.npz")
-    patterns.append(f"{model_prefix}_{DATASET_NAME}_mc_{METRIC}_directions.npz")
-    patterns.append(f"{model_prefix}_{DATASET_NAME}_{METRIC}_directions.npz")
+    patterns.append(f"{DATASET_NAME}_introspection{task_suffix}_{METRIC}_directions.npz")
+    patterns.append(f"{DATASET_NAME}_introspection{task_suffix}_{METRIC}_probe_directions.npz")
+    patterns.append(f"{DATASET_NAME}_mc_{METRIC}_directions.npz")
+    patterns.append(f"{DATASET_NAME}_{METRIC}_directions.npz")
 
     for pattern in patterns:
-        path = OUTPUT_DIR / pattern
+        path = find_output_file(pattern, model_dir=model_dir)
         if path.exists():
             return path
 
     glob_patterns = [
-        f"{model_prefix}*{METRIC}*directions.npz",
-        f"{model_prefix}*directions.npz",
+        f"*{METRIC}*directions.npz",
+        f"*directions.npz",
     ]
 
     for pattern in glob_patterns:
-        matches = list(OUTPUT_DIR.glob(pattern))
+        matches = glob_outputs(pattern, model_dir=model_dir)
         if matches:
             matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             return matches[0]
 
     raise FileNotFoundError(
-        f"No directions file found in {OUTPUT_DIR}\n"
-        f"Model: {model_prefix}, Dataset: {DATASET_NAME}, Metric: {METRIC}"
+        f"No directions file found in outputs/{model_dir}/\n"
+        f"Dataset: {DATASET_NAME}, Metric: {METRIC}"
     )
 
 
@@ -1454,10 +1454,13 @@ def main():
     import torch
     from tqdm import tqdm
 
+    model_dir = get_model_dir()
+
     print(f"\n{'=' * 70}")
     print("ACTIVATION ORACLE PROBE INTERPRETATION (ACCELERATED)")
     print("=" * 70)
     print(f"Model: {get_model_short_name(MODEL)}")
+    print(f"Model dir: {model_dir}")
     print(f"Dataset: {DATASET_NAME}")
     print(f"Metric: {METRIC}")
     print(f"Task: {META_TASK}")
@@ -1478,7 +1481,7 @@ def main():
 
     # Load directions
     try:
-        directions_path = find_directions_file()
+        directions_path = find_directions_file(model_dir=model_dir)
         print(f"\nLoading directions from: {directions_path}")
         directions = load_directions(directions_path)
     except FileNotFoundError as e:

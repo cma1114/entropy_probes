@@ -17,8 +17,8 @@ Direction types and their relationships:
 Inputs:
     outputs/{base}_mc_{metric}_directions.npz               MC uncertainty directions
     outputs/{base}_nexttoken_{metric}_directions.npz        Next-token uncertainty directions
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz   Confidence directions
-    outputs/{base}_meta_{task}_metamcuncert_directions.npz  Meta→MC uncertainty directions
+    outputs/{base}_meta_{task}_confdir_directions.npz   Confidence directions
+    outputs/{base}_meta_{task}_mcuncert_directions.npz  Meta→MC uncertainty directions (consolidated)
 
 Outputs:
     outputs/{base}_direction_analysis.json             Pairwise similarity metrics
@@ -44,8 +44,15 @@ from tqdm import tqdm
 from core import (
     DEVICE,
     get_model_short_name,
+    get_model_dir_name,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file, glob_outputs
+from core.logging_utils import (
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+)
 from core.plotting import save_figure, GRID_ALPHA
 
 # =============================================================================
@@ -54,7 +61,7 @@ from core.plotting import save_figure, GRID_ALPHA
 
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # Set to adapter path if using fine-tuned model
+ADAPTER = None  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"#
 DATASET_FILTER = None#"TriviaMC_difficulty_filtered"  # Only load directions for this dataset (None = all)
 
 # --- Quantization ---
@@ -68,17 +75,14 @@ LAYERS_TO_ANALYZE = None  # None = all layers, or list like [10, 15, 20]
 AVAILABLE_METRICS = ["logit_gap"]#"entropy", "top_prob", "margin", "logit_gap", "top_logit"]
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 
 def get_output_prefix() -> str:
-    """Generate output filename prefix based on config."""
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    if ADAPTER is not None:
-        adapter_short = get_model_short_name(ADAPTER)
-        return str(OUTPUT_DIR / f"{model_short}_adapter-{adapter_short}")
-    return str(OUTPUT_DIR / f"{model_short}")
+    """Generate output filename prefix based on config (without directory)."""
+    # With model-named directories, output prefix is just "direction_analysis"
+    # The model info is in the directory path
+    return "direction_analysis"
 
 
 def extract_dataset_from_npz(path: Path) -> Optional[str]:
@@ -165,16 +169,16 @@ def extract_metric_from_npz(path: Path) -> Optional[str]:
     return None
 
 
-def find_direction_files(output_dir: Path, model_short: str, metric_filter: Optional[str] = None, dataset_filter: Optional[str] = None, exclude_adapters: bool = False) -> Dict[str, Path]:
+def find_direction_files(model_short: str, metric_filter: Optional[str] = None, dataset_filter: Optional[str] = None, exclude_adapters: bool = False, model_dir: str = None) -> Dict[str, Path]:
     """
     Find all direction files for a given model.
 
     Args:
-        output_dir: Directory to search
-        model_short: Short model name for pattern matching
+        model_short: Short model name for pattern matching (legacy support)
         metric_filter: If specified, only include files for this metric
         dataset_filter: If specified, only include files for this dataset
         exclude_adapters: If True, exclude files with "adapter-" in the name
+        model_dir: Model directory for new output structure (if None, uses legacy patterns)
 
     Returns dict mapping direction_type -> path.
     For dataset-specific files (like mc), includes the dataset in the key.
@@ -183,36 +187,36 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
     direction_files = {}
 
     # Patterns that are NOT dataset-specific or metric-specific (single file per model)
+    # New format: {dataset}_direction_vectors.npz in model_dir
+    # Legacy format: {model}_{dataset}_direction_vectors.npz
     simple_patterns = [
-        ("introspection_direction", f"{model_short}*_direction_vectors.npz"),
+        ("introspection_direction", "*_direction_vectors.npz"),
     ]
 
     for direction_type, pattern in simple_patterns:
-        matches = list(output_dir.glob(pattern))
+        matches = glob_outputs(pattern, model_dir=model_dir)
         if matches:
             # Take the most recent if multiple
             direction_files[direction_type] = max(matches, key=lambda p: p.stat().st_mtime)
 
     # Contrastive directions from compute_contrastive_directions.py:
-    # {model}_{dataset}_{metric}_contrastive_{dir_type}_directions.npz
-    # where dir_type is "confidence" or "calibration"
-    # Also supports old format: {model}_{dataset}_{metric}_contrastive_directions.npz
+    # New format: {dataset}_{metric}_contrastive_{dir_type}_directions.npz in model_dir
+    # Legacy format: {model}_{dataset}_{metric}_contrastive_{dir_type}_directions.npz
     for metric in AVAILABLE_METRICS:
         if metric_filter and metric != metric_filter:
             continue
 
         # New format with direction type suffix
         for dir_type in ["confidence", "calibration"]:
-            pattern = f"{model_short}*_{metric}_contrastive_{dir_type}_directions.npz"
-            for path in output_dir.glob(pattern):
+            pattern = f"*_{metric}_contrastive_{dir_type}_directions.npz"
+            for path in glob_outputs(pattern, model_dir=model_dir):
                 dataset = extract_dataset_from_npz(path)
                 if dataset is None:
-                    # Try to extract from filename
+                    # Try to extract from filename: {dataset}_{metric}_contrastive_{dir_type}_directions.npz
                     name = path.name
-                    prefix = f"{model_short}_"
                     suffix = f"_{metric}_contrastive_{dir_type}_directions.npz"
-                    if name.startswith(prefix) and name.endswith(suffix):
-                        dataset = name[len(prefix):-len(suffix)]
+                    if name.endswith(suffix):
+                        dataset = name[:-len(suffix)]
                         dataset = strip_adapter_prefix(dataset)
 
                 if dataset:
@@ -224,20 +228,19 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                     direction_files[key] = path
 
         # Old format without direction type (backward compatibility)
-        contrastive_pattern = f"{model_short}*_{metric}_contrastive_directions.npz"
-        for path in output_dir.glob(contrastive_pattern):
+        contrastive_pattern = f"*_{metric}_contrastive_directions.npz"
+        for path in glob_outputs(contrastive_pattern, model_dir=model_dir):
             # Skip if this matches the new format (has _confidence_ or _calibration_)
             if "_confidence_directions.npz" in path.name or "_calibration_directions.npz" in path.name:
                 continue
 
             dataset = extract_dataset_from_npz(path)
             if dataset is None:
-                # Try to extract from filename: {model}_{dataset}_{metric}_contrastive_directions.npz
+                # Try to extract from filename: {dataset}_{metric}_contrastive_directions.npz
                 name = path.name
-                prefix = f"{model_short}_"
                 suffix = f"_{metric}_contrastive_directions.npz"
-                if name.startswith(prefix) and name.endswith(suffix):
-                    dataset = name[len(prefix):-len(suffix)]
+                if name.endswith(suffix):
+                    dataset = name[:-len(suffix)]
                     dataset = strip_adapter_prefix(dataset)
 
             if dataset:
@@ -249,8 +252,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 direction_files[key] = path
 
     # Introspection direction files from two sources:
-    # 1. run_introspection_experiment.py: {model}_{dataset}_introspection[_{task}]_{metric}_directions.npz
-    # 2. run_introspection_probe.py: {model}_{dataset}_introspection[_{task}]_{metric}_probe_directions.npz
+    # 1. run_introspection_experiment.py: {dataset}_introspection[_{task}]_{metric}_directions.npz
+    # 2. run_introspection_probe.py: {dataset}_introspection[_{task}]_{metric}_probe_directions.npz
     for metric in AVAILABLE_METRICS:
         if metric_filter and metric != metric_filter:
             continue
@@ -262,9 +265,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             return task_match.group(1) if task_match and task_match.group(1) else None
 
         # 1. Match files from run_introspection_experiment.py (no _probe suffix)
-        # Use negative lookahead to exclude _probe_directions files
-        experiment_pattern = f"{model_short}*_introspection*_{metric}_directions.npz"
-        for path in output_dir.glob(experiment_pattern):
+        experiment_pattern = f"*_introspection*_{metric}_directions.npz"
+        for path in glob_outputs(experiment_pattern, model_dir=model_dir):
             # Skip if this is actually a _probe_directions file
             if "_probe_directions.npz" in path.name:
                 continue
@@ -285,8 +287,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 direction_files[key] = path
 
         # 2. Match files from run_introspection_probe.py (_probe suffix)
-        probe_pattern = f"{model_short}*_introspection*_{metric}_probe_directions.npz"
-        for path in output_dir.glob(probe_pattern):
+        probe_pattern = f"*_introspection*_{metric}_probe_directions.npz"
+        for path in glob_outputs(probe_pattern, model_dir=model_dir):
             dataset = extract_dataset_from_npz(path)
             task = extract_task(path.name, metric, has_probe=True)
 
@@ -303,7 +305,7 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 direction_files[key] = path
 
     # Backward compatibility: old introspection_entropy/probe patterns without dataset
-    # These are ONLY for files with the exact pattern {model}_introspection_entropy_directions.npz
+    # These are ONLY for files with the exact pattern *_introspection_entropy_directions.npz
     # (no dataset in the name). Skip if we already found dataset-specific introspection files.
     if not metric_filter or metric_filter == "entropy":
         # Only add these if we found NO dataset-specific introspection files
@@ -311,48 +313,45 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                                    for k in direction_files)
         if not has_dataset_specific:
             old_intro_patterns = [
-                ("introspection_entropy", f"{model_short}_introspection_entropy_directions.npz"),
-                ("introspection_probe", f"{model_short}_introspection_probe_directions.npz"),
+                ("introspection_entropy", "*_introspection_entropy_directions.npz"),
+                ("introspection_probe", "*_introspection_probe_directions.npz"),
             ]
             for key, pattern in old_intro_patterns:
                 if key not in direction_files:
-                    matches = list(output_dir.glob(pattern))
+                    matches = glob_outputs(pattern, model_dir=model_dir)
                     if matches:
                         direction_files[key] = max(matches, key=lambda p: p.stat().st_mtime)
 
     # Metric-specific nexttoken patterns
-    # Pattern: {model}_nexttoken_{metric}_directions.npz
+    # Pattern: {dataset}_nexttoken_{metric}_directions.npz
     for metric in AVAILABLE_METRICS:
         if metric_filter and metric != metric_filter:
             continue
 
-        nexttoken_pattern = f"{model_short}*_nexttoken_{metric}_directions.npz"
-        matches = list(output_dir.glob(nexttoken_pattern))
+        nexttoken_pattern = f"*_nexttoken_{metric}_directions.npz"
+        matches = glob_outputs(nexttoken_pattern, model_dir=model_dir)
         if matches:
             path = max(matches, key=lambda p: p.stat().st_mtime)
             direction_files[f"nexttoken_{metric}"] = path
 
     # Backward compatibility: old nexttoken_entropy_directions.npz format
     if not metric_filter or metric_filter == "entropy":
-        old_pattern = f"{model_short}*_nexttoken_entropy_directions.npz"
-        old_matches = list(output_dir.glob(old_pattern))
+        old_pattern = "*_nexttoken_entropy_directions.npz"
+        old_matches = glob_outputs(old_pattern, model_dir=model_dir)
         for path in old_matches:
             # Check if this is NOT a metric-specific file (old format)
-            # Old format: model_nexttoken_entropy_directions.npz
-            # New format: model_nexttoken_entropy_directions.npz (same name for entropy)
             # We need to check if we already found it via the new pattern
             if "nexttoken_entropy" not in direction_files:
                 direction_files["nexttoken_entropy"] = path
 
     # Dataset-specific and metric-specific MC patterns
-    # New pattern: {model}_{dataset}_mc_{metric}_directions.npz
-    # Old pattern: {model}_{dataset}_mc_entropy_directions.npz
+    # Pattern: {dataset}_mc_{metric}_directions.npz
     for metric in AVAILABLE_METRICS:
         if metric_filter and metric != metric_filter:
             continue
 
-        mc_pattern = f"{model_short}*_mc_{metric}_directions.npz"
-        mc_matches = list(output_dir.glob(mc_pattern))
+        mc_pattern = f"*_mc_{metric}_directions.npz"
+        mc_matches = glob_outputs(mc_pattern, model_dir=model_dir)
         for path in mc_matches:
             # Try to get dataset from metadata first
             dataset = extract_dataset_from_npz(path)
@@ -370,8 +369,8 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
 
     # Backward compatibility: old mc_entropy_directions.npz format
     if not metric_filter or metric_filter == "entropy":
-        old_mc_pattern = f"{model_short}*_mc_entropy_directions.npz"
-        old_mc_matches = list(output_dir.glob(old_mc_pattern))
+        old_mc_pattern = "*_mc_entropy_directions.npz"
+        old_mc_matches = glob_outputs(old_mc_pattern, model_dir=model_dir)
         for path in old_mc_matches:
             dataset = extract_dataset_from_npz(path)
             if dataset is None:
@@ -387,19 +386,18 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 direction_files[key] = path
 
     # Orthogonal directions from compute_orthogonal_directions.py:
-    # {model}_{dataset}_orthogonal_directions.npz
+    # {dataset}_orthogonal_directions.npz
     # Contains: self_confidence_unique_layer_N, other_confidence_unique_layer_N
     # (legacy: introspection_layer_N, surface_layer_N)
-    orthogonal_pattern = f"{model_short}*_orthogonal_directions.npz"
-    for path in output_dir.glob(orthogonal_pattern):
+    orthogonal_pattern = "*_orthogonal_directions.npz"
+    for path in glob_outputs(orthogonal_pattern, model_dir=model_dir):
         dataset = extract_dataset_from_npz(path)
         if dataset is None:
-            # Try to extract from filename
+            # Try to extract from filename: {dataset}_orthogonal_directions.npz
             name = path.name
-            prefix = f"{model_short}_"
             suffix = "_orthogonal_directions.npz"
-            if name.startswith(prefix) and name.endswith(suffix):
-                dataset = name[len(prefix):-len(suffix)]
+            if name.endswith(suffix):
+                dataset = name[:-len(suffix)]
                 dataset = strip_adapter_prefix(dataset)
 
         if dataset:
@@ -411,40 +409,40 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
             direction_files[key] = path
 
     # Consensus directions from compare_directions_cross_dataset.py:
-    # {model}_consensus_directions.npz or {model}_adapter-{name}_consensus_directions.npz
+    # consensus_directions.npz
     # Contains: d_self_confidence_layer_N, d_other_confidence_layer_N,
     #           d_self_confidence_unique_layer_N, d_other_confidence_unique_layer_N,
     #           d_contrast_layer_N, d_mc_{metric}_layer_N (averaged across datasets)
-    consensus_pattern = f"{model_short}*_consensus_directions.npz"
-    for path in output_dir.glob(consensus_pattern):
+    consensus_pattern = "*_consensus_directions.npz"
+    for path in glob_outputs(consensus_pattern, model_dir=model_dir):
         # Use most recent if multiple exist
         if "consensus" not in direction_files or path.stat().st_mtime > direction_files["consensus"].stat().st_mtime:
             direction_files["consensus"] = path
 
     # Meta confidence directions from test_meta_transfer.py:
-    # {model}_{dataset}_meta_confidence_metaconfdir_directions.npz (d_self_confidence)
-    # {model}_{dataset}_meta_other_confidence_metaconfdir_directions.npz (d_other_confidence)
+    # {dataset}_meta_confidence_confdir_directions_{pos}.npz (d_self_confidence)
+    # {dataset}_meta_other_confidence_confdir_directions_{pos}.npz (d_other_confidence)
     for conf_type, label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence")]:
-        pattern = f"{model_short}*_meta_{conf_type}_metaconfdir_directions.npz"
-        for path in output_dir.glob(pattern):
-            dataset = extract_dataset_from_npz(path)
-            if dataset is None:
-                # Try to extract from filename
-                name = path.name
-                prefix = f"{model_short}_"
-                suffix = f"_meta_{conf_type}_metaconfdir_directions.npz"
-                if name.startswith(prefix) and name.endswith(suffix):
-                    dataset = name[len(prefix):-len(suffix)]
-                    # Strip adapter prefix if present (e.g., "adapter-xyz_SimpleMC" -> "SimpleMC")
-                    dataset = strip_adapter_prefix(dataset)
+        # Match new per-position format and legacy format
+        for pattern in [f"*_meta_{conf_type}_confdir_directions_*.npz", f"*_meta_{conf_type}_confdir_directions.npz"]:
+            for path in glob_outputs(pattern, model_dir=model_dir):
+                dataset = extract_dataset_from_npz(path)
+                if dataset is None:
+                    # Try to extract from filename
+                    name = path.name
+                    # Match: {dataset}_meta_{conf_type}_confdir_directions_{pos}.npz or legacy without pos
+                    match = re.match(rf"(.+?)_meta_{conf_type}_confdir_directions(?:_\w+)?\.npz$", name)
+                    if match:
+                        dataset = match.group(1)
+                        dataset = strip_adapter_prefix(dataset)
 
-            if dataset:
-                key = f"{label}_{dataset}"
-            else:
-                key = label
+                if dataset:
+                    key = f"{label}_{dataset}"
+                else:
+                    key = label
 
-            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
-                direction_files[key] = path
+                if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                    direction_files[key] = path
 
     # selfVother_conf directions from compute_contrast_direction.py:
     # {model}_{dataset}_selfVother_conf_directions.npz (new format)
@@ -453,7 +451,7 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
     # Contains: selfVother_conf_layer_N or self_vs_other_confidence_layer_N or contrast_layer_N
     for suffix_pattern in ["_selfVother_conf_directions.npz", "_self_vs_other_confidence_directions.npz", "_contrast_directions.npz"]:
         pattern = f"{model_short}*{suffix_pattern}"
-        for path in output_dir.glob(pattern):
+        for path in glob_outputs(pattern, model_dir=model_dir):
             dataset = extract_dataset_from_npz(path)
             if dataset is None:
                 # Try to extract from filename
@@ -473,28 +471,30 @@ def find_direction_files(output_dir: Path, model_short: str, metric_filter: Opti
                 direction_files[key] = path
 
     # Meta→MC uncertainty directions from test_meta_transfer.py (with FIND_MC_UNCERTAINTY_DIRECTIONS=True):
-    # {model}_{dataset}_meta_confidence_metamcuncert_directions.npz
-    # {model}_{dataset}_meta_other_confidence_metamcuncert_directions.npz
+    # New format: {dataset}_meta_{conf_type}_mcuncert_directions_{pos}.npz
+    # Legacy format: {dataset}_meta_{conf_type}_mcuncert_directions.npz
+    # with keys like probe_{metric}_layer_0, mean_diff_{metric}_layer_5
     for conf_type in ["confidence", "other_confidence"]:
-        pattern = f"{model_short}*_meta_{conf_type}_metamcuncert_directions.npz"
-        for path in output_dir.glob(pattern):
-            dataset = extract_dataset_from_npz(path)
-            if dataset is None:
-                # Try to extract from filename
-                name = path.name
-                prefix = f"{model_short}_"
-                suffix = f"_meta_{conf_type}_metamcuncert_directions.npz"
-                if name.startswith(prefix) and name.endswith(suffix):
-                    dataset = name[len(prefix):-len(suffix)]
-                    dataset = strip_adapter_prefix(dataset)
+        # Match new per-position format and legacy format
+        for pattern in [f"*_meta_{conf_type}_mcuncert_directions_*.npz", f"*_meta_{conf_type}_mcuncert_directions.npz"]:
+            for path in glob_outputs(pattern, model_dir=model_dir):
+                dataset = extract_dataset_from_npz(path)
+                if dataset is None:
+                    # Try to extract from filename
+                    name = path.name
+                    # Match pattern: {dataset}_meta_{conf_type}_mcuncert_directions_{pos}.npz or legacy
+                    match = re.match(rf"(.+?)_meta_{conf_type}_mcuncert_directions(?:_\w+)?\.npz$", name)
+                    if match:
+                        dataset = match.group(1)
+                        dataset = strip_adapter_prefix(dataset)
 
-            if dataset:
-                key = f"d_meta_mc_uncert_{conf_type}_{dataset}"
-            else:
-                key = f"d_meta_mc_uncert_{conf_type}"
+                if dataset:
+                    key = f"d_meta_mc_uncert_{conf_type}_{dataset}"
+                else:
+                    key = f"d_meta_mc_uncert_{conf_type}"
 
-            if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
-                direction_files[key] = path
+                if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+                    direction_files[key] = path
 
     # Filter by dataset if specified
     if dataset_filter:
@@ -965,15 +965,17 @@ def main():
 
     # Find direction files
     model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
     direction_files = find_direction_files(
-        OUTPUT_DIR, model_short,
+        model_short,
         metric_filter=args.metric,
         dataset_filter=DATASET_FILTER,
-        exclude_adapters=(ADAPTER is None)
+        exclude_adapters=(ADAPTER is None),
+        model_dir=model_dir
     )
 
     if not direction_files:
-        print(f"No direction files found in {OUTPUT_DIR} for model {model_short}")
+        print(f"No direction files found for model {model_short}")
         if args.metric:
             print(f"  (filtered by metric: {args.metric})")
         print("Run one of the probe scripts first:")
@@ -1201,7 +1203,7 @@ Key prediction:
         print("\nLogit lens skipped (no model weights loaded).")
 
     # Save results
-    results_path = Path(f"{output_prefix}_direction_analysis.json")
+    results_path = get_output_path(f"{output_prefix}_direction_analysis.json", model_dir=model_dir)
 
     # Convert numpy types for JSON serialization
     def convert_for_json(obj):
@@ -1268,7 +1270,7 @@ Key prediction:
             # Similarity across layers
             plot_similarity_across_layers(
                 all_directions, all_layers,
-                Path(f"{output_prefix}_direction_similarity_across_layers.png")
+                get_output_path(f"{output_prefix}_direction_similarity_across_layers.png", model_dir=model_dir)
             )
         else:
             print("\nOnly one direction type found - skipping similarity plot")
@@ -1331,7 +1333,7 @@ Key prediction:
                     plot_logit_lens_heatmap(
                         all_directions, all_layers, source, direction_name,
                         lm_head_weight, tokenizer,
-                        Path(filename),
+                        get_output_path(filename, model_dir=model_dir),
                         top_k=TOP_K_TOKENS,
                         norm_weight=norm_weight
                     )

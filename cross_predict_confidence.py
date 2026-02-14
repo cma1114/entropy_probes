@@ -23,15 +23,19 @@ from sklearn.model_selection import train_test_split
 import joblib
 
 from core.directions import apply_probe_centered
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.model_utils import get_model_dir_name
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# Base name for input files
-INPUT_BASE_NAME = "Llama-3.3-70B-Instruct_TriviaMC_difficulty_filtered"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+ADAPTER = None
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+DATASET = "TriviaMC_difficulty_filtered"
 
 # Train/test split (must match identify_confidence_correlate.py)
 TRAIN_SPLIT = 0.8
@@ -40,8 +44,7 @@ SEED = 42
 # Bootstrap for confidence intervals (resample predictions, NOT refit)
 N_BOOTSTRAP = 100
 
-# Output
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+# Uses centralized path management from core.config_utils
 
 
 # =============================================================================
@@ -257,18 +260,20 @@ INTERPRETATION: {interpretation}
 
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
-    print(f"Input base: {INPUT_BASE_NAME}")
+    print(f"Model: {MODEL}")
+    print(f"Dataset: {DATASET}")
+    print(f"Model dir: {model_dir}")
     print(f"Train/test split: {TRAIN_SPLIT}")
     print(f"Bootstrap iterations: {N_BOOTSTRAP}")
     print()
 
-    # Construct file paths
-    self_probes_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_confidence_confidence_probes.joblib"
-    other_probes_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_other_confidence_confidence_probes.joblib"
-    self_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_confidence_activations.npz"
-    other_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_other_confidence_activations.npz"
+    # Construct file paths using centralized path management
+    self_probes_path = find_output_file(f"{DATASET}_confidence_confidence_probes.joblib", model_dir=model_dir)
+    other_probes_path = find_output_file(f"{DATASET}_other_confidence_confidence_probes.joblib", model_dir=model_dir)
+    self_acts_path = find_output_file(f"{DATASET}_meta_confidence_activations.npz", model_dir=model_dir)
+    other_acts_path = find_output_file(f"{DATASET}_meta_other_confidence_activations.npz", model_dir=model_dir)
 
     # Check all required files exist
     missing = []
@@ -279,7 +284,7 @@ def main():
         (other_acts_path, "other-confidence activations"),
     ]:
         if not path.exists():
-            missing.append(f"  {desc}: {path}")
+            missing.append(f"  {desc}: {path.name}")
 
     if missing:
         print("ERROR: Missing required files:")
@@ -456,7 +461,9 @@ def main():
     # Compile full results
     results = {
         "config": get_config_dict(
-            input_base=INPUT_BASE_NAME,
+            model=MODEL,
+            adapter=ADAPTER,
+            dataset=DATASET,
             train_split=TRAIN_SPLIT,
             n_bootstrap=N_BOOTSTRAP,
             seed=SEED,
@@ -465,6 +472,8 @@ def main():
             n_self_test=int(len(test_idx_self)),
             n_other_test=int(len(test_idx_other)),
             num_layers=int(num_layers),
+            load_in_4bit=LOAD_IN_4BIT,
+            load_in_8bit=LOAD_IN_8BIT,
         ),
         "by_layer": results_by_layer,
         "summary": summary,
@@ -472,13 +481,13 @@ def main():
     }
 
     # Save JSON results
-    results_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_confidence_cross_prediction.json"
+    results_path = get_output_path(f"{DATASET}_confidence_cross_prediction.json", model_dir=model_dir)
     print(f"\nSaving results to {results_path}...")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
     # Plot results
-    plot_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_confidence_cross_prediction.png"
+    plot_path = get_output_path(f"{DATASET}_confidence_cross_prediction.png", model_dir=model_dir)
     print(f"Plotting results...")
     plot_cross_prediction_results(results, num_layers, plot_path)
 

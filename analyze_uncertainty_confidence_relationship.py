@@ -13,7 +13,7 @@ Inputs:
     outputs/{base}_mc_activations.npz                   MC task activations
     outputs/{base}_meta_{task}_activations.npz          Meta-task activations
     outputs/{base}_mc_{metric}_directions.npz           Uncertainty directions
-    outputs/{base}_meta_{task}_metaconfdir_directions.npz  Confidence directions
+    outputs/{base}_meta_{task}_confdir_directions.npz  Confidence directions
     outputs/{base}_cross_direction_{metric}_results.json   Cross-direction ablation results
 
 Outputs:
@@ -31,14 +31,20 @@ import matplotlib.pyplot as plt
 from scipy import stats
 
 from core.plotting import save_figure, GRID_ALPHA, CI_ALPHA, DPI, DIRECTION_COLORS
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.model_utils import get_model_dir_name
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+ADAPTER = None
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
+DATASET = "TriviaMC_difficulty_filtered"
 META_TASK = "confidence"
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 METRIC = "logit_gap"  # Uncertainty metric
 
 # Key layers to focus analysis (from prior results: L14-15 are causal peak)
@@ -52,8 +58,7 @@ BOOTSTRAP_N = 2000
 SEED = 42
 
 # Output
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 np.random.seed(SEED)
 
@@ -124,9 +129,9 @@ def load_directions(path: Path, method: str = "mean_diff") -> Dict[int, np.ndarr
     return directions
 
 
-def load_cross_direction_results(base_name: str, metric: str) -> Optional[Dict]:
+def load_cross_direction_results(base_name: str, metric: str, model_dir: str = None) -> Optional[Dict]:
     """Load cross-direction ablation results."""
-    path = OUTPUT_DIR / f"{base_name}_cross_direction_{metric}_results.json"
+    path = find_output_file(f"{base_name}_cross_direction_{metric}_results.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         return None
@@ -135,9 +140,9 @@ def load_cross_direction_results(base_name: str, metric: str) -> Optional[Dict]:
         return json.load(f)
 
 
-def load_dataset(base_name: str) -> List[Dict]:
-    """Load question dataset with metric values."""
-    path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
+def load_dataset(base_name: str, model_dir: str = None) -> List[Dict]:
+    """Load question dataset with metric values from consolidated mc_results.json."""
+    path = find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
     if not path.exists():
         print(f"  Warning: {path} not found")
         return []
@@ -145,7 +150,9 @@ def load_dataset(base_name: str) -> List[Dict]:
     with open(path) as f:
         data = json.load(f)
 
-    return data.get("data", data.get("questions", data.get("items", [])))
+    # Handle consolidated format (data is in data["dataset"]["data"])
+    dataset = data.get("dataset", data)
+    return dataset.get("data", dataset.get("questions", dataset.get("items", [])))
 
 
 # =============================================================================
@@ -838,10 +845,13 @@ def plot_analysis_results(
 # =============================================================================
 
 def main():
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     print("=" * 70)
     print("UNCERTAINTY-CONFIDENCE RELATIONSHIP ANALYSIS")
     print("=" * 70)
-    print(f"\nInput: {INPUT_BASE_NAME}")
+    print(f"\nModel dir: {model_dir}")
+    print(f"Dataset: {DATASET}")
     print(f"Meta-task: {META_TASK}")
     print(f"Metric: {METRIC}")
     print(f"Method: {METHOD}")
@@ -849,8 +859,8 @@ def main():
 
     # Load directions
     print("\nLoading directions...")
-    unc_dir_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_mc_{METRIC}_directions.npz"
-    conf_dir_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_metaconfdir_directions.npz"
+    unc_dir_path = find_output_file(f"{DATASET}_mc_{METRIC}_directions.npz", model_dir=model_dir)
+    conf_dir_path = find_output_file(f"{DATASET}_meta_{META_TASK}_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
 
     unc_dirs = load_directions(unc_dir_path, METHOD)
     conf_dirs = load_directions(conf_dir_path, METHOD)
@@ -864,8 +874,8 @@ def main():
 
     # Load activations (both MC and meta-task for domain comparison)
     print("\nLoading activations...")
-    meta_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_activations.npz"
-    mc_acts_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_mc_activations.npz"
+    meta_acts_path = find_output_file(f"{DATASET}_meta_{META_TASK}_activations.npz", model_dir=model_dir)
+    mc_acts_path = find_output_file(f"{DATASET}_mc_activations.npz", model_dir=model_dir)
 
     meta_acts = load_activations(meta_acts_path)
     mc_acts = load_activations(mc_acts_path)
@@ -875,7 +885,7 @@ def main():
 
     # Load cross-direction results
     print("\nLoading cross-direction ablation results...")
-    cross_results = load_cross_direction_results(INPUT_BASE_NAME, METRIC)
+    cross_results = load_cross_direction_results(DATASET, METRIC, model_dir=model_dir)
     if cross_results:
         print(f"  Loaded {len(cross_results.get('results', {}))} ablation results")
 
@@ -1011,7 +1021,7 @@ def main():
     print("Tests arithmetic explanation: more negative baseline_unc -> more positive delta_conf")
     print()
 
-    per_sample_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_cross_direction_{METRIC}_per_sample.npz"
+    per_sample_path = find_output_file(f"{DATASET}_cross_direction_{METRIC}_per_sample.npz", model_dir=model_dir)
     per_sample_results = {}
 
     if per_sample_path.exists():
@@ -1070,12 +1080,16 @@ def main():
 
     results = {
         "config": get_config_dict(
-            input_base=INPUT_BASE_NAME,
+            model=MODEL,
+            adapter=ADAPTER,
+            dataset=DATASET,
             meta_task=META_TASK,
             metric=METRIC,
             method=METHOD,
             focus_layers=FOCUS_LAYERS,
             bootstrap_n=BOOTSTRAP_N,
+            load_in_4bit=LOAD_IN_4BIT,
+            load_in_8bit=LOAD_IN_8BIT,
         ),
         "projection_correlations": {str(k): v for k, v in projection_results.items()},
         "direction_decomposition": {str(k): v for k, v in decomposition_results.items()},
@@ -1085,13 +1099,13 @@ def main():
         "synthesis": synthesis,
     }
 
-    json_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_uncertainty_confidence_analysis.json"
+    json_path = get_output_path(f"{DATASET}_uncertainty_confidence_analysis.json", model_dir=model_dir)
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"  Saved: {json_path}")
 
     # Plot results
-    plot_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_uncertainty_confidence_analysis.png"
+    plot_path = get_output_path(f"{DATASET}_uncertainty_confidence_analysis.png", model_dir=model_dir)
     plot_analysis_results(
         projection_results,
         decomposition_results,

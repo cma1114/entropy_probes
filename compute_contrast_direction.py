@@ -20,7 +20,7 @@ Outputs (for each dataset):
     outputs/{model}_{dataset}_selfVother_conf_directions.npz
 
 Configuration:
-    MODEL_SHORT: Model name (e.g., "Llama-3.1-8B-Instruct")
+    MODEL: Full model path (e.g., "meta-llama/Llama-3.1-8B-Instruct")
     ADAPTER: Optional path to PEFT/LoRA adapter (must match identify step)
     DATASETS: List of dataset names to process
 
@@ -32,14 +32,17 @@ Run after:
 import numpy as np
 from pathlib import Path
 
-from core.model_utils import get_model_short_name
+from core.model_utils import get_model_dir_name
+from core.config_utils import get_output_path, find_output_file
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-MODEL_SHORT = "Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter (must match identify step if used)
+LOAD_IN_4BIT = False
+LOAD_IN_8BIT = False
 DATASETS = [
     "TriviaMC_difficulty_filtered",
     "PopMC_0_difficulty_filtered",
@@ -47,37 +50,36 @@ DATASETS = [
 ]
 POSITION = "final"  # Token position to use for activations
 
-OUTPUT_DIR = Path("outputs")
+# Uses centralized path management from core.config_utils
 
 
-def get_base_name(dataset: str) -> str:
-    """Get base name for a dataset, including adapter if configured."""
-    if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        return f"{MODEL_SHORT}_adapter-{adapter_short}_{dataset}"
-    return f"{MODEL_SHORT}_{dataset}"
+def get_model_dir() -> str:
+    """Get model directory name for the configured model."""
+    return get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
 
-def load_activations(base_name: str, task: str, position: str = "final") -> dict[int, np.ndarray]:
+def load_activations(dataset: str, task: str, position: str = "final", model_dir: str = None) -> dict[int, np.ndarray]:
     """
     Load activations from meta-task activation file.
 
     Args:
-        base_name: Base name for input files
+        dataset: Dataset name
         task: "confidence" or "other_confidence"
         position: Token position (default "final")
+        model_dir: Model directory for routing to correct output location
 
     Returns:
         {layer: (n_samples, hidden_dim)}
     """
-    path = OUTPUT_DIR / f"{base_name}_meta_{task}_activations.npz"
+    filename = f"{dataset}_meta_{task}_activations.npz"
+    path = find_output_file(filename, model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(
-            f"Activations not found: {path}\n"
+            f"Activations not found: {filename}\n"
             f"Run: test_meta_transfer.py with META_TASK='{task}'"
         )
 
@@ -152,17 +154,17 @@ def compute_selfVother_conf_direction(
     return direction.astype(np.float32), info
 
 
-def process_dataset(base_name: str) -> bool:
+def process_dataset(dataset: str, model_dir: str = None) -> bool:
     """Process a single dataset. Returns True if successful."""
     print(f"\n{'='*60}")
-    print(f"Dataset: {base_name}")
+    print(f"Dataset: {dataset}")
     print(f"Position: {POSITION}")
 
     # Load activations
     print("\nLoading activations...")
     try:
-        self_acts = load_activations(base_name, "confidence", POSITION)
-        other_acts = load_activations(base_name, "other_confidence", POSITION)
+        self_acts = load_activations(dataset, "confidence", POSITION, model_dir=model_dir)
+        other_acts = load_activations(dataset, "other_confidence", POSITION, model_dir=model_dir)
     except FileNotFoundError as e:
         print(f"  SKIPPED: {e}")
         return False
@@ -189,8 +191,8 @@ def process_dataset(base_name: str) -> bool:
     # Compute selfVother_conf direction for each layer
     print("\nComputing selfVother_conf directions...")
     save_data = {
-        "_metadata_model": base_name.split("_")[0],
-        "_metadata_dataset": "_".join(base_name.split("_")[1:]),
+        "_metadata_model": MODEL,
+        "_metadata_dataset": dataset,
         "_metadata_position": POSITION,
     }
 
@@ -203,7 +205,7 @@ def process_dataset(base_name: str) -> bool:
         raw_norms.append(info["raw_norm"])
 
     # Save
-    output_path = OUTPUT_DIR / f"{base_name}_selfVother_conf_directions.npz"
+    output_path = get_output_path(f"{dataset}_selfVother_conf_directions.npz", model_dir=model_dir)
     np.savez_compressed(output_path, **save_data)
     print(f"\nSaved: {output_path.name}")
 
@@ -216,9 +218,12 @@ def process_dataset(base_name: str) -> bool:
 
 
 def main():
-    print(f"Model: {MODEL_SHORT}")
+    model_dir = get_model_dir()
+
+    print(f"Model: {MODEL}")
     if ADAPTER:
         print(f"Adapter: {ADAPTER}")
+    print(f"Model dir: {model_dir}")
     print(f"Datasets: {DATASETS}")
     print(f"Position: {POSITION}")
 
@@ -226,8 +231,7 @@ def main():
     n_skipped = 0
 
     for dataset in DATASETS:
-        base_name = get_base_name(dataset)
-        if process_dataset(base_name):
+        if process_dataset(dataset, model_dir=model_dir):
             n_success += 1
         else:
             n_skipped += 1

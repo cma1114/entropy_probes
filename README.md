@@ -202,39 +202,34 @@ For causality outputs, `{dir_suffix}` encodes the direction type: `uncertainty_{
 
 | Stage | File pattern | Description |
 |-------|-------------|-------------|
-| **Identify** | `*_mc_activations.npz` | Reusable activations (all layers) |
-| | `*_mc_dataset.json` | Question metadata + all metrics |
-| | `*_mc_{metric}_directions.npz` | Directions per metric (for transfer) |
+| **Identify (MC)** | `*_mc_results.json` | **Consolidated**: dataset + metrics + answer results |
+| | `*_mc_activations.npz` | Cached activations (all layers) |
+| | `*_mc_{metric}_directions.npz` | Direction vectors per metric |
 | | `*_mc_{metric}_probes.joblib` | Trained probes per layer |
-| | `*_mc_{metric}_results.json` | Per-layer R², MAE, bootstrap CIs |
-| | `*_mc_answer_directions.npz` | Answer directions (classifier + centroid) |
-| | `*_mc_answer_probes.joblib` | 4-class answer probes per layer |
-| | `*_mc_answer_results.json` | Per-layer answer accuracy |
-| | `*_mc_distributions.png` | Metric distributions (one row per metric) |
+| | `*_mc_answer_directions.npz` | Answer directions (if enabled) |
+| | `*_mc_answer_probes.joblib` | Answer probes (if enabled) |
+| | `*_mc_distributions.png` | Metric distributions |
 | | `*_mc_directions.png` | 4-panel directions summary |
-| **Identify (next-token)** | `*_nexttoken_activations.npz` | Reusable activations (all layers) |
-| | `*_nexttoken_dataset.json` | Sample metadata + metric values |
-| | `*_nexttoken_{metric}_directions.npz` | Directions per metric |
-| | `*_nexttoken_{metric}_results.json` | Per-layer R², CIs |
+| | `*_mc_run.log` | Detailed per-layer results |
+| **Identify (next-token)** | `*_nexttoken_results.json` | **Consolidated**: dataset + metrics + token results |
+| | `*_nexttoken_activations.npz` | Cached activations |
+| | `*_nexttoken_{metric}_directions.npz` | Direction vectors per metric |
 | | `*_nexttoken_{metric}_results.png` | R² curves per method |
-| | `*_nexttoken_token_results.json` | Token prediction accuracy |
-| **Meta-task** | `*_meta_{task}_activations.npz` | Meta-task activations |
-| | `*_meta_{task}_results.json` | Transfer R², behavioral analysis |
+| | `*_nexttoken_run.log` | Detailed per-layer results |
+| **Meta-task** | `*_meta_{task}_results.json` | Transfer R², behavioral analysis, confidence directions |
+| | `*_meta_{task}_activations.npz` | Meta-task activations |
 | | `*_meta_{task}_results.png` | Transfer plots |
-| | `*_meta_{task}_metaconfdir_directions.npz` | Confidence directions (meta → stated conf) |
-| | `*_meta_{task}_metamcuncert_directions.npz` | MC uncertainty directions from meta (meta → MC unc) |
-| | `*_meta_{task}_metamcuncert_results.json` | R², cosine similarity to d_mc |
+| | `*_meta_{task}_metaconfdir_directions.npz` | Confidence directions (if enabled) |
+| | `*_meta_{task}_metamcuncert_{metric}_directions.npz` | MC uncertainty from meta (if enabled) |
+| | `*_meta_{task}_run.log` | Detailed results |
 | **Causality** | `*_ablation_{task}_{dir_suffix}_results.json` | Ablation effects + FDR |
 | | `*_ablation_{task}_{dir_suffix}_results.png` | Ablation plots |
 | | `*_steering_{task}_{dir_suffix}_results.json` | Steering dose-response |
 | | `*_steering_{task}_{dir_suffix}_results.png` | Steering plots |
 | | `*_cross_direction_{metric}_results.json` | Cross-direction effects |
 | | `*_cross_direction_{metric}_results.png` | Cross-direction heatmaps |
-| | `*_cross_direction_{metric}_ablation_effect.png` | Single ablation trajectory plot |
 | **Interpret** | `*_direction_analysis.json` | Logit lens + similarity |
-| | `*_direction_comparison.json` | Direction type comparison |
-| | `*_direction_comparison.png` | Comparison plots |
-| **Summary** | `*_summary.json` | Cross-stage aggregation |
+| | `*_direction_analysis.png` | Analysis plots |
 
 ## Metrics
 
@@ -276,7 +271,6 @@ entropy_probes/
   ao_interpreter.py                  # AO library
 
   # Cross-stage
-  summarize_results.py               # Cross-stage consolidation
   cross_predict_confidence.py        # Self vs other-confidence cross-prediction
   synthesize_causal_results.py       # Synthesize ablation + steering results
 
@@ -302,9 +296,10 @@ entropy_probes/
     steering_experiments.py          # Ablation/steering experiment utilities
     config_utils.py                  # get_config_dict() for JSON metadata
     plotting.py                      # Centralized visualization helpers
+    logging_utils.py                 # Minimal console + detailed log file output
 
   # Archived
-  archive/                           # 22 legacy/debug/one-off scripts
+  archive/                           # Legacy/debug scripts (25+ files)
   archive/originals/                 # Pre-modification snapshots
 ```
 

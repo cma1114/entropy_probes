@@ -15,17 +15,17 @@ multiplier sweeps for efficiency.
 
 Inputs:
     outputs/{base}_mc_{metric}_directions.npz           Uncertainty directions (from Stage 1)
-    outputs/{base}_meta_{task}_metamcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
-    outputs/{base}_mc_dataset.json                      Question metadata + metric values
+    outputs/{base}_meta_{task}_mcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
+    outputs/{base}_mc_results.json                       Consolidated results (dataset + metrics)
 
-Outputs (one file per method/position combination):
-    outputs/{base}_steering_{task}_{dir_suffix}_{method}_{positions}_results.json
-    outputs/{base}_steering_{task}_{dir_suffix}_{method}_{positions}_{position}.png
+Outputs (one file per method, with per-position plots):
+    outputs/{base}_steering_{task}_{dir_suffix}_{method}_results.json
+    outputs/{base}_steering_{task}_{dir_suffix}_{method}_{position}.png
 
-    where {base} = {model_short_name}_{dataset}
+    where {base} = {dataset} (model info is in directory path)
           {dir_suffix} = "{direction_type}_{metric}" for uncertainty, else "{direction_type}"
           {method} = "probe" or "mean_diff"
-          {positions} = position(s) tested, joined by underscore (e.g., "final" or "final_question_mark")
+          {position} = token position tested (e.g., "final")
 
 Shared parameters (must match across scripts):
     SEED, TRAIN_SPLIT
@@ -48,10 +48,16 @@ from sklearn.model_selection import train_test_split
 from core.model_utils import (
     load_model_and_tokenizer,
     should_use_chat_template,
-    get_model_short_name,
+    get_model_dir_name,
     DEVICE,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
+from core.logging_utils import (
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+)
 from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA, SIGNIFICANCE_COLORS
 from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
@@ -68,8 +74,11 @@ from tasks import (
     get_stated_confidence_signal,
     format_answer_or_delegate_prompt,
     get_answer_or_delegate_signal,
+    format_other_confidence_prompt,
+    get_other_confidence_signal,
     STATED_CONFIDENCE_OPTIONS,
     ANSWER_OR_DELEGATE_OPTIONS,
+    OTHER_CONFIDENCE_OPTIONS,
     find_mc_positions,
 )
 
@@ -80,9 +89,10 @@ from tasks import (
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-INPUT_BASE_NAME = "Llama-3.1-8B-Instruct_TriviaMC_difficulty_filtered"
+DATASET = "TriviaMC_difficulty_filtered"  # Dataset name (model prefix now in directory)
 METRIC = "logit_gap"  # Which metric's directions to test
-META_TASK = "confidence"  # "confidence" or "delegate"
+META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
+PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
 # Direction type to steer:
 # - "uncertainty": Steer uncertainty directions (from identify_mc_correlate.py)
@@ -121,14 +131,13 @@ PROBE_POSITIONS = ["final"]#["question_mark", "question_newline", "options_newli
 
 # Layer selection from transfer results (for non-final positions)
 TRANSFER_R2_THRESHOLD = 0.3  # Layers with R² >= this are tested for non-final positions
-TRANSFER_RESULTS_PATH = None  # Auto-detect from INPUT_BASE_NAME if None
+TRANSFER_RESULTS_PATH = None  # Auto-detect from DATASET if None
 
 # Control count for non-final positions (final uses NUM_CONTROLS)
 NUM_CONTROLS_NONFINAL = 10
 
 # --- Output ---
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# Uses centralized path management from core.config_utils
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -138,7 +147,7 @@ torch.manual_seed(SEED)
 # TRANSFER RESULTS LOADING (for layer selection)
 # =============================================================================
 
-def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
+def load_transfer_results(base_name: str, meta_task: str, model_dir: str) -> Optional[Dict]:
     """
     Load transfer results JSON to get per-layer R² values.
 
@@ -146,7 +155,7 @@ def load_transfer_results(base_name: str, meta_task: str) -> Optional[Dict]:
     """
     path = TRANSFER_RESULTS_PATH
     if path is None:
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_results.json"
+        path = find_output_file(f"{base_name}_meta_{meta_task}_transfer_results_{PROBE_POSITION}.json", model_dir=model_dir)
     else:
         path = Path(path)
 
@@ -219,24 +228,27 @@ def load_directions(
     metric: str,
     direction_type: str = "uncertainty",
     meta_task: str = "confidence",
+    model_dir: str = None,
 ) -> Dict[str, Dict[int, np.ndarray]]:
     """
     Load all direction methods from npz file.
 
     Args:
-        base_name: Base name for input files
+        base_name: Base name for input files (dataset name)
         metric: Uncertainty metric (used for direction_type="uncertainty")
         direction_type: "uncertainty" or "metamcuncert"
         meta_task: Meta task (used for direction_type="metamcuncert")
+        model_dir: Model directory name
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
         e.g., {"probe": {0: arr, 1: arr, ...}, "mean_diff": {0: arr, 1: arr, ...}}
     """
     if direction_type == "uncertainty":
-        path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+        path = find_output_file(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir)
     elif direction_type == "metamcuncert":
-        path = OUTPUT_DIR / f"{base_name}_meta_{meta_task}_metamcuncert_directions.npz"
+        # Consolidated file with keys like probe_{metric}_layer_0
+        path = find_output_file(f"{base_name}_meta_{meta_task}_mcuncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -246,42 +258,84 @@ def load_directions(
     data = np.load(path)
 
     methods: Dict[str, Dict[int, np.ndarray]] = {}
-    for key in data.files:
-        if key.startswith("_"):
-            continue  # Skip metadata keys
 
+    if direction_type == "uncertainty":
         # Keys are like "probe_layer_0", "mean_diff_layer_5"
-        parts = key.rsplit("_layer_", 1)
-        if len(parts) != 2:
-            continue
+        for key in data.files:
+            if key.startswith("_"):
+                continue  # Skip metadata keys
 
-        method, layer_str = parts
-        try:
-            layer = int(layer_str)
-        except ValueError:
-            continue
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) != 2:
+                continue
 
-        if method not in methods:
-            methods[method] = {}
+            method, layer_str = parts
+            try:
+                layer = int(layer_str)
+            except ValueError:
+                continue
 
-        # Normalize direction
-        direction = data[key].astype(np.float32)
-        norm = np.linalg.norm(direction)
-        if norm > 0:
-            direction = direction / norm
-        methods[method][layer] = direction
+            if method not in methods:
+                methods[method] = {}
+
+            direction = data[key].astype(np.float32)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+            methods[method][layer] = direction
+
+    elif direction_type == "metamcuncert":
+        # Consolidated file with keys like "probe_{metric}_layer_0", "mean_diff_{metric}_layer_5"
+        for key in data.files:
+            if key.startswith("_"):
+                continue  # Skip metadata keys
+
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) != 2:
+                continue
+
+            method_metric, layer_str = parts
+            try:
+                layer = int(layer_str)
+            except ValueError:
+                continue
+
+            # Parse method and metric from "probe_entropy" or "mean_diff_logit_gap"
+            if method_metric.startswith("probe_"):
+                method_name = "probe"
+                key_metric = method_metric[6:]  # Remove "probe_"
+            elif method_metric.startswith("mean_diff_"):
+                method_name = "mean_diff"
+                key_metric = method_metric[10:]  # Remove "mean_diff_"
+            else:
+                continue
+
+            # Only include if metric matches
+            if key_metric != metric:
+                continue
+
+            if method_name not in methods:
+                methods[method_name] = {}
+
+            direction = data[key].astype(np.float32)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+            methods[method_name][layer] = direction
 
     return methods
 
 
-def load_dataset(base_name: str) -> Dict:
-    """Load dataset with questions and metric values."""
-    path = OUTPUT_DIR / f"{base_name}_mc_dataset.json"
+def load_dataset(base_name: str, model_dir: str) -> Dict:
+    """Load consolidated mc_results.json with questions and metric values."""
+    path = find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(f"Dataset file not found: {path}")
 
     with open(path, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Return nested dataset section for compatibility
+    return data["dataset"]
 
 
 # =============================================================================
@@ -294,6 +348,8 @@ def get_format_fn(meta_task: str):
         return format_stated_confidence_prompt
     elif meta_task == "delegate":
         return format_answer_or_delegate_prompt
+    elif meta_task == "other_confidence":
+        return format_other_confidence_prompt
     else:
         raise ValueError(f"Unknown meta_task: {meta_task}")
 
@@ -307,6 +363,8 @@ def get_signal_fn(meta_task: str):
     if meta_task == "confidence":
         # Wrap to match (probs, mapping) signature
         return lambda p, m: get_stated_confidence_signal(p)
+    elif meta_task == "other_confidence":
+        return lambda p, m: get_other_confidence_signal(p)
     elif meta_task == "delegate":
         return get_answer_or_delegate_signal
     else:
@@ -317,6 +375,8 @@ def get_options(meta_task: str) -> List[str]:
     """Get response options for meta-task."""
     if meta_task == "confidence":
         return list(STATED_CONFIDENCE_OPTIONS.keys())
+    elif meta_task == "other_confidence":
+        return list(OTHER_CONFIDENCE_OPTIONS.keys())
     elif meta_task == "delegate":
         return ANSWER_OR_DELEGATE_OPTIONS
     else:
@@ -1168,11 +1228,14 @@ def print_summary(analyses: Dict[str, Dict]):
 # =============================================================================
 
 def main():
+    # Get model directory for centralized path management
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
     print("=" * 70)
     print("STEERING CAUSALITY TEST")
     print("=" * 70)
     print(f"\nModel: {MODEL}")
-    print(f"Input: {INPUT_BASE_NAME}")
+    print(f"Dataset: {DATASET}")
     print(f"Direction type: {DIRECTION_TYPE}")
     print(f"Metric: {METRIC}")
     print(f"Meta-task: {META_TASK}")
@@ -1183,7 +1246,7 @@ def main():
 
     # Load directions
     print(f"\nLoading directions (type={DIRECTION_TYPE})...")
-    all_directions = load_directions(INPUT_BASE_NAME, METRIC, DIRECTION_TYPE, META_TASK)
+    all_directions = load_directions(DATASET, METRIC, DIRECTION_TYPE, META_TASK, model_dir=model_dir)
     available_methods = list(all_directions.keys())
     print(f"  Found methods: {available_methods}")
 
@@ -1202,7 +1265,7 @@ def main():
 
     # Load dataset
     print("\nLoading dataset...")
-    dataset = load_dataset(INPUT_BASE_NAME)
+    dataset = load_dataset(DATASET, model_dir=model_dir)
     all_data = dataset["data"]
 
     if USE_TRANSFER_SPLIT:
@@ -1225,7 +1288,7 @@ def main():
     print(f"  {METRIC}: mean={metric_values.mean():.3f}, std={metric_values.std():.3f}")
 
     # Load transfer results for layer selection (non-final positions)
-    transfer_data = load_transfer_results(INPUT_BASE_NAME, META_TASK)
+    transfer_data = load_transfer_results(DATASET, META_TASK, model_dir=model_dir)
     if transfer_data is not None:
         print(f"\nLoaded transfer results for layer selection")
         # Preview what layers would be selected FOR EACH (POSITION, METHOD) combination
@@ -1245,7 +1308,7 @@ def main():
                         else:
                             print(f"  {pos}/{method}: WARNING - no layers found, will use ALL layers")
     else:
-        expected_path = OUTPUT_DIR / f"{INPUT_BASE_NAME}_meta_{META_TASK}_results.json"
+        expected_path = find_output_file(f"{DATASET}_meta_{META_TASK}_transfer_results_{PROBE_POSITION}.json", model_dir=model_dir)
         print(f"\nNo transfer results found - will use all layers for all positions")
         print(f"  Expected: {expected_path}")
 
@@ -1353,27 +1416,18 @@ def main():
             print(f"  Best layer: {summary['best_layer']} (slope={summary['best_slope']:.4f})")
 
         # Incremental save after each position completes (crash protection)
-        model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-        # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-        dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-        # Build direction suffix
+        # Include direction type to distinguish uncertainty/metamcuncert
         dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
-        # Build position suffix
-        pos_suffix = "_".join(PROBE_POSITIONS)
 
         # Save checkpoint per method
         for method in methods:
-            if ADAPTER:
-                adapter_short = get_model_short_name(ADAPTER)
-                base_output = f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-            else:
-                base_output = f"{model_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-            checkpoint_path = OUTPUT_DIR / f"{base_output}_checkpoint.json"
+            base_output = f"{DATASET}_steering_{META_TASK}_{dir_suffix}_{method}"
+            checkpoint_path = get_output_path(f"{base_output}_checkpoint.json", model_dir=model_dir, working=True)
 
             checkpoint_json = {
                 "config": get_config_dict(
                     model=MODEL,
-                    input_base_name=INPUT_BASE_NAME,
+                    dataset=DATASET,
                     direction_type=DIRECTION_TYPE,
                     metric=METRIC,
                     meta_task=META_TASK,
@@ -1400,33 +1454,24 @@ def main():
             print(f"  Checkpoint saved: {checkpoint_path.name}")
 
     # Generate output filename components
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
-    # Extract dataset name by removing model prefix from INPUT_BASE_NAME
-    dataset_name = INPUT_BASE_NAME.replace(f"{model_short}_", "", 1)
-    # Build direction suffix (includes metric for uncertainty, just direction_type for others)
+    # Include direction type to distinguish uncertainty/metamcuncert
     dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
 
-    # Build position suffix for filename
-    pos_suffix = "_".join(PROBE_POSITIONS)
-
     def get_base_output(method: str) -> str:
-        """Get base output path for a specific method."""
-        if ADAPTER:
-            adapter_short = get_model_short_name(ADAPTER)
-            return f"{model_short}_adapter-{adapter_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
-        return f"{model_short}_{dataset_name}_steering_{META_TASK}_{dir_suffix}_{method}_{pos_suffix}"
+        """Get base output path for a specific method (without position - added per file)."""
+        return f"{DATASET}_steering_{META_TASK}_{dir_suffix}_{method}"
 
     # Save JSON results - one file per method
     print("\nSaving results...")
     saved_files = []
     for method in methods:
         base_output = get_base_output(method)
-        results_path = OUTPUT_DIR / f"{base_output}_results.json"
+        results_path = get_output_path(f"{base_output}_results.json", model_dir=model_dir)
 
         output_json = {
             "config": get_config_dict(
                 model=MODEL,
-                input_base_name=INPUT_BASE_NAME,
+                dataset=DATASET,
                 direction_type=DIRECTION_TYPE,
                 metric=METRIC,
                 meta_task=META_TASK,
@@ -1469,7 +1514,7 @@ def main():
     for method in methods:
         base_output = get_base_output(method)
         for position in PROBE_POSITIONS:
-            plot_path = OUTPUT_DIR / f"{base_output}_{position}.png"
+            plot_path = get_output_path(f"{base_output}_{position}.png", model_dir=model_dir)
             plot_steering_results(all_analyses_by_position[position][method], method, plot_path)
             saved_files.append(plot_path.name)
 

@@ -7,18 +7,17 @@ both probe and mean_diff direction-finding methods. Optionally also finds output
 directions that predict which token the model selected (parallel to MC answer directions).
 
 Inputs:
-    data/{model}_nexttoken_stratified.json              Stratified next-token dataset
-                                                        (produced by build_nexttoken_dataset.py)
+    outputs/{model_dir}/working/nexttoken_entropy_dataset.json  Stratified next-token dataset
+                                                                 (produced by build_nexttoken_dataset.py)
 
 Outputs:
-    outputs/{base}_nexttoken_activations.npz            Cached activations + metrics
-    outputs/{base}_nexttoken_dataset.json               Sample metadata + metric values
-    outputs/{base}_nexttoken_{metric}_directions.npz    Direction vectors per metric
-    outputs/{base}_nexttoken_{metric}_results.json      Per-layer R², CIs, statistics
-    outputs/{base}_nexttoken_{metric}_results.png       R² curves per metric
-    outputs/{base}_nexttoken_token_results.json         Token prediction accuracy (if enabled)
+    outputs/{model_dir}/results/nexttoken_results.json           Consolidated results
+    outputs/{model_dir}/results/nexttoken_{metric}_results.png   R² curves per metric
+    outputs/{model_dir}/results/nexttoken_entropy_distribution.png  Entropy distribution
+    outputs/{model_dir}/working/nexttoken_activations.npz        Cached activations
+    outputs/{model_dir}/working/nexttoken_{metric}_directions.npz Direction vectors
 
-    where {base} = {model_short_name}
+    where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
 Shared parameters (must match across scripts):
     SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
@@ -41,12 +40,18 @@ from sklearn.decomposition import PCA
 from core import (
     load_model_and_tokenizer,
     get_model_short_name,
+    get_model_dir_name,
     compute_nexttoken_metrics,
     find_directions,
     METRIC_INFO,
     DEVICE,
+    setup_run_logger,
+    print_run_header,
+    print_key_findings,
+    print_run_footer,
+    format_best_layer,
 )
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file
 from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA
 
 # =============================================================================
@@ -81,7 +86,7 @@ MEAN_DIFF_QUANTILE = 0.25    # Must match across scripts
 FIND_OUTPUT_TOKEN_DIRECTIONS = True  # Find directions predicting output token (parallel to MC answer directions)
 
 # --- Output ---
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+# Paths are constructed via get_output_path() which routes to outputs/results/ or outputs/working/
 
 # =============================================================================
 # VISUALIZATION FUNCTIONS
@@ -172,23 +177,21 @@ def plot_results(
     save_figure(fig, output_path)
 
 
-def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: int):
-    """Print diagnostic summary."""
-    print("\n" + "=" * 80)
-    print("DIAGNOSTIC SUMMARY")
-    print("=" * 80)
+def log_diagnostic_summary(logger, metrics_dict: dict, all_results: dict):
+    """Log diagnostic summary to file."""
+    logger.section("Diagnostic Summary")
 
     # Distribution stats for each metric
     for metric_name, values in metrics_dict.items():
         variance = values.var()
         iqr = np.percentile(values, 75) - np.percentile(values, 25)
-        print(f"\n{metric_name.upper()} Distribution:")
-        print(f"  Mean: {values.mean():.3f}, Std: {values.std():.3f}, Variance: {variance:.4f}")
-        print(f"  Median: {np.median(values):.3f}, IQR: {iqr:.3f}")
-        print(f"  Range: [{values.min():.3f}, {values.max():.3f}]")
+        logger.info(f"{metric_name.upper()} Distribution:")
+        logger.info(f"  Mean: {values.mean():.3f}, Std: {values.std():.3f}, Variance: {variance:.4f}")
+        logger.info(f"  Median: {np.median(values):.3f}, IQR: {iqr:.3f}")
+        logger.info(f"  Range: [{values.min():.3f}, {values.max():.3f}]")
 
     # Early vs late layer comparison
-    print(f"\nLayer R² Comparison (early vs late):")
+    logger.info(f"\nLayer R² Comparison (early vs late):")
     for metric_name, results in all_results.items():
         layers = sorted(results["fits"]["probe"].keys())
         n_layers = len(layers)
@@ -200,10 +203,7 @@ def print_diagnostic_summary(metrics_dict: dict, all_results: dict, num_layers: 
             early_r2 = np.mean([fits[l]["r2"] for l in early_layers])
             late_r2 = np.mean([fits[l]["r2"] for l in late_layers])
             r2_increase = late_r2 - early_r2
-
-            print(f"  {metric_name}/{method:<10}: early={early_r2:.3f}, late={late_r2:.3f}, Δ={r2_increase:+.3f}")
-
-    print("=" * 80)
+            logger.info(f"  {metric_name}/{method}: early={early_r2:.3f}, late={late_r2:.3f}, delta={r2_increase:+.3f}")
 
 
 # =============================================================================
@@ -296,11 +296,8 @@ def run_token_prediction_probe(
         {layer_idx: {"top1_accuracy": ..., "top5_accuracy": ..., "top10_accuracy": ..., ...}}
     """
     layer_indices = sorted(activations.keys())
-    n_unique = len(np.unique(predicted_tokens))
-    print(f"\nTraining token prediction probes across {len(activations)} layers...")
-    print(f"  Target: {len(predicted_tokens)} tokens, {n_unique} unique classes")
 
-    results_list = Parallel(n_jobs=n_jobs, verbose=10)(
+    results_list = Parallel(n_jobs=n_jobs, verbose=0)(
         delayed(_train_token_probe_for_layer)(
             layer_idx,
             activations[layer_idx],
@@ -310,7 +307,7 @@ def run_token_prediction_probe(
             use_pca,
             pca_components,
         )
-        for layer_idx in layer_indices
+        for layer_idx in tqdm(layer_indices, desc="Token probes")
     )
     return {layer_idx: result for layer_idx, result in results_list}
 
@@ -320,32 +317,31 @@ def run_token_prediction_probe(
 # =============================================================================
 
 
-def find_dataset_path(model_name: str) -> Path:
+def find_dataset_path(model_name: str, model_dir: str) -> Path:
     """Find the stratified dataset file."""
     if DATASET_PATH:
         return Path(DATASET_PATH)
 
-    model_short = get_model_short_name(model_name, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    # Try model-dir path first (new structure)
+    model_dir_path = find_output_file("nexttoken_entropy_dataset.json", model_dir=model_dir)
+    if model_dir_path.exists():
+        return model_dir_path
 
-    # Try model-specific path
-    model_specific = OUTPUT_DIR / f"{model_short}_nexttoken_entropy_dataset.json"
-    if model_specific.exists():
-        return model_specific
-
-    # Fall back to generic
-    generic = OUTPUT_DIR / "entropy_dataset.json"
+    # Fall back to generic (shared dataset)
+    generic = find_output_file("entropy_dataset.json")
     if generic.exists():
         return generic
 
     raise FileNotFoundError(
-        f"Could not find dataset. Tried: {model_specific}, {generic}. "
+        f"Could not find dataset. Tried: {model_dir_path}, {generic}. "
         "Run build_nexttoken_dataset.py first."
     )
 
 
-def load_dataset(path: Path) -> list:
+def load_dataset(path: Path, logger=None) -> list:
     """Load the stratified entropy dataset."""
-    print(f"Loading dataset from {path}...")
+    if logger:
+        logger.info(f"Loading dataset from {path}...")
     with open(path) as f:
         raw = json.load(f)
 
@@ -353,12 +349,13 @@ def load_dataset(path: Path) -> list:
     if isinstance(raw, dict) and "data" in raw:
         data = raw["data"]
         config = raw.get("config")
-        if config:
-            print(f"  Config: {config}")
+        if config and logger:
+            logger.info(f"  Config: {config}")
     else:
         data = raw
 
-    print(f"  Loaded {len(data)} samples")
+    if logger:
+        logger.info(f"  Loaded {len(data)} samples")
     return data
 
 
@@ -384,7 +381,7 @@ def extract_activations_and_metrics(
     all_predicted_tokens = []
 
     if checkpoint_path.exists():
-        print(f"Loading checkpoint from {checkpoint_path}...")
+        tqdm.write(f"Loading checkpoint from {checkpoint_path}...")
         ckpt = np.load(checkpoint_path, allow_pickle=True)
         if "processed_count" in ckpt.files:
             start_idx = int(ckpt["processed_count"])
@@ -397,7 +394,7 @@ def extract_activations_and_metrics(
                     all_metrics[m] = list(ckpt[m])
             if "predicted_tokens" in ckpt.files:
                 all_predicted_tokens = list(ckpt["predicted_tokens"])
-            print(f"  Resuming from sample {start_idx}")
+            tqdm.write(f"  Resuming from sample {start_idx}")
 
     # Set up hooks
     activations_cache = {}
@@ -468,7 +465,7 @@ def extract_activations_and_metrics(
                 save_dict["predicted_tokens"] = np.array(all_predicted_tokens)
                 save_dict["processed_count"] = processed
                 np.savez_compressed(checkpoint_path, **save_dict)
-                print(f"  Checkpoint: {processed}/{total}")
+                tqdm.write(f"  Checkpoint: {processed}/{total}")
 
             # Memory cleanup
             del encoded, input_ids, attention_mask, outputs
@@ -487,7 +484,7 @@ def extract_activations_and_metrics(
     # Cleanup checkpoint
     if checkpoint_path.exists():
         checkpoint_path.unlink()
-        print("  Removed checkpoint")
+        tqdm.write("  Removed checkpoint")
 
     return activations_by_layer, metrics_dict, predicted_tokens
 
@@ -498,37 +495,43 @@ def extract_activations_and_metrics(
 
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    # Model directory for organizing outputs
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    base_name = "nexttoken"  # Model prefix now in directory, not filename
 
-    model_short = get_model_short_name(MODEL, load_in_4bit=LOAD_IN_4BIT, load_in_8bit=LOAD_IN_8BIT)
+    checkpoint_path = get_output_path(f"{base_name}_checkpoint.npz", model_dir=model_dir)
+
+    # Setup logging
+    logger = setup_run_logger(None, base_name, "run", model_dir=model_dir)
+    config = {
+        "model": MODEL,
+        "adapter": ADAPTER,
+        "metrics": METRICS,
+    }
+    print_run_header("identify_nexttoken_correlate.py", 1, "Find next-token uncertainty directions", config)
+
+    logger.info(f"Model: {MODEL}")
     if ADAPTER:
-        adapter_short = get_model_short_name(ADAPTER)
-        base_name = f"{model_short}_adapter-{adapter_short}_nexttoken"
-    else:
-        base_name = f"{model_short}_nexttoken"
-
-    checkpoint_path = OUTPUT_DIR / f"{base_name}_checkpoint.npz"
-
-    print(f"Model: {MODEL}")
-    if ADAPTER:
-        print(f"Adapter: {ADAPTER}")
-    print(f"Metrics: {METRICS}")
-    print(f"Bootstrap iterations: {N_BOOTSTRAP}")
-    print(f"Output base: {base_name}")
-    print()
+        logger.info(f"Adapter: {ADAPTER}")
+    logger.info(f"Metrics: {METRICS}")
+    logger.info(f"Bootstrap iterations: {N_BOOTSTRAP}")
+    logger.info(f"Model dir: {model_dir}")
+    logger.info(f"Output base: {base_name}")
 
     # Find dataset
-    dataset_path = find_dataset_path(MODEL)
+    dataset_path = find_dataset_path(MODEL, model_dir)
 
     # Load dataset
-    dataset = load_dataset(dataset_path)
+    dataset = load_dataset(dataset_path, logger)
 
     # Check if activations already exist (resume from crash)
-    activations_path = OUTPUT_DIR / f"{base_name}_activations.npz"
-    if activations_path.exists():
-        print(f"\nFound existing activations: {activations_path}")
-        print("Loading from file (skipping model load and extraction)...")
-        loaded = np.load(activations_path)
+    # Check both new and legacy locations for migration compatibility
+    activations_read_path = find_output_file(f"{base_name}_activations.npz", model_dir=model_dir)
+    activations_path = get_output_path(f"{base_name}_activations.npz", model_dir=model_dir)  # For writing
+    if activations_read_path.exists():
+        logger.info(f"Found existing activations: {activations_read_path}")
+        logger.info("Loading from file (skipping model load and extraction)...")
+        loaded = np.load(activations_read_path)
 
         # Reconstruct activations_by_layer
         layer_keys = [k for k in loaded.files if k.startswith("layer_")]
@@ -544,88 +547,60 @@ def main():
         # Get predicted tokens
         predicted_tokens = loaded["predicted_tokens"] if "predicted_tokens" in loaded.files else None
 
-        print(f"  Loaded {num_layers} layers, {len(metrics_dict)} metrics")
+        logger.info(f"  Loaded {num_layers} layers, {len(metrics_dict)} metrics")
     else:
         # Load model
-        print("\nLoading model...")
+        logger.info("Loading model...")
         model, tokenizer, num_layers = load_model_and_tokenizer(
             MODEL,
             adapter_path=ADAPTER,
             load_in_4bit=LOAD_IN_4BIT,
             load_in_8bit=LOAD_IN_8BIT
         )
-        print(f"  Layers: {num_layers}")
-        print(f"  Device: {DEVICE}")
+        logger.info(f"  Layers: {num_layers}")
+        logger.info(f"  Device: {DEVICE}")
 
         # Extract activations and metrics
-        print(f"\nExtracting activations (batch_size={BATCH_SIZE})...")
+        logger.info(f"Extracting activations (batch_size={BATCH_SIZE})...")
         activations_by_layer, metrics_dict, predicted_tokens = extract_activations_and_metrics(
             dataset, model, tokenizer, num_layers, checkpoint_path
         )
 
-        print(f"\nActivations shape: {activations_by_layer[0].shape}")
-        print("\nMetric statistics:")
+        logger.info(f"Activations shape: {activations_by_layer[0].shape}")
+        logger.info("Metric statistics:")
         for m, v in metrics_dict.items():
-            print(f"  {m}: mean={v.mean():.3f}, std={v.std():.3f}, range=[{v.min():.3f}, {v.max():.3f}]")
+            logger.info(f"  {m}: mean={v.mean():.3f}, std={v.std():.3f}, range=[{v.min():.3f}, {v.max():.3f}]")
 
         # Save activations file
-        print(f"\nSaving activations to {activations_path}...")
+        logger.info(f"Saving activations to {activations_path}...")
         act_save = {f"layer_{i}": activations_by_layer[i] for i in range(num_layers)}
         for m_name, m_values in metrics_dict.items():
             act_save[m_name] = m_values
         act_save["predicted_tokens"] = predicted_tokens
         np.savez_compressed(activations_path, **act_save)
 
-    # Save dataset JSON
-    dataset_output_path = OUTPUT_DIR / f"{base_name}_dataset.json"
-    print(f"Saving dataset to {dataset_output_path}...")
-    metadata = []
-    for i, item in enumerate(dataset):
-        meta_item = {
-            "text": item["text"],
-            "predicted_token": int(predicted_tokens[i]),
-        }
-        for m_name, m_values in metrics_dict.items():
-            meta_item[m_name] = float(m_values[i])
-        metadata.append(meta_item)
-
-    dataset_json = {
-        "config": get_config_dict(
-            model=MODEL,
-            adapter=ADAPTER,
-            dataset_path=str(dataset_path),
-            num_samples=len(dataset),
-            seed=SEED,
-            load_in_4bit=LOAD_IN_4BIT,
-            load_in_8bit=LOAD_IN_8BIT,
-        ),
-        "stats": {},
-        "data": metadata,
-    }
-    # Add metric stats
+    # Build dataset stats for consolidated JSON
+    dataset_stats = {}
     for m_name, m_values in metrics_dict.items():
-        dataset_json["stats"][f"{m_name}_mean"] = float(m_values.mean())
-        dataset_json["stats"][f"{m_name}_std"] = float(m_values.std())
-
-    with open(dataset_output_path, "w") as f:
-        json.dump(dataset_json, f, indent=2)
+        dataset_stats[f"{m_name}_mean"] = float(m_values.mean())
+        dataset_stats[f"{m_name}_std"] = float(m_values.std())
 
     # Plot entropy distribution
     if "entropy" in metrics_dict:
-        entropy_plot_path = OUTPUT_DIR / f"{base_name}_entropy_distribution.png"
-        print(f"\nPlotting entropy distribution...")
+        entropy_plot_path = get_output_path(f"{base_name}_entropy_distribution.png", model_dir=model_dir)
+        logger.info("Plotting entropy distribution...")
         plot_entropy_distribution(metrics_dict["entropy"], entropy_plot_path)
 
     # Find directions for each metric
-    print("\n" + "=" * 60)
-    print("FINDING DIRECTIONS")
-    print("=" * 60)
+    logger.section("FINDING DIRECTIONS")
 
     metrics_to_analyze = {m: metrics_dict[m] for m in METRICS}
     all_results = {}
+    key_findings = {}
+    output_files = []
 
     for metric in METRICS:
-        print(f"\n--- {metric.upper()} ({N_BOOTSTRAP} bootstrap iterations) ---")
+        logger.info(f"\n--- {metric.upper()} ({N_BOOTSTRAP} bootstrap iterations) ---")
         target_values = metrics_to_analyze[metric]
 
         results = find_directions(
@@ -644,33 +619,32 @@ def main():
 
         all_results[metric] = results
 
-        # Print summary per method
+        # Log and collect summary per method
         for method in ["probe", "mean_diff"]:
             fits = results["fits"][method]
             best_layer = max(fits.keys(), key=lambda l: fits[l]["r2"])
             best_r2 = fits[best_layer]["r2"]
             best_corr = fits[best_layer]["corr"]
 
-            r2_std_str = ""
-            if "r2_ci_low" in fits[best_layer] and "r2_ci_high" in fits[best_layer]:
-                r2_std_str = f" [{fits[best_layer]['r2_ci_low']:.3f}, {fits[best_layer]['r2_ci_high']:.3f}]"
-            elif "r2_std" in fits[best_layer]:
-                ci_lo = best_r2 - 1.96 * fits[best_layer]['r2_std']
-                ci_hi = best_r2 + 1.96 * fits[best_layer]['r2_std']
-                r2_std_str = f" [{ci_lo:.3f}, {ci_hi:.3f}]"
+            ci_low = fits[best_layer].get("r2_ci_low")
+            ci_high = fits[best_layer].get("r2_ci_high")
+            if ci_low is None and "r2_std" in fits[best_layer]:
+                ci_low = best_r2 - 1.96 * fits[best_layer]['r2_std']
+                ci_high = best_r2 + 1.96 * fits[best_layer]['r2_std']
 
             avg_r2 = np.mean([f["r2"] for f in fits.values()])
 
-            print(f"  {method:12s}: best layer={best_layer:2d} (R²={best_r2:.3f}{r2_std_str}, r={best_corr:.3f}), avg R²={avg_r2:.3f}")
+            logger.info(f"  {method:12s}: best layer={best_layer:2d} (R²={best_r2:.3f}, r={best_corr:.3f}), avg R²={avg_r2:.3f}")
+            key_findings[f"{metric}/{method}"] = format_best_layer(method, best_layer, best_r2, ci_low, ci_high)
 
         # Method comparison
         if results["comparison"]:
             mid_layer = num_layers // 2
             cos_sim = results["comparison"][mid_layer]["cosine_sim"]
-            print(f"  probe vs mean_diff cosine similarity (layer {mid_layer}): {cos_sim:.3f}")
+            logger.info(f"  probe vs mean_diff cosine similarity (layer {mid_layer}): {cos_sim:.3f}")
 
         # Save directions file for this metric
-        directions_path = OUTPUT_DIR / f"{base_name}_{metric}_directions.npz"
+        directions_path = get_output_path(f"{base_name}_{metric}_directions.npz", model_dir=model_dir)
         dir_save = {
             "_metadata_dataset": str(dataset_path),
             "_metadata_model": MODEL,
@@ -684,72 +658,24 @@ def main():
                     dir_save[f"{method}_scaler_scale_{layer}"] = results["fits"][method][layer]["scaler_scale"]
                     dir_save[f"{method}_scaler_mean_{layer}"] = results["fits"][method][layer]["scaler_mean"]
         np.savez(directions_path, **dir_save)
-        print(f"  Saved directions: {directions_path}")
-
-        # Save results JSON for this metric
-        results_path = OUTPUT_DIR / f"{base_name}_{metric}_results.json"
-        results_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                metric=metric,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                probe_alpha=PROBE_ALPHA,
-                pca_components=PROBE_PCA_COMPONENTS,
-                n_bootstrap=N_BOOTSTRAP,
-                mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
-            "metric_stats": {
-                "mean": float(target_values.mean()),
-                "std": float(target_values.std()),
-                "min": float(target_values.min()),
-                "max": float(target_values.max()),
-                "variance": float(target_values.var()),
-                "median": float(np.median(target_values)),
-                "iqr": float(np.percentile(target_values, 75) - np.percentile(target_values, 25)),
-            },
-            "results": {},
-        }
-        for method in ["probe", "mean_diff"]:
-            results_json["results"][method] = {}
-            for layer in range(num_layers):
-                layer_info = {}
-                for k, v in results["fits"][method][layer].items():
-                    # Skip numpy arrays (scaler_scale, scaler_mean) - those go in .npz
-                    if isinstance(v, np.ndarray):
-                        continue
-                    # Convert numpy scalars to Python types
-                    if isinstance(v, np.floating):
-                        layer_info[k] = float(v)
-                    elif isinstance(v, np.integer):
-                        layer_info[k] = int(v)
-                    else:
-                        layer_info[k] = v
-                results_json["results"][method][layer] = layer_info
-
-        with open(results_path, "w") as f:
-            json.dump(results_json, f, indent=2)
-        print(f"  Saved results: {results_path}")
+        output_files.append(directions_path)
+        logger.info(f"  Saved directions: {directions_path.name}")
 
         # Plot results for this metric
-        plot_path = OUTPUT_DIR / f"{base_name}_{metric}_results.png"
+        plot_path = get_output_path(f"{base_name}_{metric}_results.png", model_dir=model_dir)
         plot_results(all_results, metric, plot_path)
+        output_files.append(plot_path)
 
-    # Diagnostic summary
-    print_diagnostic_summary(metrics_to_analyze, all_results, num_layers)
+    # Diagnostic summary to log file
+    log_diagnostic_summary(logger, metrics_to_analyze, all_results)
 
     # =========================================================================
     # OUTPUT TOKEN DIRECTIONS (parallel to MC answer directions)
     # =========================================================================
 
-    token_results = None
+    token_results_data = None
     if FIND_OUTPUT_TOKEN_DIRECTIONS and predicted_tokens is not None:
-        print("\n" + "=" * 60)
-        print("OUTPUT TOKEN DIRECTIONS")
-        print("=" * 60)
+        logger.section("OUTPUT TOKEN DIRECTIONS")
 
         token_results = run_token_prediction_probe(
             activations_by_layer,
@@ -768,32 +694,26 @@ def main():
         best_top10 = token_results[best_layer]["top10_accuracy"]
         n_classes = token_results[best_layer]["n_classes"]
 
-        print(f"\nTOKEN PREDICTION RESULTS:")
-        print(f"  Best layer: {best_layer}")
-        print(f"  Top-1 accuracy: {best_top1:.3f} ({best_top1*100:.1f}%)")
-        print(f"  Top-5 accuracy: {best_top5:.3f} ({best_top5*100:.1f}%)")
-        print(f"  Top-10 accuracy: {best_top10:.3f} ({best_top10*100:.1f}%)")
-        print(f"  Number of unique tokens: {n_classes}")
+        logger.info(f"TOKEN PREDICTION RESULTS:")
+        logger.info(f"  Best layer: {best_layer}")
+        logger.info(f"  Top-1 accuracy: {best_top1:.3f} ({best_top1*100:.1f}%)")
+        logger.info(f"  Top-5 accuracy: {best_top5:.3f} ({best_top5*100:.1f}%)")
+        logger.info(f"  Top-10 accuracy: {best_top10:.3f} ({best_top10*100:.1f}%)")
+        logger.info(f"  Number of unique tokens: {n_classes}")
 
-        # Layerwise summary
-        print(f"\n  {'Layer':<8} {'Top-1':>8} {'Top-5':>8} {'Top-10':>8}")
-        print(f"  {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
-        for layer in sorted(token_results.keys()):
-            r = token_results[layer]
-            print(f"  {layer:<8d} {r['top1_accuracy']:>8.3f} {r['top5_accuracy']:>8.3f} {r['top10_accuracy']:>8.3f}")
+        # Layerwise summary to log
+        logger.table(
+            ["Layer", "Top-1", "Top-5", "Top-10"],
+            [[layer, f"{r['top1_accuracy']:.3f}", f"{r['top5_accuracy']:.3f}", f"{r['top10_accuracy']:.3f}"]
+             for layer, r in sorted(token_results.items())],
+            "Token Prediction by Layer"
+        )
 
-        # Save token results JSON
-        token_results_path = OUTPUT_DIR / f"{base_name}_token_results.json"
-        token_json = {
-            "config": get_config_dict(
-                model=MODEL,
-                adapter=ADAPTER,
-                seed=SEED,
-                train_split=TRAIN_SPLIT,
-                pca_components=PROBE_PCA_COMPONENTS,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
+        # Add to key findings
+        key_findings["token/probe"] = f"Top-1={best_top1:.3f}, Top-5={best_top5:.3f} at layer {best_layer}"
+
+        # Store for consolidated JSON
+        token_results_data = {
             "summary": {
                 "best_layer": int(best_layer),
                 "best_top1_accuracy": float(best_top1),
@@ -803,46 +723,91 @@ def main():
             },
             "per_layer": {int(l): r for l, r in token_results.items()},
         }
-        with open(token_results_path, "w") as f:
-            json.dump(token_json, f, indent=2)
-        print(f"\n  Saved: {token_results_path}")
 
-    # Final summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
+    # =========================================================================
+    # SAVE CONSOLIDATED RESULTS JSON
+    # =========================================================================
 
+    results_path = get_output_path(f"{base_name}_results.json", model_dir=model_dir)
+    consolidated_results = {
+        "format_version": 2,
+        "config": get_config_dict(
+            model=MODEL,
+            adapter=ADAPTER,
+            dataset_path=str(dataset_path),
+            num_samples=len(dataset),
+            metrics=METRICS,
+            seed=SEED,
+            train_split=TRAIN_SPLIT,
+            probe_alpha=PROBE_ALPHA,
+            pca_components=PROBE_PCA_COMPONENTS,
+            n_bootstrap=N_BOOTSTRAP,
+            mean_diff_quantile=MEAN_DIFF_QUANTILE,
+            load_in_4bit=LOAD_IN_4BIT,
+            load_in_8bit=LOAD_IN_8BIT,
+        ),
+        "dataset": {
+            "num_samples": len(dataset),
+            "stats": dataset_stats,
+        },
+        "metrics": {},
+    }
+
+    # Add per-metric results
     for metric in METRICS:
-        print(f"\n{metric}:")
-        info = METRIC_INFO[metric]
-        print(f"  (higher = {info['higher_means']}, linear={info['linear']})")
+        target_values = metrics_to_analyze[metric]
+        results = all_results[metric]
+
+        metric_section = {
+            "stats": {
+                "mean": float(target_values.mean()),
+                "std": float(target_values.std()),
+                "min": float(target_values.min()),
+                "max": float(target_values.max()),
+                "variance": float(target_values.var()),
+                "median": float(np.median(target_values)),
+                "iqr": float(np.percentile(target_values, 75) - np.percentile(target_values, 25)),
+            },
+            "results": {},
+        }
 
         for method in ["probe", "mean_diff"]:
-            fits = all_results[metric]["fits"][method]
-            best_layer = max(fits.keys(), key=lambda l: fits[l]["r2"])
-            best_r2 = fits[best_layer]["r2"]
-            mae_str = ""
-            if "mae" in fits[best_layer]:
-                mae_str = f", MAE={fits[best_layer]['mae']:.3f}"
-            print(f"  {method}: best R²={best_r2:.3f}{mae_str} at layer {best_layer}")
+            method_results = {}
+            for layer in range(num_layers):
+                layer_info = {}
+                for k, v in results["fits"][method][layer].items():
+                    # Skip numpy arrays (scaler_scale, scaler_mean) - those go in .npz
+                    if isinstance(v, np.ndarray):
+                        continue
+                    # Convert numpy scalars to Python types
+                    if isinstance(v, np.floating):
+                        layer_info[k] = float(v)
+                    elif isinstance(v, np.integer):
+                        layer_info[k] = int(v)
+                    else:
+                        layer_info[k] = v
+                method_results[layer] = layer_info
+            metric_section["results"][method] = method_results
 
-    if token_results is not None:
-        print(f"\ntoken prediction:")
-        best_layer = max(token_results.keys(), key=lambda l: token_results[l]["top1_accuracy"])
-        best_top1 = token_results[best_layer]["top1_accuracy"]
-        print(f"  best top-1 accuracy={best_top1:.3f} at layer {best_layer}")
+        consolidated_results["metrics"][metric] = metric_section
 
-    print("\nOutput files:")
-    print(f"  {base_name}_activations.npz")
-    print(f"  {base_name}_dataset.json")
+    # Add token results if computed
+    if token_results_data is not None:
+        consolidated_results["token"] = token_results_data
+
+    with open(results_path, "w") as f:
+        json.dump(consolidated_results, f, indent=2)
+    output_files.append(results_path)
+    logger.info(f"Saved consolidated results: {results_path.name}")
+
+    # Add other output files
+    output_files.append(activations_path)
     if "entropy" in metrics_dict:
-        print(f"  {base_name}_entropy_distribution.png")
-    for metric in METRICS:
-        print(f"  {base_name}_{metric}_directions.npz")
-        print(f"  {base_name}_{metric}_results.json")
-        print(f"  {base_name}_{metric}_results.png")
-    if FIND_OUTPUT_TOKEN_DIRECTIONS and token_results is not None:
-        print(f"  {base_name}_token_results.json")
+        output_files.append(get_output_path(f"{base_name}_entropy_distribution.png", model_dir=model_dir))
+
+    # Print minimal console output
+    print_key_findings(key_findings)
+    print_run_footer(output_files, logger.log_file)
 
 
 if __name__ == "__main__":

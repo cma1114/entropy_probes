@@ -34,8 +34,8 @@ from scipy.stats import percentileofscore
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from core.config_utils import get_config_dict
-from core.model_utils import get_model_short_name
+from core.config_utils import get_config_dict, get_output_path, find_output_file, glob_outputs
+from core.model_utils import get_model_dir_name
 from core.plotting import (
     save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA,
     DPI, MARKER_SIZE, LINE_WIDTH,
@@ -73,7 +73,7 @@ PROBE_PCA_COMPONENTS = 100
 MEAN_DIFF_QUANTILE = 0.25
 
 # --- Output ---
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+# Uses centralized path management from core.config_utils
 
 
 # =============================================================================
@@ -99,55 +99,43 @@ class DirectionSet:
 # =============================================================================
 
 
-def get_prefix_for_config(
+def get_model_dir_for_config(
     model: str,
     adapter: Optional[str] = None,
     load_in_4bit: bool = False,
     load_in_8bit: bool = False,
 ) -> str:
+    """Get model directory name for a model config."""
+    return get_model_dir_name(model, adapter, load_in_4bit, load_in_8bit)
+
+
+def get_model_dir() -> str:
+    """Get model directory for the primary configured model (MODEL, ADAPTER, etc.)."""
+    return get_model_dir_for_config(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
+
+def discover_datasets_for_model_dir(model_dir: str) -> List[str]:
     """
-    Get the base name prefix for a model config.
-
-    Matches the pattern used in identify_mc_correlate.py.
-    """
-    model_short = get_model_short_name(model, load_in_4bit=load_in_4bit, load_in_8bit=load_in_8bit)
-
-    if adapter:
-        adapter_short = get_model_short_name(adapter)
-        return f"{model_short}_adapter-{adapter_short}"
-    else:
-        return model_short
-
-
-def get_base_name_prefix() -> str:
-    """Get prefix for the primary configured model (MODEL, ADAPTER, etc.)."""
-    return get_prefix_for_config(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
-
-
-def discover_datasets_for_prefix(prefix: str) -> List[str]:
-    """
-    Discover all datasets available for a given model prefix.
+    Discover all datasets available for a given model directory.
 
     Returns:
         List of dataset names
     """
-    pattern = OUTPUT_DIR.glob(f"{prefix}_*_mc_activations.npz")
+    pattern = glob_outputs("*_mc_activations.npz", model_dir=model_dir)
 
     datasets = []
     for path in pattern:
-        # Extract dataset: {prefix}_{dataset}_mc_activations.npz
-        filename = path.stem.replace("_mc_activations", "")
-        if filename.startswith(prefix + "_"):
-            dataset = filename[len(prefix) + 1:]
-            if dataset not in datasets:
-                datasets.append(dataset)
+        # Extract dataset: {dataset}_mc_activations.npz
+        dataset = path.stem.replace("_mc_activations", "")
+        if dataset not in datasets:
+            datasets.append(dataset)
 
     return sorted(datasets)
 
 
 def discover_datasets() -> List[str]:
     """Discover datasets for the primary configured model."""
-    return discover_datasets_for_prefix(get_base_name_prefix())
+    return discover_datasets_for_model_dir(get_model_dir())
 
 
 # =============================================================================
@@ -155,14 +143,14 @@ def discover_datasets() -> List[str]:
 # =============================================================================
 
 
-def load_directions(base_name: str, metric: str, method: str) -> Dict[int, np.ndarray]:
+def load_directions(base_name: str, metric: str, method: str, model_dir: str = None) -> Dict[int, np.ndarray]:
     """
     Load direction vectors from a *_directions.npz file.
 
     Returns:
         {layer: normalized_direction_vector}
     """
-    directions_path = OUTPUT_DIR / f"{base_name}_mc_{metric}_directions.npz"
+    directions_path = find_output_file(f"{base_name}_mc_{metric}_directions.npz", model_dir=model_dir)
     if not directions_path.exists():
         return {}
 
@@ -181,7 +169,7 @@ def load_directions(base_name: str, metric: str, method: str) -> Dict[int, np.nd
     return directions
 
 
-def load_activations_and_metrics(base_name: str, metrics: List[str]) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray]]:
+def load_activations_and_metrics(base_name: str, metrics: List[str], model_dir: str = None) -> Tuple[Dict[int, np.ndarray], Dict[str, np.ndarray]]:
     """
     Load activations and metric values from *_mc_activations.npz.
 
@@ -189,7 +177,7 @@ def load_activations_and_metrics(base_name: str, metrics: List[str]) -> Tuple[Di
         activations: {layer: (n_samples, hidden_dim)}
         metric_values: {metric: (n_samples,)}
     """
-    path = OUTPUT_DIR / f"{base_name}_mc_activations.npz"
+    path = find_output_file(f"{base_name}_mc_activations.npz", model_dir=model_dir)
     if not path.exists():
         raise FileNotFoundError(f"Activations not found: {path}")
 
@@ -213,7 +201,7 @@ def load_direction_set(
     dataset: str,
     metrics: List[str],
     methods: List[str],
-    prefix: Optional[str] = None,
+    model_dir: Optional[str] = None,
 ) -> Optional[DirectionSet]:
     """
     Load all directions and activations for a dataset.
@@ -222,16 +210,15 @@ def load_direction_set(
         dataset: Dataset name
         metrics: List of metrics to load
         methods: List of methods to load
-        prefix: Model prefix (uses configured model if None)
+        model_dir: Model directory (uses configured model if None)
 
     Returns None if required files are missing.
     """
-    if prefix is None:
-        prefix = get_base_name_prefix()
-    base_name = f"{prefix}_{dataset}"
+    if model_dir is None:
+        model_dir = get_model_dir()
 
     try:
-        activations, metric_values = load_activations_and_metrics(base_name, metrics)
+        activations, metric_values = load_activations_and_metrics(dataset, metrics, model_dir=model_dir)
     except FileNotFoundError:
         return None
 
@@ -248,14 +235,14 @@ def load_direction_set(
     for metric in metrics:
         directions[metric] = {}
         for method in methods:
-            dirs = load_directions(base_name, metric, method)
+            dirs = load_directions(dataset, metric, method, model_dir=model_dir)
             if dirs:
                 directions[metric][method] = dirs
 
     return DirectionSet(
-        model=prefix,
+        model=model_dir,
         dataset=dataset,
-        base_name=base_name,
+        base_name=dataset,
         directions=directions,
         activations=activations,
         metric_values=metric_values,
@@ -488,6 +475,7 @@ def run_cross_dataset_analysis(
     methods: List[str],
     n_permutations: int,
     seed: int,
+    model_dir: str = None,
 ) -> Dict:
     """
     Run cross-dataset comparison for the configured model across multiple datasets.
@@ -495,10 +483,13 @@ def run_cross_dataset_analysis(
     if len(datasets) < 2:
         return {"error": "Need at least 2 datasets"}
 
+    if model_dir is None:
+        model_dir = get_model_dir()
+
     # Load all direction sets
     direction_sets: Dict[str, DirectionSet] = {}
     for dataset in datasets:
-        ds = load_direction_set(dataset, metrics, methods)
+        ds = load_direction_set(dataset, metrics, methods, model_dir=model_dir)
         if ds is not None:
             direction_sets[dataset] = ds
 
@@ -558,8 +549,7 @@ def run_cross_dataset_analysis(
                           f"n_sig={s['n_significant']}")
 
                     # Generate per-pair plot
-                    prefix = get_base_name_prefix()
-                    plot_path = OUTPUT_DIR / f"{prefix}_{pair_key}_{metric}_{method}_similarity.png"
+                    plot_path = get_output_path(f"{pair_key}_{metric}_{method}_similarity.png", model_dir=model_dir)
                     plot_pair_comparison(comparison, pair_key, metric, method, plot_path)
 
     return results
@@ -587,12 +577,12 @@ def run_cross_model_analysis(
     direction_sets: Dict[str, DirectionSet] = {}
     for config in model_configs:
         model, adapter, load_4bit, load_8bit = config
-        prefix = get_prefix_for_config(model, adapter, load_4bit, load_8bit)
-        ds = load_direction_set(dataset, metrics, methods, prefix=prefix)
+        model_dir = get_model_dir_for_config(model, adapter, load_4bit, load_8bit)
+        ds = load_direction_set(dataset, metrics, methods, model_dir=model_dir)
         if ds is not None:
-            direction_sets[prefix] = ds
+            direction_sets[model_dir] = ds
         else:
-            print(f"  Warning: Could not load {prefix}_{dataset}")
+            print(f"  Warning: Could not load {model_dir}/{dataset}")
 
     if len(direction_sets) < 2:
         return {"error": "Could not load at least 2 models"}
@@ -659,7 +649,7 @@ def run_cross_model_analysis(
                           f"n_sig={s['n_significant']}")
 
                     # Generate per-pair plot
-                    plot_path = OUTPUT_DIR / f"cross_model_{dataset}_{pair_key}_{metric}_{method}_similarity.png"
+                    plot_path = get_output_path(f"cross_model_{dataset}_{pair_key}_{metric}_{method}_similarity.png")
                     plot_pair_comparison(comparison, pair_key, metric, method, plot_path)
 
     return results
@@ -954,7 +944,6 @@ def print_summary(results: Dict):
 
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
 
     print("=" * 70)
     print("DIRECTION SIMILARITY ANALYSIS")
@@ -987,8 +976,8 @@ def main():
         print(f"Dataset: {CROSS_MODEL_DATASET}")
         print(f"Models ({len(CROSS_MODEL_CONFIGS)}):")
         for model, adapter, load_4bit, load_8bit in CROSS_MODEL_CONFIGS:
-            prefix = get_prefix_for_config(model, adapter, load_4bit, load_8bit)
-            print(f"  - {prefix}")
+            model_dir = get_model_dir_for_config(model, adapter, load_4bit, load_8bit)
+            print(f"  - {model_dir}")
         print()
 
         print("=" * 70)
@@ -1024,17 +1013,18 @@ def main():
             ),
             "dataset": CROSS_MODEL_DATASET,
             "model_configs": [
-                get_prefix_for_config(m, a, b4, b8)
+                get_model_dir_for_config(m, a, b4, b8)
                 for m, a, b4, b8 in CROSS_MODEL_CONFIGS
             ],
             "cross_model": cross_model_results,
         }
 
-        results_path = OUTPUT_DIR / f"cross_model_{CROSS_MODEL_DATASET}_direction_similarity.json"
+        # Cross-model results go to global results (no specific model_dir)
+        results_path = get_output_path(f"cross_model_{CROSS_MODEL_DATASET}_direction_similarity.json")
 
     else:
         # ===== CROSS-DATASET MODE =====
-        model_short = get_base_name_prefix()
+        model_dir = get_model_dir()
 
         print("Mode: CROSS-DATASET")
         print(f"Model: {MODEL}")
@@ -1044,7 +1034,7 @@ def main():
             print("Quantization: 4-bit")
         elif LOAD_IN_8BIT:
             print("Quantization: 8-bit")
-        print(f"Model short: {model_short}")
+        print(f"Model dir: {model_dir}")
         print()
 
         # Discover available datasets for this model
@@ -1052,7 +1042,7 @@ def main():
         datasets = discover_datasets()
 
         if not datasets:
-            print(f"No datasets found for {model_short} in outputs/")
+            print(f"No datasets found for {model_dir} in outputs/")
             return
 
         print(f"  Found {len(datasets)} datasets: {', '.join(datasets)}")
@@ -1066,7 +1056,7 @@ def main():
         print("=" * 70)
 
         cross_dataset_results = run_cross_dataset_analysis(
-            datasets, METRICS, METHODS, N_PERMUTATIONS, SEED
+            datasets, METRICS, METHODS, N_PERMUTATIONS, SEED, model_dir=model_dir
         )
 
         if "error" in cross_dataset_results:
@@ -1074,9 +1064,9 @@ def main():
             return
 
         # Generate synthesis plot
-        plot_path = OUTPUT_DIR / f"{model_short}_cross_dataset_similarity.png"
+        plot_path = get_output_path("cross_dataset_similarity.png", model_dir=model_dir)
         plot_cross_dataset_synthesis(
-            cross_dataset_results, model_short, METRICS, METHODS, plot_path
+            cross_dataset_results, model_dir, METRICS, METHODS, plot_path
         )
 
         # Save results
@@ -1095,12 +1085,12 @@ def main():
                 probe_pca_components=PROBE_PCA_COMPONENTS,
                 mean_diff_quantile=MEAN_DIFF_QUANTILE,
             ),
-            "model_short": model_short,
+            "model_dir": model_dir,
             "datasets": datasets,
             "cross_dataset": cross_dataset_results,
         }
 
-        results_path = OUTPUT_DIR / f"{model_short}_direction_similarity.json"
+        results_path = get_output_path("direction_similarity.json", model_dir=model_dir)
 
     print(f"\nSaving results to {results_path}...")
     with open(results_path, "w") as f:

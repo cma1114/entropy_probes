@@ -76,6 +76,47 @@ After ANY change, you must SHOW these outputs (not just promise to do them):
 
 5. **One crash = full audit**: If the user reports a crash after you said it was ready, grep for ALL similar patterns and fix them all. Show the grep output.
 
+## Read Code, Don't Assume
+
+Before explaining WHY code works a certain way, SHOW the code. If you catch yourself saying "X implies Y" or "the context makes Z redundant", STOP and verify with grep/read.
+
+**Warning signs you're about to make a lazy error:**
+- Explaining why something exists without citing line numbers
+- Justifications that sound logical but aren't grounded in actual code
+- Moving quickly through multiple files without reading deeply
+- Reframing the user's requirement to match an easier implementation
+
+**Before changing any naming convention or pattern:**
+1. Grep for ALL occurrences of the thing being changed
+2. Read the code that USES it, not just the code that DEFINES it
+3. State the actual reason it exists (with line numbers), not an assumed reason
+4. If you can't find a reason, ASK rather than assuming it's unnecessary
+
+**Before changing any output file format:**
+1. Grep for the filename pattern across all scripts
+2. Read how each consumer parses/uses the file
+3. List all consumers that need updating
+4. Update ALL consumers before declaring complete
+
+**If the user expresses frustration:**
+1. STOP making changes immediately
+2. Read code more carefully, not less
+3. Ask clarifying questions rather than guessing
+4. Show reasoning with specific line numbers before implementing
+
+## Cross-Script File Dependencies
+
+When adding or modifying features that involve one script producing output that another script consumes:
+
+1. **Trace the producer**: Find the exact line where the output filename is constructed. Note the pattern.
+2. **Trace all consumers**: Grep for scripts that read this file. Find the exact line where they construct the expected filename.
+3. **Verify exact match**: The patterns must match character-for-character, including any prefixes/suffixes like `_transfer_`, `_meta_`, etc.
+
+**When user reports "file not found" or similar:**
+- NEVER assume the file doesn't exist or needs to be generated first
+- ALWAYS trace the actual filename being constructed in both producer and consumer
+- The bug is almost always a filename mismatch, not a missing file
+
 ## Critical Codebase Patterns
 
 ### Left-Padding
@@ -103,12 +144,60 @@ These constants must be identical across all scripts that use them:
 If you change one, grep for that constant name across all root `.py` files and change them all.
 
 ### Output File Naming
-Output filenames use `{model_short}_{dataset}` prefix from `get_run_name()`. Stage 2 files use `meta_` prefix (not `transfer_`):
-- `*_meta_{task}_results.json` (not `*_transfer_{task}_results.json`)
-- `*_meta_{task}_activations.npz`
+Output filenames use `{dataset}` as the base (model prefix is now in the directory). Stage 2 files use `meta_` prefix:
+- `{dataset}_meta_{task}_transfer_results.json` - D→M transfer results
+- `{dataset}_meta_{task}_transfer_{pos}.png` - Transfer plots (consolidated, all metrics)
+- `{dataset}_meta_{task}_activations.npz` - Cached meta activations
+- `{dataset}_meta_{task}_confdir_*.{npz,json,png}` - Confidence direction results
+- `{dataset}_meta_{task}_mcuncert_*.{npz,json,png}` - MC uncertainty direction results (consolidated, all metrics)
+
+### Output Directory Structure
+Outputs are organized by model, then by **purpose** (not file type):
+```
+outputs/
+├── Llama-3.1-8B-Instruct/              # Model directory (from get_model_dir_name)
+│   ├── results/                         # Human-readable final outputs (summary JSONs, plots)
+│   │   └── TriviaMC_mc_results.json
+│   └── working/                         # Machine data (activations, directions, checkpoints, logs)
+│       ├── TriviaMC_mc_activations.npz
+│       └── *_checkpoint.json            # Checkpoints go here (use working=True)
+├── Llama-3.1-8B-Instruct_4bit/         # Quantized model
+│   ├── results/
+│   └── working/
+├── results/                             # Legacy (no model_dir)
+└── working/                             # Legacy (no model_dir)
+```
+
+**Key distinction:** `results/` is for outputs intended for humans to read/view. `working/` is for machine data (checkpoints, cached computations, intermediate files). Don't route by file extension alone—checkpoints are `.json` but go to `working/`.
+
+Use centralized path helpers from `core/config_utils.py`:
+- `get_model_dir_name(model, adapter, load_in_4bit, load_in_8bit)` → model directory name
+- `get_output_path(filename, model_dir=, working=False)` → routes to correct subdirectory for writes. Use `working=True` for checkpoints and machine data.
+- `find_output_file(filename, model_dir=)` → checks new location first, falls back to legacy for reads
+- `glob_outputs(pattern, model_dir=)` → searches across output locations
+- `discover_model_dirs()` → lists all model directories
+
+**Standard pattern for primary pipeline scripts:**
+```python
+from core import get_model_dir_name
+from core.config_utils import get_output_path, find_output_file
+
+# At start of main():
+model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+base_name = DATASET  # No model prefix - it's in the directory
+
+# For writes:
+get_output_path(f"{base_name}_mc_results.json", model_dir=model_dir)
+# → outputs/Llama-3.1-8B-Instruct/results/TriviaMC_mc_results.json
+
+# For reads (with migration fallback):
+find_output_file(f"{base_name}_mc_results.json", model_dir=model_dir)
+```
+
+Do NOT use `OUTPUT_DIR = Path("outputs")` in new code. The helpers handle directory creation automatically.
 
 ### Quantization in Model Naming
-`get_model_short_name()` in `core/model_utils.py` appends `_4bit` or `_8bit` when quantization is enabled. This flows into `get_run_name()` and all output filenames automatically. When adding new scripts, always use `get_run_name()` for output path construction to ensure quantization is reflected in filenames.
+`get_model_short_name()` and `get_model_dir_name()` in `core/model_utils.py` append `_4bit` or `_8bit` when quantization is enabled. Adapter info is also included: `Llama-3.1-8B-Instruct_4bit_adapter-lora`. When adding new scripts, use `get_model_dir_name()` to construct the model directory name - this ensures quantization and adapter info are reflected in the output path.
 
 ### Confidence Interval Format
 All CIs use `[lo, hi]` format (percentile-based bootstrap), not `±std`. Example: `R²=0.567 [0.521, 0.613]`. When adding new console output, follow this convention.
@@ -131,8 +220,40 @@ Every `*_results.json` includes a `config` section produced by `get_config_dict(
 ### Script Consolidation
 - `identify_mc_answer_correlate.py` is merged into `identify_mc_correlate.py` (controlled by `FIND_ANSWER_DIRECTIONS` flag)
 - `identify_confidence_correlate.py` is merged into `test_meta_transfer.py` (controlled by `FIND_CONFIDENCE_DIRECTIONS` flag)
+- `summarize_results.py`, `compare_direction_types.py`, `regenerate_directions_plot.py` moved to `archive/` (redundant)
 - The standalone scripts remain in `archive/` for reference
 - Pre-modification snapshots are in `archive/originals/`
+
+### Output Consolidation (format_version: 2)
+Scripts produce consolidated JSON outputs with `format_version: 2`:
+- **Stage 1 MC**: `*_mc_results.json` with sections `{config, dataset, metrics.{metric}, answer}`
+- **Stage 1 Nexttoken**: `*_nexttoken_results.json` with sections `{config, dataset, metrics.{metric}, token}`
+- Per-layer details go to `*_run.log` files (not console)
+
+Console output follows minimal pattern:
+```
+================================================================================
+SCRIPT: Stage N - Description
+================================================================================
+Config: model=X, dataset=Y
+
+[tqdm progress bar]
+
+Key Findings:
+  Best R²: 0.567 [0.521, 0.613] at layer 24
+
+Output: base_mc_results.json, ... (N files)
+Log: base_mc_run.log
+================================================================================
+```
+
+### Logging Utilities (`core/logging_utils.py`)
+All scripts use centralized logging:
+- `setup_run_logger(output_dir, base_name, script_name, model_dir=None)` → creates `*_run.log`
+- `print_run_header(script_name, stage, description, config)` → console header
+- `print_key_findings(findings_dict)` → console summary
+- `print_run_footer(output_files, log_file)` → console footer
+- Logger methods: `logger.section()`, `logger.info()`, `logger.dict()`, `logger.table()`
 
 ### Module Docstring Format
 Every active script's docstring includes: purpose, inputs (file patterns loaded), outputs (file patterns produced), shared parameters note, and dependency chain (which scripts must run first).

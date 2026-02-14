@@ -12,6 +12,7 @@ Modules:
 - questions: Question loading, hashing, consistency verification
 - steering: Steering and ablation hooks for activation intervention
 - steering_experiments: Experiment runners and statistical analysis
+- logging_utils: Standardized console/file logging for all scripts
 """
 
 from .model_utils import (
@@ -19,9 +20,19 @@ from .model_utils import (
     is_base_model,
     has_chat_template,
     get_model_short_name,
+    get_model_dir_name,
     get_run_name,
     load_model_and_tokenizer,
     should_use_chat_template,
+)
+
+from .config_utils import (
+    get_config_dict,
+    get_output_path,
+    find_output_file,
+    glob_outputs,
+    discover_model_dirs,
+    OUTPUT_BASE_DIR,
 )
 
 from .extraction import (
@@ -134,15 +145,34 @@ from .steering_experiments import (
     print_ablation_summary,
 )
 
+from .logging_utils import (
+    RunLogger,
+    setup_run_logger,
+    print_run_header,
+    print_key_finding,
+    print_key_findings,
+    print_run_footer,
+    format_r2_with_ci,
+    format_best_layer,
+)
+
 __all__ = [
     # model_utils
     "DEVICE",
     "is_base_model",
     "has_chat_template",
     "get_model_short_name",
+    "get_model_dir_name",
     "get_run_name",
     "load_model_and_tokenizer",
     "should_use_chat_template",
+    # config_utils
+    "get_config_dict",
+    "get_output_path",
+    "find_output_file",
+    "glob_outputs",
+    "discover_model_dirs",
+    "OUTPUT_BASE_DIR",
     # extraction
     "compute_entropy_from_probs",
     "BatchedExtractor",
@@ -228,4 +258,13 @@ __all__ = [
     "analyze_ablation_results",
     "print_steering_summary",
     "print_ablation_summary",
+    # logging_utils
+    "RunLogger",
+    "setup_run_logger",
+    "print_run_header",
+    "print_key_finding",
+    "print_key_findings",
+    "print_run_footer",
+    "format_r2_with_ci",
+    "format_best_layer",
 ]

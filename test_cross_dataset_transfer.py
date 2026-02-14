@@ -8,17 +8,16 @@ Uses Fisher-z confidence intervals, permutation tests with two-sided p-values,
 and BH-FDR correction across layers.
 
 Inputs:
-    outputs/{source_base}_mc_{metric}_directions.npz   Source dataset directions
-    outputs/{source_base}_mc_activations.npz            Source dataset activations
-    outputs/{source_base}_mc_dataset.json               Source question metadata
-    outputs/{target_base}_mc_activations.npz            Target dataset activations
-    outputs/{target_base}_mc_dataset.json               Target question metadata
+    outputs/{model_dir}/working/{dataset}_mc_activations.npz         Activations for each dataset
+    outputs/{model_dir}/results/{dataset}_mc_results.json            Question metadata
 
-    where source/target bases are derived from SOURCE_DATASETS / TARGET_DATASETS
+    where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+    e.g., "Llama-3.3-70B-Instruct" or "Llama-3.3-70B-Instruct_4bit"
 
 Outputs:
-    outputs/{base}_cross_transfer_results.json          Transfer R, CIs, p-values
-    outputs/{base}_cross_transfer_results.png           Transfer correlation curves
+    outputs/{model_dir}/results/{pair_key}_transfer.png              Per-pair transfer plots
+    outputs/{model_dir}/results/cross_dataset_transfer.json          Consolidated results
+    outputs/{model_dir}/results/cross_dataset_transfer_synthesis.png Synthesis plot
 
 Shared parameters (must match across scripts):
     SEED, PROBE_ALPHA, PROBE_PCA_COMPONENTS, TRAIN_SPLIT, MEAN_DIFF_QUANTILE
@@ -36,7 +35,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from core import metric_sign_for_confidence
-from core.config_utils import get_config_dict
+from core.config_utils import get_config_dict, get_output_path, find_output_file, glob_outputs
+from core.model_utils import get_model_dir_name
 from core.plotting import save_figure, GRID_ALPHA
 
 # =============================================================================
@@ -44,8 +44,13 @@ from core.plotting import save_figure, GRID_ALPHA
 # =============================================================================
 
 # --- Model & Data ---
-MODEL_PREFIX = "Llama-3.3-70B-Instruct"  # Short model name (no HF org prefix)
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+ADAPTER = None  # Optional: path to PEFT/LoRA adapter
 METRICS = ["entropy", "logit_gap"]
+
+# --- Quantization ---
+LOAD_IN_4BIT = False  # Set True for 70B+ models
+LOAD_IN_8BIT = False
 METHODS = ["mean_diff", "probe"]
 META_TASKS = ["delegate"]
 
@@ -66,7 +71,7 @@ USE_FDR = True               # Apply BH-FDR across layers within each panel
 EPS_DENOM = 1e-8             # Guard against near-constant predictions
 
 # --- Output ---
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+# Uses centralized path management from core.config_utils
 
 
 # =============================================================================
@@ -291,22 +296,22 @@ class ProbeDirectionManager:
 # DATA LOADING
 # =============================================================================
 
-def load_data_package(dataset_name: str, metric: str, meta_tasks: list):
+def load_data_package(dataset_name: str, metric: str, meta_tasks: list, model_dir: str = None):
     """Loads all necessary data for a dataset at once."""
-    act_path = OUTPUT_DIR / f"{dataset_name}_mc_activations.npz"
+    act_path = find_output_file(f"{dataset_name}_mc_activations.npz", model_dir=model_dir)
     if not act_path.exists():
         raise FileNotFoundError(f"Activations not found: {act_path}")
     data = np.load(act_path)
-    
+
     mc_acts = {}
     for key in data.files:
         if key.startswith("layer_"):
             mc_acts[int(key.split("_")[1])] = data[key]
     mc_metric = data[metric]
-    
+
     meta_data = {}
     for task in meta_tasks:
-        path = OUTPUT_DIR / f"{dataset_name}_meta_{task}_activations.npz"
+        path = find_output_file(f"{dataset_name}_meta_{task}_activations.npz", model_dir=model_dir)
         if path.exists():
             m_data = np.load(path)
             acts = {}
@@ -317,15 +322,18 @@ def load_data_package(dataset_name: str, metric: str, meta_tasks: list):
                     layer = int(key.split("_")[1])
                     acts[layer] = m_data[key]
             meta_data[task] = {"acts": acts, "conf": m_data["confidences"]}
-            
+
     return {"mc_acts": mc_acts, "mc_metric": mc_metric, "meta": meta_data}
 
-def discover_datasets(model_prefix: str) -> list:
-    pattern = f"{model_prefix}_*_mc_activations.npz"
-    return sorted([p.name.replace("_mc_activations.npz", "") for p in OUTPUT_DIR.glob(pattern)])
+def discover_datasets(model_dir: str) -> list:
+    """Discover datasets in the model directory."""
+    pattern = "*_mc_activations.npz"
+    return sorted([p.name.replace("_mc_activations.npz", "") for p in glob_outputs(pattern, model_dir=model_dir)])
 
-def extract_dataset_name(base_name: str, model_prefix: str) -> str:
-    if base_name.startswith(model_prefix + "_"):
+def extract_dataset_name(base_name: str, model_prefix: str = None) -> str:
+    """Extract dataset name from base name. With new directory structure, base_name is already the dataset."""
+    # Legacy: strip model prefix if present
+    if model_prefix and base_name.startswith(model_prefix + "_"):
         return base_name[len(model_prefix) + 1:]
     return base_name
 
@@ -412,7 +420,7 @@ def get_within_baseline(X_train, y_train, X_test, y_test, method):
 # PLOTTING
 # =============================================================================
 
-def plot_transfer_results(d2d_results, d2m_results, dataset_a, dataset_b, output_path):
+def plot_transfer_results(d2d_results, d2m_results, dataset_a, dataset_b, output_path, model_dir: str = None):
     metrics = list(d2d_results.keys())
     methods = list(d2d_results[metrics[0]].keys()) if metrics else []
     
@@ -420,8 +428,8 @@ def plot_transfer_results(d2d_results, d2m_results, dataset_a, dataset_b, output
     
     n_cols = len(metrics) * len(methods)
     fig, axes = plt.subplots(2, n_cols, figsize=(5 * n_cols, 8), squeeze=False)
-    name_a = extract_dataset_name(dataset_a, MODEL_PREFIX)
-    name_b = extract_dataset_name(dataset_b, MODEL_PREFIX)
+    name_a = extract_dataset_name(dataset_a, model_dir)
+    name_b = extract_dataset_name(dataset_b, model_dir)
     fig.suptitle(f"Cross-Dataset Transfer: {name_a} -> {name_b}", fontsize=14, fontweight="bold")
     
     col = 0
@@ -485,7 +493,7 @@ def _plot_single(ax, results, title):
     ax.legend(loc="upper left", fontsize=7)
     ax.grid(True, alpha=GRID_ALPHA)
 
-def plot_synthesis(all_d2d, all_d2m, model_prefix, output_path):
+def plot_synthesis(all_d2d, all_d2m, model_dir, output_path):
     pairs = list(all_d2d.keys())
     if len(pairs) < 2: return
 
@@ -549,31 +557,33 @@ def _plot_synthesis_single(ax, all_results, pairs, metric, method, layers, title
 # =============================================================================
 
 def main():
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    datasets = discover_datasets(MODEL_PREFIX)
+    model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
+
+    datasets = discover_datasets(model_dir)
     if len(datasets) < 2: return
 
     pairs = list(combinations(datasets, 2))
-    
+
     # Store results
-    all_d2d = {} 
+    all_d2d = {}
     all_d2m = {}
 
     for ds_a, ds_b in pairs:
-        pair_key = f"{extract_dataset_name(ds_a, MODEL_PREFIX)}_vs_{extract_dataset_name(ds_b, MODEL_PREFIX)}"
+        # Dataset names are now directly the base names (no model prefix)
+        pair_key = f"{ds_a}_vs_{ds_b}"
         print(f"\nProcessing {pair_key}...")
-        
+
         all_d2d[pair_key] = {}
         all_d2m[pair_key] = {}
-        
+
         for metric in METRICS:
             all_d2d[pair_key][metric] = {}
             all_d2m[pair_key][metric] = {}
-            
+
             # 1. Load Data ONCE
             try:
-                data_A = load_data_package(ds_a, metric, META_TASKS)
-                data_B = load_data_package(ds_b, metric, META_TASKS)
+                data_A = load_data_package(ds_a, metric, META_TASKS, model_dir=model_dir)
+                data_B = load_data_package(ds_b, metric, META_TASKS, model_dir=model_dir)
             except FileNotFoundError as e:
                 print(f"Skipping {metric}: {e}")
                 continue
@@ -781,7 +791,7 @@ def main():
                     all_d2m[pair_key][metric][task][method] = res_d2m[task]
 
         # Plotting - flatten d2m structure for plotting
-        plot_path = OUTPUT_DIR / f"{MODEL_PREFIX}_{pair_key}_transfer.png"
+        plot_path = get_output_path(f"{pair_key}_transfer.png", model_dir=model_dir)
         d2m_for_plot = {}
         for m in METRICS:
             d2m_for_plot[m] = {}
@@ -790,12 +800,15 @@ def main():
                     for meth, res in task_data.items():
                         d2m_for_plot[m][meth] = res
                     break  # Use first task only
-        plot_transfer_results(all_d2d[pair_key], d2m_for_plot, ds_a, ds_b, plot_path)
+        plot_transfer_results(all_d2d[pair_key], d2m_for_plot, ds_a, ds_b, plot_path, model_dir=model_dir)
 
     # Save Final JSON with Config
     results = {
         "config": get_config_dict(
-            model_prefix=MODEL_PREFIX,
+            model=MODEL,
+            adapter=ADAPTER,
+            load_in_4bit=LOAD_IN_4BIT,
+            load_in_8bit=LOAD_IN_8BIT,
             datasets=datasets,
             metrics=METRICS,
             methods=METHODS,
@@ -814,12 +827,12 @@ def main():
         "d2m": all_d2m,
     }
 
-    with open(OUTPUT_DIR / f"{MODEL_PREFIX}_cross_dataset_transfer.json", "w") as f:
+    with open(get_output_path("cross_dataset_transfer.json", model_dir=model_dir), "w") as f:
         json.dump(results, f, indent=2)
 
     # Synthesis Plot
     if len(pairs) >= 2:
-        synthesis_path = OUTPUT_DIR / f"{MODEL_PREFIX}_cross_dataset_transfer_synthesis.png"
+        synthesis_path = get_output_path("cross_dataset_transfer_synthesis.png", model_dir=model_dir)
         # Flatten d2m
         d2m_flat = {}
         for pair_key, pair_data in all_d2m.items():
@@ -831,7 +844,7 @@ def main():
                         d2m_flat[pair_key][metric][method] = res
                     break
 
-        plot_synthesis(all_d2d, d2m_flat, MODEL_PREFIX, synthesis_path)
+        plot_synthesis(all_d2d, d2m_flat, model_dir, synthesis_path)
 
     # Print summary
     print("\n" + "=" * 70)
