@@ -61,7 +61,7 @@ from core.plotting import save_figure, GRID_ALPHA
 
 # --- Model & Data ---
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = None  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"#
+ADAPTER = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"#None  # Optional: path to PEFT/LoRA adapter
 DATASET_FILTER = None#"TriviaMC_difficulty_filtered"  # Only load directions for this dataset (None = all)
 
 # --- Quantization ---
@@ -72,10 +72,56 @@ LOAD_IN_8BIT = False
 # --- Script-specific ---
 TOP_K_TOKENS = 12  # Number of top tokens to show in logit lens
 LAYERS_TO_ANALYZE = None  # None = all layers, or list like [10, 15, 20]
-AVAILABLE_METRICS = ["logit_gap"]#"entropy", "top_prob", "margin", "logit_gap", "top_logit"]
+AVAILABLE_METRICS = ["entropy","logit_gap"]# "top_prob", "margin", "logit_gap", "top_logit"]
 
 # --- Output ---
 # Uses centralized path management from core.config_utils
+
+# Known source prefixes for dataset extraction (longest first for correct matching)
+# These prefixes are stripped from source to get the dataset name
+# The prefix itself (with underscores removed) becomes the direction type
+DIRECTION_PREFIXES = [
+    # Meta→MC directions (longest first)
+    "d_meta_mc_uncert_other_confidence",
+    "d_meta_mc_uncert_confidence",
+    "d_meta_mc_uncert_delegate",
+    # Meta confidence directions
+    "d_self_confidence",
+    "d_other_confidence",
+    "d_delegate",
+    # Introspection (longer patterns first)
+    "introspection_probe_entropy",
+    "introspection_probe_logit_gap",
+    "introspection_entropy",
+    "introspection_logit_gap",
+    # MC task directions
+    "mc_entropy",
+    "mc_logit_gap",
+    "mc_top_prob",
+    "mc_margin",
+    "mc_top_logit",
+    # Nexttoken directions
+    "nexttoken_entropy",
+    "nexttoken_logit_gap",
+    "nexttoken_top_prob",
+    "nexttoken_margin",
+    "nexttoken_top_logit",
+    # Confidence/calibration contrastive
+    "confidence_entropy",
+    "confidence_logit_gap",
+    "calibration_entropy",
+    "calibration_logit_gap",
+    "contrastive_entropy",
+    "contrastive_logit_gap",
+    # Contrast (legacy patterns)
+    "self_vs_other_confidence",
+    "selfVother_conf",
+    "contrast",
+    # Orthogonal directions
+    "orthogonal",
+    # Consensus
+    "consensus",
+]
 
 
 def get_output_prefix() -> str:
@@ -422,7 +468,8 @@ def find_direction_files(model_short: str, metric_filter: Optional[str] = None, 
     # Meta confidence directions from test_meta_transfer.py:
     # {dataset}_meta_confidence_confdir_directions_{pos}.npz (d_self_confidence)
     # {dataset}_meta_other_confidence_confdir_directions_{pos}.npz (d_other_confidence)
-    for conf_type, label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence")]:
+    # {dataset}_meta_delegate_confdir_directions_{pos}.npz (d_delegate)
+    for conf_type, label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence"), ("delegate", "d_delegate")]:
         # Match new per-position format and legacy format
         for pattern in [f"*_meta_{conf_type}_confdir_directions_*.npz", f"*_meta_{conf_type}_confdir_directions.npz"]:
             for path in glob_outputs(pattern, model_dir=model_dir):
@@ -474,7 +521,7 @@ def find_direction_files(model_short: str, metric_filter: Optional[str] = None, 
     # New format: {dataset}_meta_{conf_type}_mcuncert_directions_{pos}.npz
     # Legacy format: {dataset}_meta_{conf_type}_mcuncert_directions.npz
     # with keys like probe_{metric}_layer_0, mean_diff_{metric}_layer_5
-    for conf_type in ["confidence", "other_confidence"]:
+    for conf_type in ["confidence", "other_confidence", "delegate"]:
         # Match new per-position format and legacy format
         for pattern in [f"*_meta_{conf_type}_mcuncert_directions_*.npz", f"*_meta_{conf_type}_mcuncert_directions.npz"]:
             for path in glob_outputs(pattern, model_dir=model_dir):
@@ -702,6 +749,85 @@ def clean_token_str(s: str) -> str:
     if len(s) > 12:
         s = s[:10] + '..'
     return s if s.strip() else repr(s)
+
+
+def normalize_direction_name(source: str, direction_name: str) -> tuple[list[str], str, str]:
+    """
+    Convert source + direction_name to (components, method, dataset).
+
+    Pattern: {dataset}_logitlens_{components}_{method}.png
+    Components have underscores BETWEEN them, not WITHIN.
+
+    Returns:
+        components: List of name parts (each with internal underscores removed)
+        method: "probe" or "meandiff"
+        dataset: Dataset name extracted from source, or ""
+    """
+    # Extract method and metric from direction_name
+    if "mean_diff" in direction_name:
+        method = "meandiff"
+        metric = direction_name.replace("mean_diff_", "").replace("mean_diff", "").strip("_")
+    elif direction_name == "probe" or direction_name.startswith("probe_"):
+        method = "probe"
+        metric = direction_name.replace("probe_", "").replace("probe", "").strip("_")
+    else:
+        method = "probe"
+        metric = direction_name
+
+    # Compact metric (logit_gap -> logitgap)
+    metric = metric.replace("_", "") if metric else ""
+
+    # Try each known prefix (list is pre-sorted longest first)
+    for prefix in DIRECTION_PREFIXES:
+        if source.startswith(prefix + "_") or source == prefix:
+            dataset = source[len(prefix)+1:] if source.startswith(prefix + "_") else ""
+
+            # Handle d_meta_mc_uncert_* -> dirtype=dmetamcuncert, task=confidence/delegate
+            if prefix.startswith("d_meta_mc_uncert_"):
+                task = prefix.replace("d_meta_mc_uncert_", "")
+                components = ["dmetamcuncert", task]
+                if metric:
+                    components.append(metric)
+                return components, method, dataset
+
+            # Handle d_*_confidence -> dirtype=d*confidence (single component)
+            if prefix.startswith("d_") and prefix.endswith("_confidence"):
+                dirtype = prefix.replace("_", "")
+                return [dirtype], method, dataset
+
+            # Handle mc_* -> dirtype=mc, metric=*
+            if prefix.startswith("mc_"):
+                metric_from_prefix = prefix.replace("mc_", "").replace("_", "")
+                return ["mc", metric_from_prefix], method, dataset
+
+            # Handle nexttoken_* -> dirtype=nexttoken, metric=*
+            if prefix.startswith("nexttoken_"):
+                metric_from_prefix = prefix.replace("nexttoken_", "").replace("_", "")
+                return ["nexttoken", metric_from_prefix], method, dataset
+
+            # Handle orthogonal -> dirtype=orthogonal, task from direction_name
+            if prefix == "orthogonal":
+                task = direction_name.replace("_", "")
+                return ["orthogonal", task], method, dataset
+
+            # Handle consensus -> dirtype=consensus, task from direction_name
+            if prefix == "consensus":
+                task = direction_name.replace("_", "")
+                return ["consensus", task], method, dataset
+
+            # Handle contrast variants
+            if prefix in ("selfVother_conf", "self_vs_other_confidence", "contrast"):
+                return ["contrast"], method, dataset
+
+            # Default: just compact the prefix
+            dirtype = prefix.replace("_", "")
+            components = [dirtype]
+            if metric:
+                components.append(metric)
+            return components, method, dataset
+
+    # Fallback: just remove underscores from source
+    return [source.replace("_", "")], method, ""
 
 
 def logit_lens_for_layer(
@@ -1281,54 +1407,12 @@ Key prediction:
                 # Get direction names from first available layer
                 first_layer = next(iter(layers_dict.keys()))
                 for direction_name in layers_dict[first_layer].keys():
-                    # Build consistent filename: {output_prefix}_logit_lens_{direction_type}_{dataset}.png
-                    # Extract dataset from source (e.g., "d_self_confidence_SimpleMC" -> "SimpleMC")
-                    # or use source directly if no dataset embedded
+                    # Normalize direction name and extract dataset
+                    components, method, dataset = normalize_direction_name(source, direction_name)
 
-                    # Determine the full direction type name
-                    if source.startswith("orthogonal_"):
-                        # orthogonal_SimpleMC + self_confidence_unique -> d_self_confidence_unique
-                        dataset = source.replace("orthogonal_", "")
-                        # Handle legacy names
-                        if direction_name == "introspection":
-                            dir_type = "d_self_confidence_unique"
-                        elif direction_name == "surface":
-                            dir_type = "d_other_confidence_unique"
-                        else:
-                            dir_type = f"d_{direction_name}"
-                    elif source.startswith("selfVother_conf_"):
-                        # selfVother_conf_SimpleMC -> d_selfVother_conf
-                        dataset = source.replace("selfVother_conf_", "")
-                        dir_type = "d_selfVother_conf"
-                    elif source.startswith("self_vs_other_confidence_"):
-                        # Legacy: self_vs_other_confidence_SimpleMC -> d_selfVother_conf
-                        dataset = source.replace("self_vs_other_confidence_", "")
-                        dir_type = "d_selfVother_conf"
-                    elif source.startswith("contrast_"):
-                        # Legacy: contrast_SimpleMC -> d_selfVother_conf
-                        dataset = source.replace("contrast_", "")
-                        dir_type = "d_selfVother_conf"
-                    elif source == "consensus":
-                        # consensus + d_self_confidence -> d_self_confidence_consensus
-                        dataset = "consensus"
-                        dir_type = direction_name
-                    elif source.startswith("d_self_confidence_"):
-                        # d_self_confidence_SimpleMC + mean_diff -> d_self_confidence
-                        dataset = source.replace("d_self_confidence_", "")
-                        dir_type = "d_self_confidence"
-                    elif source.startswith("d_other_confidence_"):
-                        # d_other_confidence_SimpleMC + mean_diff -> d_other_confidence
-                        dataset = source.replace("d_other_confidence_", "")
-                        dir_type = "d_other_confidence"
-                    else:
-                        # Fallback: use source and direction_name as-is
-                        dataset = ""
-                        dir_type = f"{source}_{direction_name}" if direction_name not in source else source
-
-                    if dataset:
-                        filename = f"{output_prefix}_logit_lens_{dir_type}_{dataset}.png"
-                    else:
-                        filename = f"{output_prefix}_logit_lens_{dir_type}.png"
+                    # Build filename: {dataset}_logitlens_{components}_{method}.png
+                    parts = ([dataset] if dataset else []) + ["logitlens"] + components + [method]
+                    filename = "_".join(parts) + ".png"
 
                     plot_logit_lens_heatmap(
                         all_directions, all_layers, source, direction_name,
