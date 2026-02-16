@@ -22,7 +22,10 @@
       "Bash(done)",
       "Bash(for:*)",
       "Bash(do python3 -m py_compile \"$f\")",
-      "Bash(do echo \"=== $f ===\" grep -n \"get_model_dir_name\\\\|model_dir.*=\" \"$f\")"
+      "Bash(do echo \"=== $f ===\" grep -n \"get_model_dir_name\\\\|model_dir.*=\" \"$f\")",
+      "Bash(python3 -m py_compile:*)",
+      "Bash(gemini)",
+      "Bash(gemini:*)"
     ]
   },
   "enableAllProjectMcpServers": false

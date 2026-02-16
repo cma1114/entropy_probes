@@ -143,6 +143,47 @@ python compare_direction_types.py
 
 Compares uncertainty, answer, and confidence directions via cosine similarity. Reports bootstrap CIs on mean cosine.
 
+### Stage 5: Causal ordering analysis
+
+Test whether MC uncertainty representations appear in meta-task activations *before* meta output uncertainty and confidence representations—as predicted if MC uncertainty causally drives meta-judgments.
+
+```bash
+python analyze_causal_ordering.py
+```
+
+**Rationale**: If the model's MC uncertainty causally influences its meta-judgment (e.g., confidence rating), then:
+1. MC uncertainty signal should appear in **earlier** layers (input processing)
+2. Meta output uncertainty (entropy over answer/delegate) should appear in **middle** layers (decision computation)
+3. Meta confidence (the output) should appear in **later** layers (output generation)
+
+The script plots R² vs layer for four signals:
+- **D→M transfer**: MC direction applied to meta activations (tests if same direction transfers)
+- **mcuncert**: Direction in meta activations that predicts MC uncertainty (tests if any direction encodes it)
+- **metaentropy**: Direction predicting entropy over meta-task output options
+- **confdir**: Direction predicting stated confidence
+
+If MC signals peak before meta signals, this is consistent with MC uncertainty being causal. If they peak at the same layer or confdir peaks first, this argues against the causal hypothesis.
+
+### Direction comparison across datasets and tasks
+
+Compare all 12 "output uncertainty" directions to each other:
+
+```bash
+python compare_uncertainty_directions.py
+```
+
+Computes a 12×12 cosine similarity matrix comparing:
+- MC entropy directions (3): one per dataset
+- Meta output entropy directions (9): 3 datasets × 3 meta tasks (self, other, delegate)
+
+Key questions answered:
+- Are MC entropy directions consistent across datasets?
+- Are meta output entropy directions consistent across datasets?
+- How similar are MC entropy vs meta output entropy directions?
+- Does the delegate task find a different direction than self/other confidence tasks?
+
+Also see `compare_directions_cross_dataset.py` for comparing specific direction types across datasets with consensus vector computation.
+
 ### Cross-stage summary
 
 ```bash

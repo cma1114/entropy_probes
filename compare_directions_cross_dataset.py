@@ -80,6 +80,9 @@ DIRECTION_TYPES = [
     "d_selfVother_conf",
     f"d_mc_{MC_METRIC}",
     "d_meta_mc_uncert",  # metamcuncert: meta activations → MC uncertainty
+    "d_self_meta_entropy",  # meta output entropy from confidence task
+    "d_other_meta_entropy",  # meta output entropy from other_confidence task
+    "d_delegate_meta_entropy",  # meta output entropy from delegate task
 ]
 
 
@@ -191,6 +194,21 @@ def load_all_directions(dataset: str, model_dir: str = None) -> dict[str, dict[i
             if key.startswith(prefix):
                 layer = int(key.replace(prefix, ""))
                 directions["d_meta_mc_uncert"][layer] = normalize(data[key])
+
+    # d_*_meta_entropy from metaentropy directions (entropy over meta task's output distribution)
+    meta_entropy_tasks = [
+        ("d_self_meta_entropy", "confidence"),
+        ("d_other_meta_entropy", "other_confidence"),
+        ("d_delegate_meta_entropy", "delegate"),
+    ]
+    for dir_name, meta_task in meta_entropy_tasks:
+        metaent_path = find_output_file(f"{dataset}_meta_{meta_task}_metaentropy_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
+        if metaent_path.exists():
+            data = np.load(metaent_path)
+            for key in data.files:
+                if key.startswith("mean_diff_layer_"):
+                    layer = int(key.replace("mean_diff_layer_", ""))
+                    directions[dir_name][layer] = normalize(data[key])
 
     # Check we have at least some directions
     has_any = any(len(d) > 0 for d in directions.values())

@@ -130,6 +130,12 @@ COMPARE_UNCERTAINTY_METRIC = METRICS[0]  # Compare confidence vs uncertainty dir
 FIND_MC_UNCERTAINTY_DIRECTIONS = True
 MC_UNCERTAINTY_METRICS = ["logit_gap", "entropy"]  # Which MC metrics to predict from meta activations
 
+# --- Meta Output Entropy directions ---
+# Train probes on meta-task activations to predict meta output entropy
+# (entropy over Answer/Delegate for delegate task, or over S-Z for confidence task)
+# Tests: Is the model's uncertainty representation shared across tasks?
+FIND_META_OUTPUT_ENTROPY_DIRECTIONS = True
+
 # --- Script-specific ---
 # Token positions to probe for transfer
 # question_mark: "?" at end of embedded MC question
@@ -223,6 +229,57 @@ def compute_behavioral_stats(
             }
 
     return stats
+
+
+def compute_logit_margin_stats(logit_margins: np.ndarray) -> dict:
+    """
+    Compute summary statistics for logit_margin signal (delegate task only).
+
+    Args:
+        logit_margins: (n_samples,) array of logit(Answer) - logit(Delegate)
+
+    Returns:
+        dict with summary statistics, or None if all NaN
+    """
+    if np.all(np.isnan(logit_margins)):
+        return None
+
+    stats = {"n_samples": len(logit_margins)}
+    # For logit_margin: positive = prefers Answer, negative = prefers Delegate
+    answer_rate = float((logit_margins > 0).mean())
+    delegate_rate = float((logit_margins <= 0).mean())
+    stats["answer_rate"] = answer_rate
+    stats["delegate_rate"] = delegate_rate
+    stats["logit_margin_mean"] = float(logit_margins.mean())
+    stats["logit_margin_std"] = float(logit_margins.std())
+    stats["logit_margin_min"] = float(logit_margins.min())
+    stats["logit_margin_max"] = float(logit_margins.max())
+    stats["logit_margin_median"] = float(np.median(logit_margins))
+    stats["logit_margin_quantiles"] = {
+        "q10": float(np.percentile(logit_margins, 10)),
+        "q25": float(np.percentile(logit_margins, 25)),
+        "q50": float(np.percentile(logit_margins, 50)),
+        "q75": float(np.percentile(logit_margins, 75)),
+        "q90": float(np.percentile(logit_margins, 90)),
+    }
+    return stats
+
+
+def compute_meta_output_entropy(option_probs: np.ndarray) -> np.ndarray:
+    """
+    Compute entropy over meta-task option distribution.
+
+    Args:
+        option_probs: (n_samples, n_options) probability distribution
+                      Delegate: 2 options (Answer, Delegate)
+                      Confidence: 8 options (S-Z)
+
+    Returns:
+        (n_samples,) entropy values
+    """
+    eps = 1e-10
+    p = np.clip(option_probs, eps, 1.0)
+    return -np.sum(p * np.log(p), axis=1)
 
 
 def load_probes(probes_path: Path) -> dict:
@@ -1236,11 +1293,21 @@ def main():
                     position_valid_arrays[pos_name] = loaded[key]
                 elif key == "confidences":
                     confidences = loaded[key]
+                elif key == "logit_margins":
+                    logit_margins = loaded[key]
                 elif key == "option_probs":
                     option_probs = loaded[key]
             # If no option_probs found (old cache), set to None
             if "option_probs" not in loaded.files:
                 option_probs = None
+            # If no logit_margins found (old cache), reconstruct from confidences
+            if "logit_margins" not in loaded.files:
+                if META_TASK == "delegate":
+                    # logit_margin = log(P(Answer) / (1 - P(Answer))) = logit(Answer) - logit(Delegate)
+                    eps = 1e-10
+                    logit_margins = np.log((confidences + eps) / (1 - confidences + eps))
+                else:
+                    logit_margins = np.full(len(confidences), np.nan)
             # If no validity masks found (old format), assume all valid
             if not position_valid_arrays:
                 n_samples = len(confidences)
@@ -1254,12 +1321,21 @@ def main():
                     legacy_activations[layer] = loaded[key]
                 elif key == "confidences":
                     confidences = loaded[key]
+                elif key == "logit_margins":
+                    logit_margins = loaded[key]
                 elif key == "option_probs":
                     option_probs = loaded[key]
             meta_activations = {"final": legacy_activations}
             # Legacy format: no option_probs
             if "option_probs" not in loaded.files:
                 option_probs = None
+            # Legacy format: no logit_margins - reconstruct from confidences
+            if "logit_margins" not in loaded.files:
+                if META_TASK == "delegate":
+                    eps = 1e-10
+                    logit_margins = np.log((confidences + eps) / (1 - confidences + eps))
+                else:
+                    logit_margins = np.full(len(confidences), np.nan)
             # Legacy format: only final position, all valid
             n_samples = len(confidences)
             position_valid_arrays = {"final": np.ones(n_samples, dtype=bool)}
@@ -1315,6 +1391,7 @@ def main():
             for pos in PROBE_POSITIONS
         }
         all_confidences = []
+        all_logit_margins = []  # logit(Answer) - logit(Delegate) for delegate task
         all_option_probs = []  # Raw probability distributions over options
         all_mappings = []
         # Track which examples have valid positions for each position name
@@ -1364,7 +1441,7 @@ def main():
                     for bp in batch_positions:
                         position_valid[pos_name].append(pos_name in bp)
 
-                layer_acts_by_pos, probs, _, _ = extractor.extract_batch(
+                layer_acts_by_pos, probs, logits_list, _ = extractor.extract_batch(
                     input_ids, attention_mask, option_token_ids, token_positions
                 )
 
@@ -1374,11 +1451,21 @@ def main():
                         for layer, act in item_acts.items():
                             all_activations[pos_name][layer].append(act)
 
-                for p, mapping in zip(probs, batch_mappings):
+                for p, logits, mapping in zip(probs, logits_list, batch_mappings):
                     confidence = signal_fn(p, mapping)
                     all_confidences.append(confidence)
                     all_option_probs.append(p)
                     all_mappings.append(mapping)
+
+                    # Compute logit_margin for delegate task
+                    if META_TASK == "delegate" and mapping is not None:
+                        # mapping maps "1"/"2" -> "Answer"/"Delegate"
+                        ans_idx = 0 if mapping.get("1") == "Answer" else 1
+                        del_idx = 1 - ans_idx
+                        logit_margin = float(logits[ans_idx] - logits[del_idx])
+                        all_logit_margins.append(logit_margin)
+                    else:
+                        all_logit_margins.append(np.nan)  # Not applicable for other tasks
 
         # Stack activations: {position: {layer: np.array}}
         meta_activations = {
@@ -1386,6 +1473,7 @@ def main():
             for pos, pos_acts in all_activations.items()
         }
         confidences = np.array(all_confidences)
+        logit_margins = np.array(all_logit_margins)  # NaN for non-delegate tasks
         option_probs = np.stack(all_option_probs)  # (n_samples, n_options)
         # Convert validity masks to arrays
         position_valid_arrays = {pos: np.array(valid) for pos, valid in position_valid.items()}
@@ -1399,7 +1487,7 @@ def main():
 
         # Save activations for future runs
         print(f"Saving activations...")
-        save_dict = {"confidences": confidences, "option_probs": option_probs}
+        save_dict = {"confidences": confidences, "logit_margins": logit_margins, "option_probs": option_probs}
         for pos_name, pos_acts in meta_activations.items():
             for layer, acts in pos_acts.items():
                 save_dict[f"layer_{layer}_{pos_name}"] = acts
@@ -1586,17 +1674,20 @@ def main():
         # Bootstrap CI for full dataset correlation
         full_std = _bootstrap_corr_std(direct_values * sign, confidences, n_boot=N_BOOTSTRAP, seed=SEED)
 
+        ci_lo = corr - 1.96 * full_std
+        ci_hi = corr + 1.96 * full_std
+
         behavioral[metric] = {
             "pearson_r": float(corr),
             "pearson_p": float(p_value),
             "pearson_r_std": float(full_std),
+            "pearson_ci_low": float(ci_lo),
+            "pearson_ci_high": float(ci_hi),
             "spearman_r": float(spearman_corr),
             "spearman_p": float(spearman_p),
         }
 
         sign_str = "(inverted)" if sign < 0 else ""
-        ci_lo = corr - 1.96 * full_std
-        ci_hi = corr + 1.96 * full_std
         print(f"  {metric} {sign_str}: r={corr:.3f} [{ci_lo:.3f}, {ci_hi:.3f}] (p={p_value:.2e}), ρ={spearman_corr:.3f}")
 
 
@@ -1613,16 +1704,79 @@ def main():
         # Bootstrap CI for test set correlation
         test_std = _bootstrap_corr_std(direct_test * sign, conf_test, n_boot=N_BOOTSTRAP, seed=SEED)
 
+        test_ci_lo = test_r - 1.96 * test_std
+        test_ci_hi = test_r + 1.96 * test_std
+
         behavioral[metric]["test_pearson_r"] = float(test_r)
         behavioral[metric]["test_pearson_p"] = float(test_p)
         behavioral[metric]["test_pearson_r_std"] = float(test_std)
+        behavioral[metric]["test_pearson_ci_low"] = float(test_ci_lo)
+        behavioral[metric]["test_pearson_ci_high"] = float(test_ci_hi)
         behavioral[metric]["test_spearman_r"] = float(test_rs)
         behavioral[metric]["test_spearman_p"] = float(test_rs_p)
 
         sign_str = "(inverted)" if sign < 0 else ""
-        test_ci_lo = test_r - 1.96 * test_std
-        test_ci_hi = test_r + 1.96 * test_std
         print(f"  {metric} {sign_str} test-set: r={test_r:.3f} [{test_ci_lo:.3f}, {test_ci_hi:.3f}], ρ={test_rs:.3f}")
+
+    # Behavioral correlation for logit_margin (delegate task only)
+    # logit_margin = logit(Answer) - logit(Delegate), an alternative to P(Answer)
+    behavioral_logit_margin = None
+    if META_TASK == "delegate" and not np.all(np.isnan(logit_margins)):
+        print("\nMetric ↔ logit_margin (full dataset):")
+        behavioral_logit_margin = {"meta_target": "logit_margin"}
+
+        for metric in metrics_tested:
+            direct_values = dataset["metric_values"][metric]
+            sign = metric_sign_for_confidence(metric)
+
+            corr, p_value = pearsonr(direct_values * sign, logit_margins)
+            spearman_corr, spearman_p = spearmanr(direct_values * sign, logit_margins)
+
+            # Bootstrap CI for full dataset correlation
+            full_std = _bootstrap_corr_std(direct_values * sign, logit_margins, n_boot=N_BOOTSTRAP, seed=SEED)
+
+            ci_lo = corr - 1.96 * full_std
+            ci_hi = corr + 1.96 * full_std
+
+            behavioral_logit_margin[metric] = {
+                "pearson_r": float(corr),
+                "pearson_p": float(p_value),
+                "pearson_r_std": float(full_std),
+                "pearson_ci_low": float(ci_lo),
+                "pearson_ci_high": float(ci_hi),
+                "spearman_r": float(spearman_corr),
+                "spearman_p": float(spearman_p),
+            }
+
+            sign_str = "(inverted)" if sign < 0 else ""
+            print(f"  {metric} {sign_str}: r={corr:.3f} [{ci_lo:.3f}, {ci_hi:.3f}] (p={p_value:.2e}), ρ={spearman_corr:.3f}")
+
+        # Test-set baseline for logit_margin
+        print("\nMetric ↔ logit_margin (test set):")
+        lm_test = logit_margins[test_idx]
+        for metric in metrics_tested:
+            direct_test = dataset["metric_values"][metric][test_idx]
+            sign = metric_sign_for_confidence(metric)
+
+            test_r, test_p = pearsonr(direct_test * sign, lm_test)
+            test_rs, test_rs_p = spearmanr(direct_test * sign, lm_test)
+
+            # Bootstrap CI for test set correlation
+            test_std = _bootstrap_corr_std(direct_test * sign, lm_test, n_boot=N_BOOTSTRAP, seed=SEED)
+
+            test_ci_lo = test_r - 1.96 * test_std
+            test_ci_hi = test_r + 1.96 * test_std
+
+            behavioral_logit_margin[metric]["test_pearson_r"] = float(test_r)
+            behavioral_logit_margin[metric]["test_pearson_p"] = float(test_p)
+            behavioral_logit_margin[metric]["test_pearson_r_std"] = float(test_std)
+            behavioral_logit_margin[metric]["test_pearson_ci_low"] = float(test_ci_lo)
+            behavioral_logit_margin[metric]["test_pearson_ci_high"] = float(test_ci_hi)
+            behavioral_logit_margin[metric]["test_spearman_r"] = float(test_rs)
+            behavioral_logit_margin[metric]["test_spearman_p"] = float(test_rs_p)
+
+            sign_str = "(inverted)" if sign < 0 else ""
+            print(f"  {metric} {sign_str} test-set: r={test_r:.3f} [{test_ci_lo:.3f}, {test_ci_hi:.3f}], ρ={test_rs:.3f}")
 
     # =============================================================================
     # MEAN-DIFF TRANSFER (precomputed directions)
@@ -1957,7 +2111,9 @@ def main():
             "meta_target_stats": compute_behavioral_stats(
                 confidences, option_probs, META_TASK
             ),
+            "logit_margin_stats": compute_logit_margin_stats(logit_margins),  # None for non-delegate tasks
             "behavioral": behavioral,
+            "behavioral_logit_margin": behavioral_logit_margin,  # None for non-delegate tasks
             "transfer": {},
             "mean_diff_transfer": {},
         }
@@ -2429,6 +2585,200 @@ def main():
                 # Add mcuncert files to output list
                 output_files.extend([mcuncert_dir_path, mcuncert_results_path, mcuncert_plot_path])
 
+        # =================================================================
+        # META OUTPUT ENTROPY DIRECTIONS FOR THIS POSITION (optional)
+        # =================================================================
+        if FIND_META_OUTPUT_ENTROPY_DIRECTIONS and option_probs is not None:
+            meta_activations_by_layer = meta_activations.get(pos, {})
+
+            if not meta_activations_by_layer:
+                print(f"  Skipping meta output entropy probes ({pos}) - no activations available")
+            else:
+                # Compute entropy over meta-task output distribution
+                meta_entropy = compute_meta_output_entropy(option_probs)
+                n_options = option_probs.shape[1]
+                max_entropy = np.log(n_options)  # ln(2) for delegate, ln(8) for confidence
+
+                print(f"  Training meta output entropy probes ({pos})...")
+                print(f"    Target: entropy over {n_options} options, range [0, {max_entropy:.3f}]")
+
+                metaent_results = find_mc_uncertainty_directions_from_meta(
+                    meta_activations_by_layer,
+                    meta_entropy,
+                    train_idx,
+                    test_idx,
+                    alpha=PROBE_ALPHA,
+                    n_components=PROBE_PCA_COMPONENTS,
+                    mean_diff_quantile=MEAN_DIFF_QUANTILE,
+                    n_bootstrap=N_BOOTSTRAP,
+                    seed=SEED,
+                )
+
+                # Compare to MC entropy direction
+                mc_entropy_comparison = None
+                mc_entropy_path = find_output_file(f"{base_name}_mc_entropy_directions.npz", model_dir=model_dir)
+                if mc_entropy_path.exists():
+                    mc_data = np.load(mc_entropy_path)
+                    mc_entropy_comparison = {}
+                    for method in ["probe", "mean_diff"]:
+                        mc_dirs = {}
+                        for layer in range(num_layers):
+                            key = f"{method}_layer_{layer}"
+                            if key in mc_data:
+                                mc_dirs[layer] = mc_data[key]
+                        if mc_dirs:
+                            mc_entropy_comparison[method] = compare_confidence_to_uncertainty(
+                                metaent_results["directions"][method],
+                                mc_dirs
+                            )
+                    if not mc_entropy_comparison:
+                        mc_entropy_comparison = None
+
+                # Save directions
+                metaent_directions = {
+                    "_metadata_input_base": f"{model_dir}/{base_name}",
+                    "_metadata_meta_task": META_TASK,
+                    "_metadata_position": pos,
+                    "_metadata_n_options": n_options,
+                }
+                for method in ["probe", "mean_diff"]:
+                    for layer in range(num_layers):
+                        metaent_directions[f"{method}_layer_{layer}"] = metaent_results["directions"][method][layer]
+
+                metaent_dir_path = get_output_path(f"{base_output}_metaentropy_directions_{pos}.npz", model_dir=model_dir)
+                np.savez(metaent_dir_path, **metaent_directions)
+
+                # Save probes
+                metaent_probes = {
+                    "metadata": {
+                        "input_base": f"{model_dir}/{base_name}",
+                        "meta_task": META_TASK,
+                        "position": pos,
+                        "n_options": n_options,
+                        "train_split": TRAIN_SPLIT,
+                        "probe_alpha": PROBE_ALPHA,
+                        "pca_components": PROBE_PCA_COMPONENTS,
+                        "seed": SEED,
+                    },
+                    "probes": metaent_results["probes"],
+                }
+                metaent_probes_path = get_output_path(f"{base_output}_metaentropy_probes_{pos}.joblib", model_dir=model_dir)
+                joblib.dump(metaent_probes, metaent_probes_path)
+
+                # Build JSON results
+                metaent_json = {
+                    "config": get_config_dict(
+                        input_base=f"{model_dir}/{base_name}",
+                        meta_task=META_TASK,
+                        position=pos,
+                        n_options=n_options,
+                        train_split=TRAIN_SPLIT,
+                        probe_alpha=PROBE_ALPHA,
+                        pca_components=PROBE_PCA_COMPONENTS,
+                        mean_diff_quantile=MEAN_DIFF_QUANTILE,
+                        n_bootstrap=N_BOOTSTRAP,
+                        seed=SEED,
+                        load_in_4bit=LOAD_IN_4BIT,
+                        load_in_8bit=LOAD_IN_8BIT,
+                    ),
+                    "target_stats": {
+                        "mean": float(meta_entropy.mean()),
+                        "std": float(meta_entropy.std()),
+                        "min": float(meta_entropy.min()),
+                        "max": float(meta_entropy.max()),
+                        "max_possible": float(max_entropy),
+                        "n_options": n_options,
+                    },
+                    "stats": {
+                        "n_samples": len(train_idx) + len(test_idx),
+                        "n_train": len(train_idx),
+                        "n_test": len(test_idx),
+                    },
+                    "results": {},
+                    "comparison_within_methods": {},
+                }
+
+                # Add per-layer results
+                for method in ["probe", "mean_diff"]:
+                    metaent_json["results"][method] = {}
+                    for layer in range(num_layers):
+                        layer_info = {}
+                        for k, v in metaent_results["fits"][method][layer].items():
+                            if isinstance(v, np.floating):
+                                layer_info[k] = float(v)
+                            elif isinstance(v, np.integer):
+                                layer_info[k] = int(v)
+                            else:
+                                layer_info[k] = v
+                        metaent_json["results"][method][layer] = layer_info
+
+                # Add probe vs mean_diff comparison
+                for layer in range(num_layers):
+                    metaent_json["comparison_within_methods"][layer] = {
+                        "cosine_sim": float(metaent_results["comparison"][layer]["cosine_sim"])
+                    }
+
+                # Add comparison to MC entropy directions
+                if mc_entropy_comparison:
+                    metaent_json["mc_entropy_comparison"] = {"by_method": {}}
+                    for method, method_comp in mc_entropy_comparison.items():
+                        metaent_json["mc_entropy_comparison"]["by_method"][method] = {
+                            layer: {k: float(v) for k, v in comp.items()}
+                            for layer, comp in method_comp.items()
+                        }
+
+                metaent_results_path = get_output_path(f"{base_output}_metaentropy_results_{pos}.json", model_dir=model_dir)
+                with open(metaent_results_path, "w") as f:
+                    json.dump(metaent_json, f, indent=2)
+
+                # Plot: R² by layer + cosine similarity to MC entropy
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+                # Panel 1: R² by layer
+                ax1 = axes[0]
+                layers_list = list(range(num_layers))
+                for method, color in [("probe", "tab:blue"), ("mean_diff", "tab:orange")]:
+                    r2_vals = [metaent_results["fits"][method][l]["test_r2"] for l in layers_list]
+                    ax1.plot(layers_list, r2_vals, label=method, color=color, linewidth=1.5)
+                ax1.set_xlabel("Layer")
+                ax1.set_ylabel("R²")
+                ax1.set_title(f"Meta Output Entropy M→M ({META_TASK}, {pos})")
+                ax1.legend()
+                ax1.grid(True, alpha=0.3)
+
+                # Panel 2: Cosine similarity to MC entropy direction
+                ax2 = axes[1]
+                if mc_entropy_comparison:
+                    for method, color in [("probe", "tab:blue"), ("mean_diff", "tab:orange")]:
+                        if method in mc_entropy_comparison:
+                            cos_vals = [mc_entropy_comparison[method][l]["cosine_similarity"] for l in layers_list]
+                            ax2.plot(layers_list, cos_vals, label=method, color=color, linewidth=1.5)
+                    ax2.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                    ax2.set_ylim(-1, 1)
+                else:
+                    ax2.text(0.5, 0.5, "MC entropy directions not found", ha="center", va="center", transform=ax2.transAxes)
+                ax2.set_xlabel("Layer")
+                ax2.set_ylabel("Cosine Similarity")
+                ax2.set_title("cos(d_meta_entropy, d_mc_entropy)")
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                metaent_plot_path = get_output_path(f"{base_output}_metaentropy_results_{pos}.png", model_dir=model_dir)
+                plt.savefig(metaent_plot_path, dpi=300)
+                plt.close()
+
+                # Add metaentropy files to output list
+                output_files.extend([metaent_dir_path, metaent_results_path, metaent_plot_path])
+
+                # Add to key findings
+                best_layer_probe = max(layers_list, key=lambda l: metaent_results["fits"]["probe"][l]["test_r2"])
+                best_r2 = metaent_results["fits"]["probe"][best_layer_probe]["test_r2"]
+                key_findings[f"Meta entropy M→M ({pos})"] = f"R²={best_r2:.3f} at L{best_layer_probe}"
+                if mc_entropy_comparison and "probe" in mc_entropy_comparison:
+                    cos_at_best = mc_entropy_comparison["probe"][best_layer_probe]["cosine_similarity"]
+                    key_findings[f"cos(d_meta_ent, d_mc_ent) ({pos})"] = f"{cos_at_best:.3f} at L{best_layer_probe}"
+
     # Collect key findings for console summary
     meta_stats = compute_behavioral_stats(confidences, option_probs, META_TASK)
     if META_TASK == "delegate":
@@ -2442,10 +2792,15 @@ def main():
         if not layers_available:
             continue
 
-        # Behavioral correlation
+        # Behavioral correlation (P(Answer) for delegate, stated confidence otherwise)
         beh = behavioral[metric]
         r_val = beh['pearson_r']
         key_findings[f"Behavioral ({metric})"] = f"r={r_val:.3f}"
+
+        # Behavioral correlation (logit_margin) - delegate task only
+        if behavioral_logit_margin is not None and metric in behavioral_logit_margin:
+            lm_r = behavioral_logit_margin[metric]['pearson_r']
+            key_findings[f"Behavioral logit_margin ({metric})"] = f"r={lm_r:.3f}"
 
         # D→D (test set)
         d2d_r2_val = None
