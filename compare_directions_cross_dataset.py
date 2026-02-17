@@ -195,19 +195,21 @@ def load_all_directions(dataset: str, model_dir: str = None) -> dict[str, dict[i
                 layer = int(key.replace(prefix, ""))
                 directions["d_meta_mc_uncert"][layer] = normalize(data[key])
 
-    # d_*_meta_entropy from metaentropy directions (entropy over meta task's output distribution)
-    meta_entropy_tasks = [
+    # d_*_meta_uncert from metauncert directions (uncertainty over meta task's output distribution)
+    meta_uncert_tasks = [
         ("d_self_meta_entropy", "confidence"),
         ("d_other_meta_entropy", "other_confidence"),
         ("d_delegate_meta_entropy", "delegate"),
     ]
-    for dir_name, meta_task in meta_entropy_tasks:
-        metaent_path = find_output_file(f"{dataset}_meta_{meta_task}_metaentropy_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
-        if metaent_path.exists():
-            data = np.load(metaent_path)
+    for dir_name, meta_task in meta_uncert_tasks:
+        metauncert_path = find_output_file(f"{dataset}_meta_{meta_task}_metauncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
+        if metauncert_path.exists():
+            data = np.load(metauncert_path)
+            # New format: mean_diff_{metric}_layer_{layer}
+            prefix = f"mean_diff_{MC_METRIC}_layer_"
             for key in data.files:
-                if key.startswith("mean_diff_layer_"):
-                    layer = int(key.replace("mean_diff_layer_", ""))
+                if key.startswith(prefix):
+                    layer = int(key.replace(prefix, ""))
                     directions[dir_name][layer] = normalize(data[key])
 
     # Check we have at least some directions

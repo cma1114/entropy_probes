@@ -166,13 +166,15 @@ def get_output_path(filename: str, model_dir: str = None, working: bool = False)
     return target_dir / filename
 
 
-def find_output_file(filename: str, model_dir: str = None) -> Path:
+def find_output_file(filename: str, model_dir: str = None, working: bool = False) -> Path:
     """
     Find an existing output file with migration-friendly fallback chain.
 
     Args:
         filename: Just the filename (not a path)
         model_dir: Optional model directory name. If provided, searches in model-specific dirs first.
+        working: If True, force lookup in working/ even for .json/.png extensions.
+                 Use for checkpoints, datasets, and other machine data saved with working=True.
 
     Returns:
         Path to the file. Search order when model_dir is provided:
@@ -193,7 +195,7 @@ def find_output_file(filename: str, model_dir: str = None) -> Path:
         # Then:   outputs/Llama-3.1-8B-Instruct_TriviaMC_results.json
     """
     ext = Path(filename).suffix.lower()
-    subdir = "results" if ext in _RESULTS_EXTENSIONS else "working"
+    subdir = "working" if working else ("results" if ext in _RESULTS_EXTENSIONS else "working")
 
     if model_dir:
         # 1. New model-dir location

@@ -11,11 +11,12 @@ Inputs:
                                                                  (produced by build_nexttoken_dataset.py)
 
 Outputs:
-    outputs/{model_dir}/results/nexttoken_results.json           Consolidated results
-    outputs/{model_dir}/results/nexttoken_{metric}_results.png   R² curves per metric
-    outputs/{model_dir}/results/nexttoken_entropy_distribution.png  Entropy distribution
+    outputs/{model_dir}/results/nexttoken_results.json           Consolidated results (format_version: 2)
+    outputs/{model_dir}/results/nexttoken_directions.png         Consolidated directions summary
+    outputs/{model_dir}/results/nexttoken_distributions.png      Metric distributions
     outputs/{model_dir}/working/nexttoken_activations.npz        Cached activations
-    outputs/{model_dir}/working/nexttoken_{metric}_directions.npz Direction vectors
+    outputs/{model_dir}/working/nexttoken_{metric}_directions.npz Direction vectors per metric
+    outputs/{model_dir}/working/nexttoken_{metric}_probes.joblib  Probe pipeline objects per metric
 
     where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
 
@@ -27,6 +28,7 @@ Run after: build_nexttoken_dataset.py
 
 from pathlib import Path
 import json
+import joblib
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -51,8 +53,12 @@ from core import (
     print_run_footer,
     format_best_layer,
 )
+from core.directions import probe_direction
 from core.config_utils import get_config_dict, get_output_path, find_output_file
-from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA
+from core.plotting import (
+    save_figure, plot_directions_summary, METHOD_COLORS, METRIC_COLORS,
+    GRID_ALPHA, CI_ALPHA,
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -93,87 +99,57 @@ FIND_OUTPUT_TOKEN_DIRECTIONS = True  # Find directions predicting output token (
 # =============================================================================
 
 
-def plot_entropy_distribution(
-    entropies: np.ndarray,
-    output_path: Path
+def plot_nexttoken_distributions(
+    metrics_dict: Dict[str, np.ndarray],
+    output_path: Path,
 ):
-    """Plot entropy distribution for next-token prediction."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    """
+    Plot metric distributions for next-token prediction.
 
-    # 1. Overall entropy histogram (percentage)
-    ax1 = axes[0]
-    ax1.hist(entropies, bins=30, edgecolor='black', alpha=0.7,
-             weights=np.ones(len(entropies)) / len(entropies) * 100)
-    ax1.axvline(entropies.mean(), color='red', linestyle='--',
-                label=f'Mean: {entropies.mean():.3f}')
-    ax1.axvline(np.median(entropies), color='orange', linestyle='--',
-                label=f'Median: {np.median(entropies):.3f}')
-    ax1.set_xlabel('Entropy')
-    ax1.set_ylabel('Percentage')
-    ax1.set_title(f'Next-Token Entropy Distribution (n={len(entropies)})')
-    ax1.legend()
-    ax1.grid(True, alpha=GRID_ALPHA)
+    Creates one row per metric with 2 panels each:
+    1. Histogram with mean/median markers
+    2. CDF with quartile markers
+    """
+    metrics = list(metrics_dict.keys())
+    n_metrics = len(metrics)
+    if n_metrics == 0:
+        return
 
-    # 2. CDF
-    ax2 = axes[1]
-    sorted_ent = np.sort(entropies)
-    cdf = np.arange(1, len(sorted_ent) + 1) / len(sorted_ent)
-    ax2.plot(sorted_ent, cdf, linewidth=2)
-    ax2.set_xlabel('Entropy')
-    ax2.set_ylabel('Cumulative Probability')
-    ax2.set_title('Entropy CDF')
-    ax2.grid(True, alpha=GRID_ALPHA)
-    # Mark quartiles
-    for q, label in [(0.25, 'Q1'), (0.5, 'Median'), (0.75, 'Q3')]:
-        val = np.percentile(entropies, q * 100)
-        ax2.axhline(q, color='gray', linestyle=':', alpha=0.5)
-        ax2.axvline(val, color='gray', linestyle=':', alpha=0.5)
+    fig, axes = plt.subplots(n_metrics, 2, figsize=(12, 4 * n_metrics), squeeze=False)
 
-    save_figure(fig, output_path)
+    for row, metric in enumerate(metrics):
+        values = metrics_dict[metric]
+        color = METRIC_COLORS.get(metric, "tab:gray")
 
+        # Panel 1: Histogram
+        ax1 = axes[row, 0]
+        ax1.hist(values, bins=30, edgecolor='black', alpha=0.7,
+                 weights=np.ones(len(values)) / len(values) * 100, color=color)
+        ax1.axvline(values.mean(), color='red', linestyle='--',
+                    label=f'Mean: {values.mean():.3f}')
+        ax1.axvline(np.median(values), color='orange', linestyle='--',
+                    label=f'Median: {np.median(values):.3f}')
+        ax1.set_xlabel(metric)
+        ax1.set_ylabel('Percentage')
+        ax1.set_title(f'{metric} Distribution (n={len(values)})')
+        ax1.legend(fontsize=8)
+        ax1.grid(True, alpha=GRID_ALPHA)
 
-def plot_results(
-    all_results: dict,
-    metric: str,
-    output_path: Path
-):
-    """Plot R² across layers for both methods with confidence intervals."""
-    results = all_results[metric]
-    layers = sorted(results["fits"]["probe"].keys())
+        # Panel 2: CDF
+        ax2 = axes[row, 1]
+        sorted_vals = np.sort(values)
+        cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
+        ax2.plot(sorted_vals, cdf, linewidth=2, color=color)
+        ax2.set_xlabel(metric)
+        ax2.set_ylabel('Cumulative Probability')
+        ax2.set_title(f'{metric} CDF')
+        ax2.grid(True, alpha=GRID_ALPHA)
+        for q in [0.25, 0.5, 0.75]:
+            val = np.percentile(values, q * 100)
+            ax2.axhline(q, color='gray', linestyle=':', alpha=0.5)
+            ax2.axvline(val, color='gray', linestyle=':', alpha=0.5)
 
-    # Single panel - just the R² curves
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    for method in ["probe", "mean_diff"]:
-        fits = results["fits"][method]
-        color = METHOD_COLORS.get(method, "tab:gray")
-        r2_values = [fits[l]["r2"] for l in layers]
-
-        # Check for std (bootstrap)
-        has_std = "r2_std" in fits[layers[0]]
-        if has_std:
-            r2_std = [fits[l]["r2_std"] for l in layers]
-            ax.fill_between(
-                layers,
-                np.array(r2_values) - np.array(r2_std),
-                np.array(r2_values) + np.array(r2_std),
-                alpha=CI_ALPHA, color=color
-            )
-
-        # Find best layer for this method
-        best_layer = max(layers, key=lambda l: fits[l]["r2"])
-        best_r2 = fits[best_layer]["r2"]
-        label = f'{method} (best: L{best_layer}, R²={best_r2:.3f})'
-
-        ax.plot(layers, r2_values, 'o-', label=label, color=color, markersize=4)
-
-    ax.set_xlabel('Layer Index')
-    ax.set_ylabel('R² Score')
-    ax.set_title(f'{metric} Predictability by Layer (Next-Token)')
-    ax.legend()
-    ax.grid(True, alpha=GRID_ALPHA)
-    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-
+    fig.suptitle('Next-Token Metric Distributions', fontsize=14, fontweight='bold')
     save_figure(fig, output_path)
 
 
@@ -322,13 +298,13 @@ def find_dataset_path(model_name: str, model_dir: str) -> Path:
     if DATASET_PATH:
         return Path(DATASET_PATH)
 
-    # Try model-dir path first (new structure)
-    model_dir_path = find_output_file("nexttoken_entropy_dataset.json", model_dir=model_dir)
+    # Try model-dir path first (new structure) - dataset is machine data, saved with working=True
+    model_dir_path = find_output_file("nexttoken_entropy_dataset.json", model_dir=model_dir, working=True)
     if model_dir_path.exists():
         return model_dir_path
 
     # Fall back to generic (shared dataset)
-    generic = find_output_file("entropy_dataset.json")
+    generic = find_output_file("entropy_dataset.json", working=True)
     if generic.exists():
         return generic
 
@@ -579,17 +555,33 @@ def main():
         act_save["predicted_tokens"] = predicted_tokens
         np.savez_compressed(activations_path, **act_save)
 
+    # Build per-item metadata (parallel to MC's metadata list)
+    metadata = []
+    for i, item in enumerate(dataset):
+        entry = {
+            "text": item["text"][:200],  # Truncate to keep JSON reasonable
+            "predicted_token": int(predicted_tokens[i]) if predicted_tokens is not None else None,
+        }
+        for m_name, m_values in metrics_dict.items():
+            entry[m_name] = float(m_values[i])
+        metadata.append(entry)
+
     # Build dataset stats for consolidated JSON
     dataset_stats = {}
     for m_name, m_values in metrics_dict.items():
         dataset_stats[f"{m_name}_mean"] = float(m_values.mean())
         dataset_stats[f"{m_name}_std"] = float(m_values.std())
 
-    # Plot entropy distribution
-    if "entropy" in metrics_dict:
-        entropy_plot_path = get_output_path(f"{base_name}_entropy_distribution.png", model_dir=model_dir)
-        logger.info("Plotting entropy distribution...")
-        plot_entropy_distribution(metrics_dict["entropy"], entropy_plot_path)
+    # Log metric distributions
+    logger.section("Metric Distributions")
+    for m_name, m_values in metrics_dict.items():
+        logger.info(f"{m_name}: mean={m_values.mean():.3f}, std={m_values.std():.3f}, "
+                     f"range=[{m_values.min():.3f}, {m_values.max():.3f}]")
+
+    # Plot metric distributions (all metrics, not just entropy)
+    distributions_path = get_output_path(f"{base_name}_distributions.png", model_dir=model_dir)
+    logger.info("Plotting metric distributions...")
+    plot_nexttoken_distributions(metrics_dict, distributions_path)
 
     # Find directions for each metric
     logger.section("FINDING DIRECTIONS")
@@ -643,13 +635,37 @@ def main():
             cos_sim = results["comparison"][mid_layer]["cosine_sim"]
             logger.info(f"  probe vs mean_diff cosine similarity (layer {mid_layer}): {cos_sim:.3f}")
 
+        # Fit probes separately for transfer tests (parallel to MC pattern)
+        probe_objects = {}
+        for layer in tqdm(range(num_layers), desc=f"Fitting {metric} probes", leave=False):
+            X = activations_by_layer[layer]
+            _, info = probe_direction(
+                X, target_values,
+                alpha=PROBE_ALPHA,
+                pca_components=PROBE_PCA_COMPONENTS,
+                bootstrap_splits=None,
+                return_probe=True,
+            )
+            probe_objects[layer] = {
+                "scaler": info["scaler"],
+                "pca": info["pca"],
+                "ridge": info["ridge"],
+            }
+
         # Save directions file for this metric
         directions_path = get_output_path(f"{base_name}_{metric}_directions.npz", model_dir=model_dir)
+        probes_path = get_output_path(f"{base_name}_{metric}_probes.joblib", model_dir=model_dir)
+
         dir_save = {
             "_metadata_dataset": str(dataset_path),
             "_metadata_model": MODEL,
             "_metadata_metric": metric,
         }
+        probe_save = {
+            "metadata": {"model": MODEL, "metric": metric},
+            "probes": probe_objects,
+        }
+
         for method in ["probe", "mean_diff"]:
             for layer in range(num_layers):
                 dir_save[f"{method}_layer_{layer}"] = results["directions"][method][layer]
@@ -657,17 +673,29 @@ def main():
                 if method == "probe" and "scaler_scale" in results["fits"][method][layer]:
                     dir_save[f"{method}_scaler_scale_{layer}"] = results["fits"][method][layer]["scaler_scale"]
                     dir_save[f"{method}_scaler_mean_{layer}"] = results["fits"][method][layer]["scaler_mean"]
-        np.savez(directions_path, **dir_save)
-        output_files.append(directions_path)
-        logger.info(f"  Saved directions: {directions_path.name}")
 
-        # Plot results for this metric
-        plot_path = get_output_path(f"{base_name}_{metric}_results.png", model_dir=model_dir)
-        plot_results(all_results, metric, plot_path)
-        output_files.append(plot_path)
+        np.savez(directions_path, **dir_save)
+        joblib.dump(probe_save, probes_path)
+        output_files.append(directions_path)
+        output_files.append(probes_path)
+        logger.info(f"  Saved directions: {directions_path.name}")
+        logger.info(f"  Saved probes: {probes_path.name}")
 
     # Diagnostic summary to log file
     log_diagnostic_summary(logger, metrics_to_analyze, all_results)
+
+    # Consolidated directions plot (parallel to MC's *_mc_directions.png)
+    directions_plot_path = get_output_path(f"{base_name}_directions.png", model_dir=model_dir)
+    plot_directions_summary(
+        all_results,
+        None,  # No answer results (token prediction is not comparable)
+        metrics_to_analyze,
+        metadata,
+        METRIC_INFO,
+        directions_plot_path,
+        title_prefix="Next-Token",
+    )
+    output_files.append(directions_plot_path)
 
     # =========================================================================
     # OUTPUT TOKEN DIRECTIONS (parallel to MC answer directions)
@@ -749,6 +777,7 @@ def main():
         "dataset": {
             "num_samples": len(dataset),
             "stats": dataset_stats,
+            "data": metadata,
         },
         "metrics": {},
     }
@@ -759,7 +788,7 @@ def main():
         results = all_results[metric]
 
         metric_section = {
-            "stats": {
+            "metric_stats": {
                 "mean": float(target_values.mean()),
                 "std": float(target_values.std()),
                 "min": float(target_values.min()),
@@ -802,8 +831,7 @@ def main():
 
     # Add other output files
     output_files.append(activations_path)
-    if "entropy" in metrics_dict:
-        output_files.append(get_output_path(f"{base_name}_entropy_distribution.png", model_dir=model_dir))
+    output_files.append(distributions_path)
 
     # Print minimal console output
     print_key_findings(key_findings)

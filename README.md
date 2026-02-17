@@ -159,7 +159,7 @@ python analyze_causal_ordering.py
 The script plots R² vs layer for four signals:
 - **D→M transfer**: MC direction applied to meta activations (tests if same direction transfers)
 - **mcuncert**: Direction in meta activations that predicts MC uncertainty (tests if any direction encodes it)
-- **metaentropy**: Direction predicting entropy over meta-task output options
+- **metauncert**: Direction predicting uncertainty over meta-task output options
 - **confdir**: Direction predicting stated confidence
 
 If MC signals peak before meta signals, this is consistent with MC uncertainty being causal. If they peak at the same layer or confdir peaks first, this argues against the causal hypothesis.

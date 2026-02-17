@@ -7,12 +7,12 @@ it should appear in activations BEFORE meta output uncertainty and meta confiden
 Compares layer-by-layer R² for four signals in meta-task activations:
 1. D→M transfer: MC uncertainty direction (from MC task) applied to meta activations
 2. mcuncert: Direction trained on meta activations to predict MC uncertainty
-3. metaentropy: Direction trained on meta activations to predict meta output entropy
+3. metauncert: Direction trained on meta activations to predict meta output uncertainty
 4. confdir: Direction trained on meta activations to predict stated confidence
 
 Prediction if MC uncertainty is causal:
 - D→M transfer and/or mcuncert should peak at EARLIER layers
-- metaentropy should peak at MIDDLE layers
+- metauncert should peak at MIDDLE layers
 - confdir should peak at LATER layers
 
 If they all peak at the same layer, or confdir peaks before MC signals,
@@ -22,7 +22,7 @@ Inputs:
     outputs/{model_dir}/results/{dataset}_meta_{task}_transfer_results_{pos}.json
     outputs/{model_dir}/results/{dataset}_meta_{task}_confdir_results_{pos}.json
     outputs/{model_dir}/results/{dataset}_meta_{task}_mcuncert_results_{pos}.json
-    outputs/{model_dir}/results/{dataset}_meta_{task}_metaentropy_results_{pos}.json
+    outputs/{model_dir}/results/{dataset}_meta_{task}_metauncert_results_{pos}.json
 
 Outputs:
     outputs/{model_dir}/results/{dataset}_meta_{task}_causal_ordering.json
@@ -53,7 +53,7 @@ DATASET = "TriviaMC_difficulty_filtered"
 META_TASK = "confidence"  # or "other_confidence", "delegate"
 PROBE_POSITION = "final"
 
-# Which MC metric to use for D→M transfer and mcuncert
+# Which metric to use for D→M transfer, mcuncert, and metauncert
 MC_METRIC = "entropy"
 
 # =============================================================================
@@ -65,7 +65,7 @@ def get_model_dir() -> str:
 
 
 def load_transfer_r2(base_name: str, meta_task: str, pos: str, metric: str, model_dir: str) -> dict:
-    """Load D→M transfer R² by layer."""
+    """Load D→M transfer R² by layer for both methods (probe and mean_diff)."""
     path = find_output_file(f"{base_name}_meta_{meta_task}_transfer_results_{pos}.json", model_dir=model_dir)
     if not path.exists():
         return None
@@ -73,15 +73,29 @@ def load_transfer_r2(base_name: str, meta_task: str, pos: str, metric: str, mode
     with open(path) as f:
         data = json.load(f)
 
-    # Extract centered R² for the specified metric
-    r2_by_layer = {}
-    if "transfer" in data and metric in data["transfer"]:
-        for layer_str, layer_data in data["transfer"][metric].items():
-            layer = int(layer_str)
-            if "centered" in layer_data:
-                r2_by_layer[layer] = layer_data["centered"].get("r2", 0)
+    result = {}
 
-    return r2_by_layer if r2_by_layer else None
+    # Probe-based transfer: transfer[metric]["per_layer"][layer]["centered_r2"]
+    if "transfer" in data and metric in data["transfer"]:
+        per_layer = data["transfer"][metric].get("per_layer", {})
+        r2_by_layer = {}
+        for layer_str, layer_data in per_layer.items():
+            layer = int(layer_str)
+            r2_by_layer[layer] = layer_data.get("centered_r2", 0)
+        if r2_by_layer:
+            result["probe"] = r2_by_layer
+
+    # Mean-diff-based transfer: mean_diff_transfer[metric]["per_layer"][layer]["centered_r2"]
+    if "mean_diff_transfer" in data and metric in data["mean_diff_transfer"]:
+        per_layer = data["mean_diff_transfer"][metric].get("per_layer", {})
+        r2_by_layer = {}
+        for layer_str, layer_data in per_layer.items():
+            layer = int(layer_str)
+            r2_by_layer[layer] = layer_data.get("centered_r2", 0)
+        if r2_by_layer:
+            result["mean_diff"] = r2_by_layer
+
+    return result if result else None
 
 
 def load_confdir_r2(base_name: str, meta_task: str, pos: str, model_dir: str) -> dict:
@@ -138,23 +152,27 @@ def load_mcuncert_r2(base_name: str, meta_task: str, pos: str, metric: str, mode
     return result if result else None
 
 
-def load_metaentropy_r2(base_name: str, meta_task: str, pos: str, model_dir: str) -> dict:
-    """Load meta output entropy R² by layer for both methods."""
-    path = find_output_file(f"{base_name}_meta_{meta_task}_metaentropy_results_{pos}.json", model_dir=model_dir)
+def load_metauncert_r2(base_name: str, meta_task: str, pos: str, metric: str, model_dir: str) -> dict:
+    """Load meta output uncertainty R² by layer for both methods."""
+    path = find_output_file(f"{base_name}_meta_{meta_task}_metauncert_results_{pos}.json", model_dir=model_dir)
     if not path.exists():
         return None
 
     with open(path) as f:
         data = json.load(f)
 
-    if "results" not in data:
+    if "metrics" not in data or metric not in data["metrics"]:
+        return None
+
+    metric_data = data["metrics"][metric]
+    if "results" not in metric_data:
         return None
 
     result = {}
     for method in ["probe", "mean_diff"]:
-        if method in data["results"]:
+        if method in metric_data["results"]:
             r2_by_layer = {}
-            for layer_str, layer_data in data["results"][method].items():
+            for layer_str, layer_data in metric_data["results"][method].items():
                 layer = int(layer_str)
                 r2_by_layer[layer] = layer_data.get("test_r2", 0)
             if r2_by_layer:
@@ -186,11 +204,13 @@ def main():
 
     signals = {}
 
-    # 1. D→M transfer (single method - centered projection)
+    # 1. D→M transfer - both methods
     transfer_r2 = load_transfer_r2(base_name, META_TASK, PROBE_POSITION, MC_METRIC, model_dir)
     if transfer_r2:
-        signals["D→M transfer"] = transfer_r2
-        print(f"  D→M transfer: {len(transfer_r2)} layers")
+        for method, r2_dict in transfer_r2.items():
+            name = f"D→M_{method}"
+            signals[name] = r2_dict
+            print(f"  {name}: {len(r2_dict)} layers")
     else:
         print("  D→M transfer: NOT FOUND")
 
@@ -204,15 +224,15 @@ def main():
     else:
         print("  mcuncert: NOT FOUND")
 
-    # 3. metaentropy - both methods
-    metaentropy_r2 = load_metaentropy_r2(base_name, META_TASK, PROBE_POSITION, model_dir)
-    if metaentropy_r2:
-        for method, r2_dict in metaentropy_r2.items():
-            name = f"metaentropy_{method}"
+    # 3. metauncert (meta output uncertainty) - both methods
+    metauncert_r2 = load_metauncert_r2(base_name, META_TASK, PROBE_POSITION, MC_METRIC, model_dir)
+    if metauncert_r2:
+        for method, r2_dict in metauncert_r2.items():
+            name = f"metauncert_{method}"
             signals[name] = r2_dict
             print(f"  {name}: {len(r2_dict)} layers")
     else:
-        print("  metaentropy: NOT FOUND")
+        print("  metauncert: NOT FOUND")
 
     # 4. confdir - both methods
     confdir_r2 = load_confdir_r2(base_name, META_TASK, PROBE_POSITION, model_dir)
@@ -250,9 +270,9 @@ def main():
 
     # Check if MC signals peak before meta signals
     # MC signals: D→M transfer, mcuncert (both methods)
-    # Meta signals: metaentropy, confdir (both methods)
-    mc_signal_patterns = ["D→M transfer", "mcuncert_probe", "mcuncert_mean_diff"]
-    meta_signal_patterns = ["metaentropy_probe", "metaentropy_mean_diff",
+    # Meta signals: metauncert, confdir (both methods)
+    mc_signal_patterns = ["D→M_probe", "D→M_mean_diff", "mcuncert_probe", "mcuncert_mean_diff"]
+    meta_signal_patterns = ["metauncert_probe", "metauncert_mean_diff",
                            "confdir_probe", "confdir_mean_diff"]
 
     mc_peaks = [peaks[s]["layer"] for s in mc_signal_patterns if s in peaks]
@@ -297,7 +317,7 @@ def main():
             "mc_before_meta": bool(mc_avg < meta_avg),
         }
 
-    results_path = get_output_path(f"{base_name}_meta_{META_TASK}_causal_ordering.json", model_dir=model_dir)
+    results_path = get_output_path(f"{base_name}_meta_{META_TASK}_causal_ordering_{MC_METRIC}_{PROBE_POSITION}.json", model_dir=model_dir)
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {results_path}")
@@ -305,23 +325,25 @@ def main():
     # Plot
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Colors: probe=solid, mean_diff=dashed; MC signals=blues, meta signals=reds/oranges
+    # Colors: each signal type gets distinct hue; probe=solid, mean_diff=dashed
     colors = {
-        "D→M transfer": "tab:blue",
-        "mcuncert_probe": "tab:blue",
-        "mcuncert_mean_diff": "tab:cyan",
-        "metaentropy_probe": "tab:orange",
-        "metaentropy_mean_diff": "gold",
-        "confdir_probe": "tab:red",
-        "confdir_mean_diff": "tab:pink",
+        "D→M_probe": "tab:purple",         # MC: purple
+        "D→M_mean_diff": "violet",         # MC: violet (dashed)
+        "mcuncert_probe": "tab:blue",      # MC: blue
+        "mcuncert_mean_diff": "tab:cyan",  # MC: cyan (dashed)
+        "metauncert_probe": "tab:green",   # Meta: green
+        "metauncert_mean_diff": "lime",    # Meta: lime (dashed)
+        "confdir_probe": "tab:red",        # Meta: red
+        "confdir_mean_diff": "tab:orange", # Meta: orange (dashed)
     }
 
     linestyles = {
-        "D→M transfer": "-",
+        "D→M_probe": "-",
+        "D→M_mean_diff": "--",
         "mcuncert_probe": "-",
         "mcuncert_mean_diff": "--",
-        "metaentropy_probe": "-",
-        "metaentropy_mean_diff": "--",
+        "metauncert_probe": "-",
+        "metauncert_mean_diff": "--",
         "confdir_probe": "-",
         "confdir_mean_diff": "--",
     }
@@ -338,12 +360,13 @@ def main():
 
     ax.set_xlabel("Layer")
     ax.set_ylabel("R²")
-    ax.set_title(f"Causal Ordering: {DATASET} / {META_TASK}\n(dots = peak layer)")
+    ax.set_ylim(-0.5, 1.0)
+    ax.set_title(f"Causal Ordering: {DATASET} / {META_TASK} / {MC_METRIC}\n(dots = peak layer)")
     ax.legend()
     ax.grid(True, alpha=GRID_ALPHA)
 
     plt.tight_layout()
-    plot_path = get_output_path(f"{base_name}_meta_{META_TASK}_causal_ordering.png", model_dir=model_dir)
+    plot_path = get_output_path(f"{base_name}_meta_{META_TASK}_causal_ordering_{MC_METRIC}_{PROBE_POSITION}.png", model_dir=model_dir)
     plt.savefig(plot_path, dpi=150)
     plt.close()
     print(f"Saved: {plot_path}")

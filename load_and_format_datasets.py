@@ -67,6 +67,8 @@ def load_and_format_dataset(dataset_name, num_questions_needed=None, split=None,
         return load_and_format_triviamc(num_questions_needed, skip_questions=skip_questions, shuffle_answers=shuffle_answers)
     elif dataset_name=="TriviaMC_difficulty_filtered":
         return load_and_format_triviamc_filtered(num_questions_needed, skip_questions=skip_questions, shuffle_answers=shuffle_answers)
+    elif dataset_name=="TriviaMC_probability_filtered":
+        return load_and_format_triviamc_filtered(num_questions_needed, skip_questions=skip_questions, shuffle_answers=shuffle_answers, dataset_name="TriviaMC_probability_filtered")
     elif dataset_name=="Garupanese":
         if split is None:
             return load_and_format_garupanese(num_questions_needed, skip_questions=skip_questions)
@@ -1126,21 +1128,20 @@ def load_and_format_triviamc(num_questions_needed=None, split="test", skip_quest
     return formatted_questions
 
 
-def load_and_format_triviamc_filtered(num_questions_needed=None, split="test", skip_questions=None, shuffle_answers=True):
+def load_and_format_triviamc_filtered(num_questions_needed=None, split="test", skip_questions=None, shuffle_answers=True, dataset_name="TriviaMC_difficulty_filtered"):
     """
-    Loads the difficulty-filtered TriviaMC dataset (balanced correct/incorrect).
-    Same format as TriviaMC but from the filtered file.
+    Loads a filtered TriviaMC dataset (e.g. difficulty-filtered or probability-filtered).
+    Handles both pre-stored options dicts and text-based correct_answer + distractors formats.
     """
     import json
-    print(f"Attempting to load TriviaMC_difficulty_filtered...")
+    print(f"Attempting to load {dataset_name}...")
     try:
-        filename = "./data/TriviaMC_difficulty_filtered.jsonl"
+        filename = f"./data/{dataset_name}.jsonl"
         with open(filename, 'r') as f:
             dataset = [json.loads(line) for line in f]
-        print(f"TriviaMC_difficulty_filtered Dataset loaded successfully ({len(dataset)} questions).")
+        print(f"{dataset_name} loaded successfully ({len(dataset)} questions).")
     except Exception as e:
-        print(f"Error loading TriviaMC_difficulty_filtered dataset: {e}")
-        print("Run filter_by_difficulty.py first to create this file.")
+        print(f"Error loading {dataset_name}: {e}")
         return None
 
     formatted_questions = []
@@ -1151,7 +1152,7 @@ def load_and_format_triviamc_filtered(num_questions_needed=None, split="test", s
     question_ids_added = set()
 
     if not num_questions_needed: num_questions_needed = len(dataset)
-    print(f"Formatting {num_questions_needed} questions from TriviaMC_difficulty_filtered...")
+    print(f"Formatting {num_questions_needed} questions from {dataset_name}...")
     for idx in dataset_indices:
         if len(formatted_questions) >= num_questions_needed:
             break
@@ -1212,5 +1213,5 @@ def load_and_format_triviamc_filtered(num_questions_needed=None, split="test", s
     if len(formatted_questions) < num_questions_needed:
         print(f"Warning: Only able to format {len(formatted_questions)} unique questions, but {num_questions_needed} were requested.")
 
-    print(f"Successfully formatted {len(formatted_questions)} unique questions from TriviaMC_difficulty_filtered.")
+    print(f"Successfully formatted {len(formatted_questions)} unique questions from {dataset_name}.")
     return formatted_questions

@@ -58,6 +58,7 @@ from core import (
     print_run_footer,
     format_r2_with_ci,
 )
+from core.metrics import compute_mc_metrics
 from core.directions import probe_direction
 from core.config_utils import get_config_dict, get_output_path, find_output_file, glob_outputs
 from core.plotting import save_figure, METHOD_COLORS, GRID_ALPHA, CI_ALPHA
@@ -101,7 +102,7 @@ from tasks import (
 # Must match the identify_mc_correlate.py settings that produced Stage 1 files
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DATASET = "TriviaMC_difficulty_filtered"
-ADAPTER = None  # Optional: must match identify step if used
+ADAPTER = None  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000" #
 METRICS = ["logit_gap", "entropy"]  # Which metrics to test transfer for
 META_TASK = "confidence"  # "confidence", "other_confidence", or "delegate"
 
@@ -134,7 +135,8 @@ MC_UNCERTAINTY_METRICS = ["logit_gap", "entropy"]  # Which MC metrics to predict
 # Train probes on meta-task activations to predict meta output entropy
 # (entropy over Answer/Delegate for delegate task, or over S-Z for confidence task)
 # Tests: Is the model's uncertainty representation shared across tasks?
-FIND_META_OUTPUT_ENTROPY_DIRECTIONS = True
+FIND_META_OUTPUT_UNCERTAINTY_DIRECTIONS = True
+META_OUTPUT_UNCERTAINTY_METRICS = ["entropy", "logit_gap"]  # Which meta output metrics to analyze
 
 # --- Script-specific ---
 # Token positions to probe for transfer
@@ -265,21 +267,6 @@ def compute_logit_margin_stats(logit_margins: np.ndarray) -> dict:
     return stats
 
 
-def compute_meta_output_entropy(option_probs: np.ndarray) -> np.ndarray:
-    """
-    Compute entropy over meta-task option distribution.
-
-    Args:
-        option_probs: (n_samples, n_options) probability distribution
-                      Delegate: 2 options (Answer, Delegate)
-                      Confidence: 8 options (S-Z)
-
-    Returns:
-        (n_samples,) entropy values
-    """
-    eps = 1e-10
-    p = np.clip(option_probs, eps, 1.0)
-    return -np.sum(p * np.log(p), axis=1)
 
 
 def load_probes(probes_path: Path) -> dict:
@@ -2586,92 +2573,47 @@ def main():
                 output_files.extend([mcuncert_dir_path, mcuncert_results_path, mcuncert_plot_path])
 
         # =================================================================
-        # META OUTPUT ENTROPY DIRECTIONS FOR THIS POSITION (optional)
+        # META OUTPUT UNCERTAINTY DIRECTIONS FOR THIS POSITION (optional)
         # =================================================================
-        if FIND_META_OUTPUT_ENTROPY_DIRECTIONS and option_probs is not None:
+        if FIND_META_OUTPUT_UNCERTAINTY_DIRECTIONS and option_probs is not None:
             meta_activations_by_layer = meta_activations.get(pos, {})
 
             if not meta_activations_by_layer:
-                print(f"  Skipping meta output entropy probes ({pos}) - no activations available")
+                print(f"  Skipping meta output uncertainty probes ({pos}) - no activations available")
             else:
-                # Compute entropy over meta-task output distribution
-                meta_entropy = compute_meta_output_entropy(option_probs)
+                # Compute all uncertainty metrics over meta-task output distribution
                 n_options = option_probs.shape[1]
-                max_entropy = np.log(n_options)  # ln(2) for delegate, ln(8) for confidence
+                meta_output_metrics = compute_mc_metrics(option_probs, option_logits=None)
 
-                print(f"  Training meta output entropy probes ({pos})...")
-                print(f"    Target: entropy over {n_options} options, range [0, {max_entropy:.3f}]")
-
-                metaent_results = find_mc_uncertainty_directions_from_meta(
-                    meta_activations_by_layer,
-                    meta_entropy,
-                    train_idx,
-                    test_idx,
-                    alpha=PROBE_ALPHA,
-                    n_components=PROBE_PCA_COMPONENTS,
-                    mean_diff_quantile=MEAN_DIFF_QUANTILE,
-                    n_bootstrap=N_BOOTSTRAP,
-                    seed=SEED,
-                )
-
-                # Compare to MC entropy direction
-                mc_entropy_comparison = None
-                mc_entropy_path = find_output_file(f"{base_name}_mc_entropy_directions.npz", model_dir=model_dir)
-                if mc_entropy_path.exists():
-                    mc_data = np.load(mc_entropy_path)
-                    mc_entropy_comparison = {}
-                    for method in ["probe", "mean_diff"]:
-                        mc_dirs = {}
-                        for layer in range(num_layers):
-                            key = f"{method}_layer_{layer}"
-                            if key in mc_data:
-                                mc_dirs[layer] = mc_data[key]
-                        if mc_dirs:
-                            mc_entropy_comparison[method] = compare_confidence_to_uncertainty(
-                                metaent_results["directions"][method],
-                                mc_dirs
-                            )
-                    if not mc_entropy_comparison:
-                        mc_entropy_comparison = None
-
-                # Save directions
-                metaent_directions = {
+                # Initialize consolidated structures for all metrics (like mcuncert)
+                all_metauncert_directions = {
                     "_metadata_input_base": f"{model_dir}/{base_name}",
                     "_metadata_meta_task": META_TASK,
                     "_metadata_position": pos,
                     "_metadata_n_options": n_options,
+                    "_metadata_metrics": json.dumps(META_OUTPUT_UNCERTAINTY_METRICS),
                 }
-                for method in ["probe", "mean_diff"]:
-                    for layer in range(num_layers):
-                        metaent_directions[f"{method}_layer_{layer}"] = metaent_results["directions"][method][layer]
-
-                metaent_dir_path = get_output_path(f"{base_output}_metaentropy_directions_{pos}.npz", model_dir=model_dir)
-                np.savez(metaent_dir_path, **metaent_directions)
-
-                # Save probes
-                metaent_probes = {
+                all_metauncert_probes = {
                     "metadata": {
                         "input_base": f"{model_dir}/{base_name}",
                         "meta_task": META_TASK,
                         "position": pos,
                         "n_options": n_options,
+                        "metrics": META_OUTPUT_UNCERTAINTY_METRICS,
                         "train_split": TRAIN_SPLIT,
                         "probe_alpha": PROBE_ALPHA,
                         "pca_components": PROBE_PCA_COMPONENTS,
                         "seed": SEED,
                     },
-                    "probes": metaent_results["probes"],
+                    "probes": {},
                 }
-                metaent_probes_path = get_output_path(f"{base_output}_metaentropy_probes_{pos}.joblib", model_dir=model_dir)
-                joblib.dump(metaent_probes, metaent_probes_path)
-
-                # Build JSON results
-                metaent_json = {
+                all_metauncert_json = {
                     "config": get_config_dict(
                         input_base=f"{model_dir}/{base_name}",
                         meta_task=META_TASK,
                         position=pos,
                         n_options=n_options,
+                        metrics=META_OUTPUT_UNCERTAINTY_METRICS,
                         train_split=TRAIN_SPLIT,
                         probe_alpha=PROBE_ALPHA,
                         pca_components=PROBE_PCA_COMPONENTS,
@@ -2681,103 +2623,160 @@ def main():
                         load_in_4bit=LOAD_IN_4BIT,
                         load_in_8bit=LOAD_IN_8BIT,
                     ),
-                    "target_stats": {
-                        "mean": float(meta_entropy.mean()),
-                        "std": float(meta_entropy.std()),
-                        "min": float(meta_entropy.min()),
-                        "max": float(meta_entropy.max()),
-                        "max_possible": float(max_entropy),
-                        "n_options": n_options,
-                    },
                     "stats": {
                         "n_samples": len(train_idx) + len(test_idx),
                         "n_train": len(train_idx),
                         "n_test": len(test_idx),
                     },
-                    "results": {},
-                    "comparison_within_methods": {},
+                    "metrics": {},
                 }
+                all_metauncert_for_plot = {}
 
-                # Add per-layer results
-                for method in ["probe", "mean_diff"]:
-                    metaent_json["results"][method] = {}
-                    for layer in range(num_layers):
-                        layer_info = {}
-                        for k, v in metaent_results["fits"][method][layer].items():
-                            if isinstance(v, np.floating):
-                                layer_info[k] = float(v)
-                            elif isinstance(v, np.integer):
-                                layer_info[k] = int(v)
-                            else:
-                                layer_info[k] = v
-                        metaent_json["results"][method][layer] = layer_info
+                # Loop over each meta output uncertainty metric
+                for meta_metric in META_OUTPUT_UNCERTAINTY_METRICS:
+                    meta_uncertainty = meta_output_metrics[meta_metric]
 
-                # Add probe vs mean_diff comparison
-                for layer in range(num_layers):
-                    metaent_json["comparison_within_methods"][layer] = {
-                        "cosine_sim": float(metaent_results["comparison"][layer]["cosine_sim"])
+                    print(f"  Training meta output uncertainty probes ({pos}, {meta_metric})...")
+                    metauncert_results = find_mc_uncertainty_directions_from_meta(
+                        meta_activations_by_layer,
+                        meta_uncertainty,
+                        train_idx,
+                        test_idx,
+                        alpha=PROBE_ALPHA,
+                        n_components=PROBE_PCA_COMPONENTS,
+                        mean_diff_quantile=MEAN_DIFF_QUANTILE,
+                        n_bootstrap=N_BOOTSTRAP,
+                        seed=SEED,
+                    )
+
+                    # Compare to corresponding MC direction
+                    mc_dir_comparison = None
+                    mc_directions_path = find_output_file(f"{base_name}_mc_{meta_metric}_directions.npz", model_dir=model_dir)
+                    if mc_directions_path.exists():
+                        mc_data = np.load(mc_directions_path)
+                        mc_dir_comparison = {}
+                        for method in ["probe", "mean_diff"]:
+                            mc_dirs = {}
+                            for layer in range(num_layers):
+                                key = f"{method}_layer_{layer}"
+                                if key in mc_data:
+                                    mc_dirs[layer] = mc_data[key]
+                            if mc_dirs:
+                                mc_dir_comparison[method] = compare_confidence_to_uncertainty(
+                                    metauncert_results["directions"][method],
+                                    mc_dirs
+                                )
+                        if not mc_dir_comparison:
+                            mc_dir_comparison = None
+
+                    # Add to consolidated structures
+                    for method in ["probe", "mean_diff"]:
+                        for layer in range(num_layers):
+                            all_metauncert_directions[f"{method}_{meta_metric}_layer_{layer}"] = metauncert_results["directions"][method][layer]
+                    all_metauncert_probes["probes"][meta_metric] = metauncert_results["probes"]
+
+                    metric_results = {
+                        "target_stats": {
+                            "mean": float(meta_uncertainty.mean()),
+                            "std": float(meta_uncertainty.std()),
+                            "min": float(meta_uncertainty.min()),
+                            "max": float(meta_uncertainty.max()),
+                        },
+                        "results": {},
+                        "comparison_within_methods": {},
                     }
-
-                # Add comparison to MC entropy directions
-                if mc_entropy_comparison:
-                    metaent_json["mc_entropy_comparison"] = {"by_method": {}}
-                    for method, method_comp in mc_entropy_comparison.items():
-                        metaent_json["mc_entropy_comparison"]["by_method"][method] = {
-                            layer: {k: float(v) for k, v in comp.items()}
-                            for layer, comp in method_comp.items()
+                    for method in ["probe", "mean_diff"]:
+                        metric_results["results"][method] = {}
+                        for layer in range(num_layers):
+                            layer_info = {}
+                            for k, v in metauncert_results["fits"][method][layer].items():
+                                if isinstance(v, np.floating):
+                                    layer_info[k] = float(v)
+                                elif isinstance(v, np.integer):
+                                    layer_info[k] = int(v)
+                                else:
+                                    layer_info[k] = v
+                            metric_results["results"][method][layer] = layer_info
+                    for layer in range(num_layers):
+                        metric_results["comparison_within_methods"][layer] = {
+                            "cosine_sim": float(metauncert_results["comparison"][layer]["cosine_sim"])
                         }
+                    if mc_dir_comparison:
+                        metric_results["comparison_to_mc_directions"] = {"by_method": {}}
+                        for method, method_comp in mc_dir_comparison.items():
+                            metric_results["comparison_to_mc_directions"]["by_method"][method] = {
+                                layer: {k: float(v) for k, v in comp.items()}
+                                for layer, comp in method_comp.items()
+                            }
+                    all_metauncert_json["metrics"][meta_metric] = metric_results
+                    all_metauncert_for_plot[meta_metric] = (metauncert_results, mc_dir_comparison)
 
-                metaent_results_path = get_output_path(f"{base_output}_metaentropy_results_{pos}.json", model_dir=model_dir)
-                with open(metaent_results_path, "w") as f:
-                    json.dump(metaent_json, f, indent=2)
+                # Save per-position metauncert files
+                metauncert_dir_path = get_output_path(f"{base_output}_metauncert_directions_{pos}.npz", model_dir=model_dir)
+                np.savez(metauncert_dir_path, **all_metauncert_directions)
 
-                # Plot: R² by layer + cosine similarity to MC entropy
-                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                metauncert_probes_path = get_output_path(f"{base_output}_metauncert_probes_{pos}.joblib", model_dir=model_dir)
+                joblib.dump(all_metauncert_probes, metauncert_probes_path)
 
-                # Panel 1: R² by layer
-                ax1 = axes[0]
+                metauncert_results_path = get_output_path(f"{base_output}_metauncert_results_{pos}.json", model_dir=model_dir)
+                with open(metauncert_results_path, "w") as f:
+                    json.dump(all_metauncert_json, f, indent=2)
+
+                # Plot: one row per metric (R² by layer + cosine similarity to MC)
+                n_metrics = len(META_OUTPUT_UNCERTAINTY_METRICS)
+                fig, axes = plt.subplots(n_metrics, 2, figsize=(12, 4 * n_metrics))
+                if n_metrics == 1:
+                    axes = axes.reshape(1, 2)
+
                 layers_list = list(range(num_layers))
-                for method, color in [("probe", "tab:blue"), ("mean_diff", "tab:orange")]:
-                    r2_vals = [metaent_results["fits"][method][l]["test_r2"] for l in layers_list]
-                    ax1.plot(layers_list, r2_vals, label=method, color=color, linewidth=1.5)
-                ax1.set_xlabel("Layer")
-                ax1.set_ylabel("R²")
-                ax1.set_title(f"Meta Output Entropy M→M ({META_TASK}, {pos})")
-                ax1.legend()
-                ax1.grid(True, alpha=0.3)
+                for row, meta_metric in enumerate(META_OUTPUT_UNCERTAINTY_METRICS):
+                    metauncert_results, mc_dir_comparison = all_metauncert_for_plot[meta_metric]
 
-                # Panel 2: Cosine similarity to MC entropy direction
-                ax2 = axes[1]
-                if mc_entropy_comparison:
+                    # Panel 1: R² by layer
+                    ax1 = axes[row, 0]
                     for method, color in [("probe", "tab:blue"), ("mean_diff", "tab:orange")]:
-                        if method in mc_entropy_comparison:
-                            cos_vals = [mc_entropy_comparison[method][l]["cosine_similarity"] for l in layers_list]
-                            ax2.plot(layers_list, cos_vals, label=method, color=color, linewidth=1.5)
-                    ax2.axhline(0, color="gray", linestyle="--", alpha=0.5)
-                    ax2.set_ylim(-1, 1)
-                else:
-                    ax2.text(0.5, 0.5, "MC entropy directions not found", ha="center", va="center", transform=ax2.transAxes)
-                ax2.set_xlabel("Layer")
-                ax2.set_ylabel("Cosine Similarity")
-                ax2.set_title("cos(d_meta_entropy, d_mc_entropy)")
-                ax2.legend()
-                ax2.grid(True, alpha=0.3)
+                        r2_vals = [metauncert_results["fits"][method][l]["test_r2"] for l in layers_list]
+                        ax1.plot(layers_list, r2_vals, label=method, color=color, linewidth=1.5)
+                    ax1.set_xlabel("Layer")
+                    ax1.set_ylabel("R²")
+                    ax1.set_title(f"Meta Output {meta_metric} M→M ({META_TASK}, {pos})")
+                    ax1.legend()
+                    ax1.grid(True, alpha=0.3)
+
+                    # Panel 2: Cosine similarity to MC direction
+                    ax2 = axes[row, 1]
+                    if mc_dir_comparison:
+                        for method, color in [("probe", "tab:blue"), ("mean_diff", "tab:orange")]:
+                            if method in mc_dir_comparison:
+                                cos_vals = [mc_dir_comparison[method][l]["cosine_similarity"] for l in layers_list]
+                                ax2.plot(layers_list, cos_vals, label=method, color=color, linewidth=1.5)
+                        ax2.axhline(0, color="gray", linestyle="--", alpha=0.5)
+                        ax2.set_ylim(-1, 1)
+                    else:
+                        ax2.text(0.5, 0.5, f"MC {meta_metric} directions not found", ha="center", va="center", transform=ax2.transAxes)
+                    ax2.set_xlabel("Layer")
+                    ax2.set_ylabel("Cosine Similarity")
+                    ax2.set_title(f"cos(d_meta_{meta_metric}, d_mc_{meta_metric})")
+                    ax2.legend()
+                    ax2.grid(True, alpha=0.3)
 
                 plt.tight_layout()
-                metaent_plot_path = get_output_path(f"{base_output}_metaentropy_results_{pos}.png", model_dir=model_dir)
-                plt.savefig(metaent_plot_path, dpi=300)
+                metauncert_plot_path = get_output_path(f"{base_output}_metauncert_results_{pos}.png", model_dir=model_dir)
+                plt.savefig(metauncert_plot_path, dpi=300)
                 plt.close()
 
-                # Add metaentropy files to output list
-                output_files.extend([metaent_dir_path, metaent_results_path, metaent_plot_path])
+                # Add metauncert files to output list
+                output_files.extend([metauncert_dir_path, metauncert_results_path, metauncert_plot_path])
 
-                # Add to key findings
-                best_layer_probe = max(layers_list, key=lambda l: metaent_results["fits"]["probe"][l]["test_r2"])
-                best_r2 = metaent_results["fits"]["probe"][best_layer_probe]["test_r2"]
-                key_findings[f"Meta entropy M→M ({pos})"] = f"R²={best_r2:.3f} at L{best_layer_probe}"
-                if mc_entropy_comparison and "probe" in mc_entropy_comparison:
-                    cos_at_best = mc_entropy_comparison["probe"][best_layer_probe]["cosine_similarity"]
-                    key_findings[f"cos(d_meta_ent, d_mc_ent) ({pos})"] = f"{cos_at_best:.3f} at L{best_layer_probe}"
+                # Add to key findings (first metric only to avoid clutter)
+                first_metric = META_OUTPUT_UNCERTAINTY_METRICS[0]
+                first_results, first_mc_comp = all_metauncert_for_plot[first_metric]
+                best_layer_probe = max(layers_list, key=lambda l: first_results["fits"]["probe"][l]["test_r2"])
+                best_r2 = first_results["fits"]["probe"][best_layer_probe]["test_r2"]
+                key_findings[f"Meta {first_metric} M→M ({pos})"] = f"R²={best_r2:.3f} at L{best_layer_probe}"
+                if first_mc_comp and "probe" in first_mc_comp:
+                    cos_at_best = first_mc_comp["probe"][best_layer_probe]["cosine_similarity"]
+                    key_findings[f"cos(d_meta_{first_metric}, d_mc_{first_metric}) ({pos})"] = f"{cos_at_best:.3f} at L{best_layer_probe}"
 
     # Collect key findings for console summary
     meta_stats = compute_behavioral_stats(confidences, option_probs, META_TASK)

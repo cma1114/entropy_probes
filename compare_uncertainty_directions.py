@@ -3,11 +3,11 @@ Compare all output uncertainty directions across datasets and tasks.
 
 Computes a 12×12 cosine similarity matrix comparing:
 - MC entropy directions (3): one per dataset
-- Meta output entropy directions (9): 3 datasets × 3 meta tasks
+- Meta output uncertainty directions (9): 3 datasets × 3 meta tasks
 
 Inputs:
     outputs/{model_dir}/working/{dataset}_mc_entropy_directions.npz
-    outputs/{model_dir}/working/{dataset}_meta_{task}_metaentropy_directions_{pos}.npz
+    outputs/{model_dir}/working/{dataset}_meta_{task}_metauncert_directions_{pos}.npz
 
 Outputs:
     outputs/{model_dir}/results/uncertainty_directions_comparison.json
@@ -15,7 +15,7 @@ Outputs:
 
 Run after:
     identify_mc_correlate.py (for MC entropy directions)
-    test_meta_transfer.py with FIND_META_OUTPUT_ENTROPY_DIRECTIONS=True (for all 3 meta tasks)
+    test_meta_transfer.py with FIND_META_OUTPUT_UNCERTAINTY_DIRECTIONS=True (for all 3 meta tasks)
 """
 
 import numpy as np
@@ -87,15 +87,17 @@ def load_mc_entropy_direction(dataset: str, model_dir: str) -> dict[int, np.ndar
     return directions
 
 
-def load_meta_entropy_direction(dataset: str, meta_task: str, model_dir: str) -> dict[int, np.ndarray]:
-    """Load meta output entropy direction for a dataset and meta task."""
+def load_meta_uncertainty_direction(dataset: str, meta_task: str, metric: str, model_dir: str) -> dict[int, np.ndarray]:
+    """Load meta output uncertainty direction for a dataset, meta task, and metric."""
     directions = {}
-    path = find_output_file(f"{dataset}_meta_{meta_task}_metaentropy_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
+    path = find_output_file(f"{dataset}_meta_{meta_task}_metauncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     if path.exists():
         data = np.load(path)
+        # New format: mean_diff_{metric}_layer_{layer}
+        prefix = f"mean_diff_{metric}_layer_"
         for key in data.files:
-            if key.startswith("mean_diff_layer_"):
-                layer = int(key.replace("mean_diff_layer_", ""))
+            if key.startswith(prefix):
+                layer = int(key.replace(prefix, ""))
                 directions[layer] = normalize(data[key])
     return directions
 
@@ -127,11 +129,11 @@ def main():
         else:
             print(f"  {name}: NOT FOUND")
 
-    # Meta output entropy directions
+    # Meta output uncertainty directions
     for dataset in DATASETS:
         for meta_task in META_TASKS:
             name = f"{META_TASK_SHORT[meta_task]}_{DATASET_SHORT[dataset]}"
-            dirs = load_meta_entropy_direction(dataset, meta_task, model_dir)
+            dirs = load_meta_uncertainty_direction(dataset, meta_task, MC_METRIC, model_dir)
             if dirs:
                 all_directions[name] = dirs
                 print(f"  {name}: {len(dirs)} layers")
