@@ -69,14 +69,14 @@ from tasks import format_direct_prompt
 # =============================================================================
 
 # --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 ADAPTER = None  # Optional: path to PEFT/LoRA adapter
 DATASET = "TriviaMC_difficulty_filtered"
 METRICS = ["logit_gap"]  # Which metrics to analyze
 NUM_QUESTIONS = 500
 
 # --- Quantization ---
-LOAD_IN_4BIT = False  # Set True for 70B+ models
+LOAD_IN_4BIT = True  # Set True for 70B+ models
 LOAD_IN_8BIT = False
 
 # --- Experiment ---
@@ -483,6 +483,7 @@ def main():
         # Save directions (binary cache)
         answer_dir_path = get_output_path(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
         dir_save = {
+            "_metadata_dataset": base_name,
             "_metadata_input_base": f"{model_dir}/{base_name}",
             "_metadata_n_classes": len(answer_mapping),
             "_metadata_answer_mapping": json.dumps(answer_mapping),

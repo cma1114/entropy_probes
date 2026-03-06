@@ -87,7 +87,9 @@ DIRECTION_PREFIXES = [
     "d_meta_mc_uncert_other_confidence",
     "d_meta_mc_uncert_confidence",
     "d_meta_mc_uncert_delegate",
-    # Meta confidence directions
+    # Meta confidence directions (longer prefixes first)
+    "d_delegate_logit_margin",
+    "d_delegate_p_answer",
     "d_self_confidence",
     "d_other_confidence",
     "d_delegate",
@@ -799,6 +801,9 @@ def normalize_direction_name(source: str, direction_name: str) -> tuple[list[str
     elif direction_name == "probe" or direction_name.startswith("probe_"):
         method = "probe"
         metric = direction_name.replace("probe_", "").replace("probe", "").strip("_")
+    elif direction_name == "centroid" or direction_name.startswith("centroid_"):
+        method = "centroid"
+        metric = direction_name.replace("centroid_", "").replace("centroid", "").strip("_")
     else:
         method = "probe"
         metric = direction_name
@@ -843,6 +848,11 @@ def normalize_direction_name(source: str, direction_name: str) -> tuple[list[str
             if prefix == "consensus":
                 task = direction_name.replace("_", "")
                 return ["consensus", task], method, dataset
+
+            # Handle d_delegate_{target} -> dirtype=ddelegate, target component
+            if prefix.startswith("d_delegate_"):
+                target = prefix.replace("d_delegate_", "").replace("_", "")
+                return ["ddelegate", target], method, dataset
 
             # Handle contrast variants
             if prefix in ("selfVother_conf", "self_vs_other_confidence", "contrast"):
