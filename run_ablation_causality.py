@@ -9,18 +9,23 @@ Supports multiple direction types via DIRECTION_TYPE:
 - "confidence": Stated confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
 - "metamcuncert": MC uncertainty directions found from meta activations (from test_meta_transfer.py with FIND_MC_UNCERTAINTY_DIRECTIONS=True)
 
+Cross-dataset ablation: Set DIRECTION_DATASET to load directions from a different dataset
+than the evaluation dataset (DATASET). Tests whether d_mc generalizes across datasets.
+
 Tests all layers with pooled null distribution + FDR correction.
 
 Inputs:
-    outputs/{base}_mc_{metric}_directions.npz            Uncertainty directions
-    outputs/{base}_mc_answer_directions.npz              Answer directions (if DIRECTION_TYPE="answer")
-    outputs/{base}_meta_{task}_confdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
-    outputs/{base}_meta_{task}_mcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
+    outputs/{dir_base}_mc_{metric}_directions.npz         Uncertainty directions
+    outputs/{dir_base}_mc_answer_directions.npz           Answer directions (if DIRECTION_TYPE="answer")
+    outputs/{dir_base}_meta_{task}_confdir_directions.npz Confidence directions (if DIRECTION_TYPE="confidence")
+    outputs/{dir_base}_meta_{task}_mcuncert_directions.npz Meta→MC uncertainty directions (if DIRECTION_TYPE="metamcuncert")
     outputs/{base}_mc_results.json                        Consolidated results (dataset + metrics)
 
+    where {dir_base} = DIRECTION_DATASET if set, else DATASET
+
 Outputs (one file per method, with per-position plots):
-    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_results.json
-    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_{position}.png
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_results.json                    (same dataset)
+    outputs/{base}_ablation_{task}_{dir_suffix}_{method}_from_{dir_base}_results.json   (cross-dataset)
 
     where {base} = {dataset} (model info is in directory path)
           {dir_suffix} = "{direction_type}_{metric}" for uncertainty, else "{direction_type}"
@@ -87,11 +92,12 @@ from tasks import (
 # =============================================================================
 
 # --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 ADAPTER = None  # Optional: LoRA adapter path (must match identify step if used)
-DATASET = "TriviaMC_difficulty_filtered"  # Dataset name (model prefix now in directory)
+DATASET = "TriviaMC_difficulty_filtered"  # Evaluation dataset (meta-task runs here)
+DIRECTION_DATASET = None  # Source of directions (None = use DATASET, or e.g. "PopMC_0_difficulty_filtered")
 METRIC = "logit_gap"  # Which metric's directions to test (for DIRECTION_TYPE="uncertainty")
-META_TASK = "confidence"  # "confidence", "delegate", or "other_confidence"
+META_TASK = "delegate"  # "confidence", "delegate", or "other_confidence"
 PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 
 # Direction type to ablate:
@@ -127,15 +133,15 @@ DIRECTION_DESCRIPTIONS = {
 #     * "logit_margin" -> logit(Answer) - logit(Delegate) for those same tokens.
 # - For META_TASK=confidence: this script always uses the stated-confidence option probabilities;
 #   if you set CONFIDENCE_SIGNAL="logit_margin" we fall back to "prob" for that task.
-CONFIDENCE_SIGNAL = "prob"  # "prob" or "logit_margin"
+CONFIDENCE_SIGNAL = "logit_margin"  # "prob" or "logit_margin"
 
 # --- Quantization ---
-LOAD_IN_4BIT = False   # Set True for 70B+ models
+LOAD_IN_4BIT = True   # Set True for 70B+ models
 LOAD_IN_8BIT = False
 
 # --- Experiment ---
 SEED = 42                    # Must match across scripts
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 NUM_QUESTIONS = 100          # How many questions (ignored if USE_TRANSFER_SPLIT=True)
 NUM_CONTROLS = 25            # Random orthogonal directions per layer for null distribution
 
@@ -152,7 +158,7 @@ TRAIN_SPLIT = 0.8            # Must match across scripts
 # Expanded batch target for batched ablation.
 # When ablating k directions (1 primary + NUM_CONTROLS), we expand each base batch by k.
 # Higher values = better GPU utilization but more memory.
-EXPANDED_BATCH_TARGET = 96
+EXPANDED_BATCH_TARGET = 128
 
 # Optional: specify layers to test (None = all layers from directions file)
 LAYERS = None  # e.g., [20, 25, 30] for quick testing
@@ -1206,6 +1212,10 @@ def analyze_ablation_results(results: Dict, metric: str, base_name: str) -> Dict
         delta_conf_mean = float(np.mean(delta_conf))
         delta_conf_std = float(np.std(delta_conf))
 
+        # Bootstrap CI for mean Δconf (reuse idx matrix from correlation bootstrap)
+        boot_delta_conf_means = delta_conf[idx].mean(axis=1)
+        delta_conf_ci = np.quantile(boot_delta_conf_means, [lo, hi]).astype(np.float32)
+
         delta_corr_metric = compute_correlation(delta_conf, metric_signed)
         delta_spearman_metric = compute_spearman(delta_conf, metric_signed)
 
@@ -1291,6 +1301,7 @@ def analyze_ablation_results(results: Dict, metric: str, base_name: str) -> Dict
             # Δconf diagnostics
             "delta_conf_mean": delta_conf_mean,
             "delta_conf_std": delta_conf_std,
+            "delta_conf_mean_ci95": [float(delta_conf_ci[0]), float(delta_conf_ci[1])],
             "delta_conf_corr_metric": float(delta_corr_metric),
             "delta_conf_spearman_metric": float(delta_spearman_metric),
             "baseline_to_ablated_conf_corr": float(baseline_to_ablated_corr),
@@ -1354,6 +1365,7 @@ def analyze_ablation_results(results: Dict, metric: str, base_name: str) -> Dict
             "ablated_confidence_mean": ld["ablated_conf_mean"],
             "delta_conf_mean": ld["delta_conf_mean"],
             "delta_conf_std": ld["delta_conf_std"],
+            "delta_conf_mean_ci95": ld["delta_conf_mean_ci95"],
             "delta_conf_corr_metric": ld["delta_conf_corr_metric"],
             "delta_conf_spearman_metric": ld["delta_conf_spearman_metric"],
             "baseline_to_ablated_conf_corr": ld["baseline_to_ablated_conf_corr"],
@@ -1566,6 +1578,56 @@ def plot_ablation_results(analysis: Dict, method: str, output_path: Path):
 
     save_figure(fig, output_path)
 
+
+def plot_confidence_impact(analysis: Dict, method: str, position: str, output_path: Path):
+    """
+    Create single-panel figure showing mean Δconf by layer with bootstrap 95% CI.
+    """
+    layers = analysis.get("layers", [])
+    if not layers:
+        print(f"  Skipping confidence plot for {method} - no layers")
+        return
+
+    per = analysis["per_layer"]
+
+    # Extract data
+    delta_conf_mean = np.array([per[l]["delta_conf_mean"] for l in layers], dtype=np.float32)
+    ci_lo = np.array([per[l]["delta_conf_mean_ci95"][0] for l in layers], dtype=np.float32)
+    ci_hi = np.array([per[l]["delta_conf_mean_ci95"][1] for l in layers], dtype=np.float32)
+
+    # Create single-panel figure
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    x = np.arange(len(layers))
+
+    # Reference line at y=0
+    ax.axhline(0, color='black', linestyle='-', linewidth=0.5)
+
+    # CI band and line
+    ax.fill_between(x, ci_lo, ci_hi, color=CONDITION_COLORS["ablated"], alpha=CI_ALPHA)
+    ax.plot(x, delta_conf_mean, 'o-', color=CONDITION_COLORS["ablated"],
+            markersize=4, linewidth=1.5)
+
+    ax.set_xticks(x[::2])
+    ax.set_xticklabels([layers[i] for i in range(0, len(layers), 2)])
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Δ Confidence (ablated − baseline)')
+    ax.grid(True, alpha=GRID_ALPHA)
+
+    # Title with key info
+    metric = analysis.get("metric", "unknown")
+    peak_idx = int(np.argmin(delta_conf_mean))
+    peak_layer = layers[peak_idx]
+    peak_val = float(delta_conf_mean[peak_idx])
+    peak_ci = [float(ci_lo[peak_idx]), float(ci_hi[peak_idx])]
+
+    ax.set_title(f'Confidence Impact: {method.upper()} {metric} ({position})\n'
+                 f'Peak: L{peak_layer} Δconf = {peak_val:.3f} [{peak_ci[0]:.3f}, {peak_ci[1]:.3f}]',
+                 fontsize=11)
+
+    save_figure(fig, output_path)
+
+
 def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
     """Comparison plot of different direction methods.
 
@@ -1657,7 +1719,14 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
 def main():
     # Model directory for organizing outputs
     model_dir = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
-    base_name = DATASET  # Dataset name (model prefix now in directory)
+    base_name = DATASET  # Evaluation dataset (model prefix now in directory)
+    direction_base = DIRECTION_DATASET if DIRECTION_DATASET else DATASET  # Source of directions
+
+    # Cross-dataset suffix for output files (only when datasets differ)
+    if DIRECTION_DATASET and DIRECTION_DATASET != DATASET:
+        cross_suffix = f"_from_{DIRECTION_DATASET}"
+    else:
+        cross_suffix = ""
 
     # Setup output naming
     model_short = get_model_short_name(MODEL)
@@ -1665,6 +1734,7 @@ def main():
     config = {
         "model": MODEL.split("/")[-1],
         "dataset": DATASET,
+        "direction_dataset": DIRECTION_DATASET or DATASET,
         "task": META_TASK,
         "direction_type": DIRECTION_TYPE,
     }
@@ -1675,9 +1745,9 @@ def main():
     output_files = []
 
     # Load directions based on direction type
-    print("Loading directions...")
+    print(f"Loading directions from {direction_base}...")
     all_directions = load_directions(
-        base_name,
+        direction_base,
         direction_type=DIRECTION_TYPE,
         metric=METRIC,
         meta_task=META_TASK,
@@ -1803,7 +1873,7 @@ def main():
         dir_suffix = f"{DIRECTION_TYPE}_{METRIC}" if DIRECTION_TYPE == "uncertainty" else DIRECTION_TYPE
 
         for method in methods:
-            checkpoint_base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}"
+            checkpoint_base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}{cross_suffix}"
             checkpoint_path = get_output_path(f"{checkpoint_base}_checkpoint.json", model_dir=model_dir, working=True)
 
             checkpoint_json = {
@@ -1841,7 +1911,7 @@ def main():
 
     def get_base_output(method: str) -> str:
         """Get base output path for a specific method (without position - added per file)."""
-        base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}"
+        base = f"{base_name}_ablation_{META_TASK}_{dir_suffix}_{method}{cross_suffix}"
         # Add confidence signal to filename when non-default (for delegate task)
         if META_TASK == "delegate" and CONFIDENCE_SIGNAL != "prob":
             base += f"_{CONFIDENCE_SIGNAL}"
@@ -1908,9 +1978,15 @@ def main():
     for method in methods:
         method_base_output = get_base_output(method)
         for position in PROBE_POSITIONS:
+            # Correlation impact plot
             plot_path = get_output_path(f"{method_base_output}_{position}.png", model_dir=model_dir)
             plot_ablation_results(all_analyses_by_pos[position][method], method, plot_path)
             output_files.append(plot_path)
+
+            # Confidence impact plot
+            conf_plot_path = get_output_path(f"{method_base_output}_{position}_confidence.png", model_dir=model_dir)
+            plot_confidence_impact(all_analyses_by_pos[position][method], method, position, conf_plot_path)
+            output_files.append(conf_plot_path)
 
     # Collect key findings
     for position in PROBE_POSITIONS:

@@ -44,17 +44,20 @@ from core.plotting import GRID_ALPHA
 # CONFIGURATION
 # =============================================================================
 
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 ADAPTER = None
-LOAD_IN_4BIT = False
+LOAD_IN_4BIT = True
 LOAD_IN_8BIT = False
 
 DATASET = "TriviaMC_difficulty_filtered"
-META_TASK = "confidence"  # or "other_confidence", "delegate"
+META_TASK = "delegate"  # or "other_confidence", "delegate"
 PROBE_POSITION = "final"
 
 # Which metric to use for D→M transfer, mcuncert, and metauncert
-MC_METRIC = "entropy"
+MC_METRIC = "logit_gap"
+
+# For delegate task: which confdir target to load ("p_answer" or "logit_margin")
+DELEGATE_CONFDIR_TARGET = "logit_margin"
 
 # =============================================================================
 # FUNCTIONS
@@ -98,9 +101,16 @@ def load_transfer_r2(base_name: str, meta_task: str, pos: str, metric: str, mode
     return result if result else None
 
 
-def load_confdir_r2(base_name: str, meta_task: str, pos: str, model_dir: str) -> dict:
+def load_confdir_r2(base_name: str, meta_task: str, pos: str, model_dir: str, delegate_target: str = None) -> dict:
     """Load confidence direction R² by layer for both methods."""
-    path = find_output_file(f"{base_name}_meta_{meta_task}_confdir_results_{pos}.json", model_dir=model_dir)
+    # Determine filename suffix based on meta task and target
+    if meta_task == "delegate":
+        target = delegate_target or "p_answer"
+        suffix = f"_{target}"
+    else:
+        suffix = ""
+
+    path = find_output_file(f"{base_name}_meta_{meta_task}_confdir{suffix}_results_{pos}.json", model_dir=model_dir)
     if not path.exists():
         return None
 
@@ -235,7 +245,7 @@ def main():
         print("  metauncert: NOT FOUND")
 
     # 4. confdir - both methods
-    confdir_r2 = load_confdir_r2(base_name, META_TASK, PROBE_POSITION, model_dir)
+    confdir_r2 = load_confdir_r2(base_name, META_TASK, PROBE_POSITION, model_dir, delegate_target=DELEGATE_CONFDIR_TARGET)
     if confdir_r2:
         for method, r2_dict in confdir_r2.items():
             name = f"confdir_{method}"

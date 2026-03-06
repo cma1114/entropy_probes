@@ -120,10 +120,14 @@ PROBE_ALPHA = 1000.0         # Must match across scripts
 PROBE_PCA_COMPONENTS = 100   # Must match across scripts
 TRAIN_SPLIT = 0.8            # Must match across scripts
 
+# --- Skip transfer training (use when you only want confdir/mcuncert with different settings) ---
+SKIP_TRANSFER_TRAINING = False  # Set True to skip main D→M transfer, only do confdir/mcuncert
+
 # --- Confidence directions (optional, merged from identify_confidence_correlate.py) ---
 FIND_CONFIDENCE_DIRECTIONS = True  # Train probes on stated confidence from meta activations
 MEAN_DIFF_QUANTILE = 0.25          # Must match across scripts
 COMPARE_UNCERTAINTY_METRIC = METRICS[0]  # Compare confidence vs uncertainty dirs (None to skip)
+DELEGATE_CONFDIR_TARGET = "logit_margin"  # "p_answer" or "logit_margin" (only for delegate task)
 
 # --- MC Uncertainty directions from meta activations ---
 # Train probes on meta-task activations to predict MC uncertainty (logit_gap, entropy)
@@ -1489,13 +1493,22 @@ def main():
     first_layer = list(meta_activations[first_pos].keys())[0]
     target_name = "P(Answer)" if META_TASK == "delegate" else "Stated confidence" if META_TASK == "confidence" else "Other confidence"
 
-    # Train probes and test transfer for each metric and position
-    print(f"Training probes and testing transfer...")
-
     # Results structure: {position: {metric: {layer: {...}}}}
     transfer_results_by_pos = {pos: {} for pos in positions_available}
+
+    # Initialize result containers
     direct_r2 = {}
     direct_r2_std = {}
+    mean_diff_transfer_by_pos = {pos: {} for pos in positions_available}
+    mean_diff_direct_r2 = {}
+    mean_diff_direct_r2_std = {}
+
+    # Train probes and test transfer for each metric and position
+    if SKIP_TRANSFER_TRAINING:
+        print("Skipping D→M transfer training (SKIP_TRANSFER_TRAINING=True)")
+        metrics_tested = [m for m in METRICS if m in dataset["metric_values"]]
+    else:
+        print(f"Training probes and testing transfer...")
     metrics_tested = [m for m in METRICS if m in dataset["metric_values"]]
 
     # Helper functions defined once
@@ -1527,7 +1540,7 @@ def main():
                 vals.append(float(r))
         return float(np.std(vals)) if len(vals) > 1 else 0.0
 
-    for metric in metrics_tested:
+    for metric in ([] if SKIP_TRANSFER_TRAINING else metrics_tested):
         direct_values = dataset["metric_values"][metric]
 
         # Split data
@@ -1776,7 +1789,7 @@ def main():
 
     conf_test = confidences[test_idx]
 
-    for metric in metrics_tested:
+    for metric in ([] if SKIP_TRANSFER_TRAINING else metrics_tested):
         # Locate and load directions file for this metric
         try:
             directions_path = _find_directions_npz(base_name, metric, model_dir)
@@ -1916,7 +1929,7 @@ def main():
     answer_transfer_results = {}
     answer_probes_path = find_output_file(f"{base_name}_mc_answer_probes.joblib", model_dir=model_dir)
 
-    if answer_probes_path.exists():
+    if answer_probes_path.exists() and not SKIP_TRANSFER_TRAINING:
         print(f"\nLoading answer probes from {answer_probes_path}...")
         answer_probe_data = joblib.load(answer_probes_path)
         answer_probes = answer_probe_data["probes"]
@@ -2043,8 +2056,8 @@ def main():
             answer_d2m=answer_d2m,
         )
 
-    # Plot position comparison (only if multiple positions)
-    if len(positions_available) > 1:
+    # Plot position comparison (only if multiple positions and not skipping)
+    if len(positions_available) > 1 and not SKIP_TRANSFER_TRAINING:
         plot_position_comparison(
             transfer_results_by_pos,
             mean_diff_transfer_by_pos,
@@ -2067,43 +2080,49 @@ def main():
     print(f"Saving per-position results...")
 
     for pos in positions_available:
-        if not transfer_results_by_pos[pos]:
+        has_transfer_results = bool(transfer_results_by_pos[pos])
+
+        # Skip transfer result saving if no results (but continue for confdir/mcuncert)
+        if not has_transfer_results and not FIND_CONFIDENCE_DIRECTIONS and not FIND_MC_UNCERTAINTY_DIRECTIONS:
             continue
 
         # Define per-position output paths
         results_json_path = get_output_path(f"{base_output}_transfer_results_{pos}.json", model_dir=model_dir)
         results_npz_path = get_output_path(f"{base_output}_transfer_results_{pos}.npz", model_dir=model_dir)
 
-        # Build position-specific JSON
-        results_json = {
-            "format_version": 2,
-            "config": get_config_dict(
-                model=model_name,
-                dataset=dataset['config']['dataset'],
-                meta_task=META_TASK,
-                position=pos,
-                num_questions=len(dataset['questions']),
-                num_layers=num_layers,
-                input_model_dir=model_dir,
-                input_dataset=base_name,
-                train_split=TRAIN_SPLIT,
-                n_train=len(train_idx),
-                n_test=len(test_idx),
-                seed=SEED,
-                probe_alpha=PROBE_ALPHA,
-                probe_pca_components=PROBE_PCA_COMPONENTS,
-                load_in_4bit=LOAD_IN_4BIT,
-                load_in_8bit=LOAD_IN_8BIT,
-            ),
-            "meta_target_stats": compute_behavioral_stats(
-                confidences, option_probs, META_TASK
-            ),
-            "logit_margin_stats": compute_logit_margin_stats(logit_margins),  # None for non-delegate tasks
-            "behavioral": behavioral,
-            "behavioral_logit_margin": behavioral_logit_margin,  # None for non-delegate tasks
-            "transfer": {},
-            "mean_diff_transfer": {},
-        }
+        # Build position-specific JSON (skip if no transfer results)
+        if not has_transfer_results:
+            results_json = {}  # Placeholder to avoid NameError
+        else:
+            results_json = {
+                "format_version": 2,
+                "config": get_config_dict(
+                    model=model_name,
+                    dataset=dataset['config']['dataset'],
+                    meta_task=META_TASK,
+                    position=pos,
+                    num_questions=len(dataset['questions']),
+                    num_layers=num_layers,
+                    input_model_dir=model_dir,
+                    input_dataset=base_name,
+                    train_split=TRAIN_SPLIT,
+                    n_train=len(train_idx),
+                    n_test=len(test_idx),
+                    seed=SEED,
+                    probe_alpha=PROBE_ALPHA,
+                    probe_pca_components=PROBE_PCA_COMPONENTS,
+                    load_in_4bit=LOAD_IN_4BIT,
+                    load_in_8bit=LOAD_IN_8BIT,
+                ),
+                "meta_target_stats": compute_behavioral_stats(
+                    confidences, option_probs, META_TASK
+                ),
+                "logit_margin_stats": compute_logit_margin_stats(logit_margins),  # None for non-delegate tasks
+                "behavioral": behavioral,
+                "behavioral_logit_margin": behavioral_logit_margin,  # None for non-delegate tasks
+                "transfer": {},
+                "mean_diff_transfer": {},
+            }
 
         # Add probe transfer results for this position
         for metric in metrics_tested:
@@ -2222,50 +2241,52 @@ def main():
                     item[metric] = float(dataset["metric_values"][metric][i])
             results_json["per_question"].append(item)
 
-        # Save JSON
-        with open(results_json_path, "w") as f:
-            json.dump(results_json, f, indent=2)
+        # Save JSON (skip if no transfer results)
+        if has_transfer_results:
+            with open(results_json_path, "w") as f:
+                json.dump(results_json, f, indent=2)
 
-        # Save NPZ
-        save_dict = {
-            "model": model_name,
-            "dataset": dataset['config']['dataset'],
-            "meta_task": META_TASK,
-            "position": pos,
-            "metrics": np.array(metrics_tested),
-            "num_questions": len(dataset['questions']),
-            "num_layers": num_layers,
-            "confidences": confidences,
-        }
+        # Save NPZ (skip if no transfer results)
+        if has_transfer_results:
+            save_dict = {
+                "model": model_name,
+                "dataset": dataset['config']['dataset'],
+                "meta_task": META_TASK,
+                "position": pos,
+                "metrics": np.array(metrics_tested),
+                "num_questions": len(dataset['questions']),
+                "num_layers": num_layers,
+                "confidences": confidences,
+            }
 
-        for metric in metrics_tested:
-            if metric not in transfer_results_by_pos[pos]:
-                continue
-            for layer in transfer_results_by_pos[pos][metric].keys():
-                save_dict[f"transfer_{metric}_layer{layer}_centered_r2"] = transfer_results_by_pos[pos][metric][layer]["centered"]["r2"]
-                save_dict[f"transfer_{metric}_layer{layer}_centered_r2_std"] = transfer_results_by_pos[pos][metric][layer]["centered"].get("r2_std", 0.0)
-                save_dict[f"transfer_{metric}_layer{layer}_centered_pred_conf_pearson"] = transfer_results_by_pos[pos][metric][layer]["centered"].get("pred_conf_pearson", np.nan)
-                save_dict[f"transfer_{metric}_layer{layer}_separate_r2"] = transfer_results_by_pos[pos][metric][layer]["separate"]["r2"]
-                save_dict[f"transfer_{metric}_layer{layer}_separate_r2_std"] = transfer_results_by_pos[pos][metric][layer]["separate"].get("r2_std", 0.0)
-                save_dict[f"transfer_{metric}_layer{layer}_separate_pred_conf_pearson"] = transfer_results_by_pos[pos][metric][layer]["separate"].get("pred_conf_pearson", np.nan)
-                # Add D→D from training if available
-                if metric in direct_r2 and layer in direct_r2[metric]:
-                    save_dict[f"d2d_{metric}_layer{layer}_r2"] = direct_r2[metric][layer]
-                if metric in direct_r2_std and layer in direct_r2_std[metric]:
-                    save_dict[f"d2d_{metric}_layer{layer}_r2_std"] = direct_r2_std[metric][layer]
+            for metric in metrics_tested:
+                if metric not in transfer_results_by_pos[pos]:
+                    continue
+                for layer in transfer_results_by_pos[pos][metric].keys():
+                    save_dict[f"transfer_{metric}_layer{layer}_centered_r2"] = transfer_results_by_pos[pos][metric][layer]["centered"]["r2"]
+                    save_dict[f"transfer_{metric}_layer{layer}_centered_r2_std"] = transfer_results_by_pos[pos][metric][layer]["centered"].get("r2_std", 0.0)
+                    save_dict[f"transfer_{metric}_layer{layer}_centered_pred_conf_pearson"] = transfer_results_by_pos[pos][metric][layer]["centered"].get("pred_conf_pearson", np.nan)
+                    save_dict[f"transfer_{metric}_layer{layer}_separate_r2"] = transfer_results_by_pos[pos][metric][layer]["separate"]["r2"]
+                    save_dict[f"transfer_{metric}_layer{layer}_separate_r2_std"] = transfer_results_by_pos[pos][metric][layer]["separate"].get("r2_std", 0.0)
+                    save_dict[f"transfer_{metric}_layer{layer}_separate_pred_conf_pearson"] = transfer_results_by_pos[pos][metric][layer]["separate"].get("pred_conf_pearson", np.nan)
+                    # Add D→D from training if available
+                    if metric in direct_r2 and layer in direct_r2[metric]:
+                        save_dict[f"d2d_{metric}_layer{layer}_r2"] = direct_r2[metric][layer]
+                    if metric in direct_r2_std and layer in direct_r2_std[metric]:
+                        save_dict[f"d2d_{metric}_layer{layer}_r2_std"] = direct_r2_std[metric][layer]
 
-            save_dict[f"behavioral_{metric}_pearson_r"] = behavioral[metric]["pearson_r"]
-            save_dict[f"behavioral_{metric}_spearman_r"] = behavioral[metric]["spearman_r"]
+                save_dict[f"behavioral_{metric}_pearson_r"] = behavioral[metric]["pearson_r"]
+                save_dict[f"behavioral_{metric}_spearman_r"] = behavioral[metric]["spearman_r"]
 
-            if "test_pearson_r" in behavioral[metric]:
-                save_dict[f"behavioral_{metric}_test_pearson_r"] = behavioral[metric]["test_pearson_r"]
-            if "test_spearman_r" in behavioral[metric]:
-                save_dict[f"behavioral_{metric}_test_spearman_r"] = behavioral[metric]["test_spearman_r"]
+                if "test_pearson_r" in behavioral[metric]:
+                    save_dict[f"behavioral_{metric}_test_pearson_r"] = behavioral[metric]["test_pearson_r"]
+                if "test_spearman_r" in behavioral[metric]:
+                    save_dict[f"behavioral_{metric}_test_spearman_r"] = behavioral[metric]["test_spearman_r"]
 
-        np.savez(results_npz_path, **save_dict)
+            np.savez(results_npz_path, **save_dict)
 
-        # Add to output files
-        output_files.extend([results_json_path, results_npz_path])
+            # Add to output files
+            output_files.extend([results_json_path, results_npz_path])
 
         # =================================================================
         # CONFIDENCE DIRECTIONS FOR THIS POSITION (optional)
@@ -2278,11 +2299,25 @@ def main():
             if not meta_activations_by_layer:
                 print(f"  Skipping confidence probes ({pos}) - no activations available")
             else:
+                # Determine confdir target: logit_margin or P(Answer)/stated confidence
+                if META_TASK == "delegate" and DELEGATE_CONFDIR_TARGET == "logit_margin":
+                    confdir_target = logit_margins
+                    confdir_target_name = "logit_margin"
+                    confdir_suffix = "_logit_margin"
+                elif META_TASK == "delegate":
+                    confdir_target = confidences
+                    confdir_target_name = "P(Answer)"
+                    confdir_suffix = "_p_answer"
+                else:
+                    confdir_target = confidences
+                    confdir_target_name = "stated_confidence"
+                    confdir_suffix = ""  # No suffix for non-delegate tasks
+
                 # Find confidence directions using both methods
-                print(f"  Training confidence probes ({pos})...")
+                print(f"  Training confidence probes ({pos}, target={confdir_target_name})...")
                 conf_results = find_confidence_directions_both_methods(
                     meta_activations_by_layer,
-                    confidences,
+                    confdir_target,
                     train_idx,
                     test_idx,
                     alpha=PROBE_ALPHA,
@@ -2319,7 +2354,7 @@ def main():
                             conf_unc_comparison = None
 
                 # Save meta-confidence directions
-                conf_dir_path = get_output_path(f"{base_output}_confdir_directions_{pos}.npz", model_dir=model_dir)
+                conf_dir_path = get_output_path(f"{base_output}_confdir{confdir_suffix}_directions_{pos}.npz", model_dir=model_dir)
                 dir_save = {
                     "_metadata_input_base": f"{model_dir}/{base_name}",
                     "_metadata_meta_task": META_TASK,
@@ -2331,7 +2366,7 @@ def main():
                 np.savez(conf_dir_path, **dir_save)
 
                 # Save meta-confidence probe objects
-                conf_probes_path = get_output_path(f"{base_output}_confdir_probes_{pos}.joblib", model_dir=model_dir)
+                conf_probes_path = get_output_path(f"{base_output}_confdir{confdir_suffix}_probes_{pos}.joblib", model_dir=model_dir)
                 probe_save = {
                     "metadata": {
                         "input_base": f"{model_dir}/{base_name}",
@@ -2347,12 +2382,13 @@ def main():
                 joblib.dump(probe_save, conf_probes_path)
 
                 # Save meta-confidence results JSON
-                conf_results_path = get_output_path(f"{base_output}_confdir_results_{pos}.json", model_dir=model_dir)
+                conf_results_path = get_output_path(f"{base_output}_confdir{confdir_suffix}_results_{pos}.json", model_dir=model_dir)
                 conf_json = {
                     "config": get_config_dict(
                         input_base=f"{model_dir}/{base_name}",
                         meta_task=META_TASK,
                         position=pos,
+                        confdir_target=confdir_target_name,
                         train_split=TRAIN_SPLIT,
                         probe_alpha=PROBE_ALPHA,
                         pca_components=PROBE_PCA_COMPONENTS,
@@ -2363,13 +2399,13 @@ def main():
                         load_in_8bit=LOAD_IN_8BIT,
                     ),
                     "stats": {
-                        "n_samples": len(confidences),
+                        "n_samples": len(confdir_target),
                         "n_train": len(train_idx),
                         "n_test": len(test_idx),
-                        "confidence_mean": float(confidences.mean()),
-                        "confidence_std": float(confidences.std()),
-                        "confidence_min": float(confidences.min()),
-                        "confidence_max": float(confidences.max()),
+                        "target_mean": float(confdir_target.mean()),
+                        "target_std": float(confdir_target.std()),
+                        "target_min": float(confdir_target.min()),
+                        "target_max": float(confdir_target.max()),
                     },
                     "results": {},
                     "comparison": {},
@@ -2404,7 +2440,7 @@ def main():
                     json.dump(conf_json, f, indent=2)
 
                 # Plot meta-confidence directions
-                conf_plot_path = get_output_path(f"{base_output}_confdir_results_{pos}.png", model_dir=model_dir)
+                conf_plot_path = get_output_path(f"{base_output}_confdir{confdir_suffix}_results_{pos}.png", model_dir=model_dir)
                 plot_confidence_directions(
                     conf_results=conf_results,
                     conf_unc_comparison=conf_unc_comparison,

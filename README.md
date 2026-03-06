@@ -145,16 +145,14 @@ Compares uncertainty, answer, and confidence directions via cosine similarity. R
 
 ### Stage 5: Causal ordering analysis
 
-Test whether MC uncertainty representations appear in meta-task activations *before* meta output uncertainty and confidence representations—as predicted if MC uncertainty causally drives meta-judgments.
+Test whether MC uncertainty representations appear in meta-task activations *before* meta output uncertainty and confidence representations—as predicted if MC uncertainty causally drives meta-judgments via those vectors.
 
 ```bash
 python analyze_causal_ordering.py
 ```
 
-**Rationale**: If the model's MC uncertainty causally influences its meta-judgment (e.g., confidence rating), then:
-1. MC uncertainty signal should appear in **earlier** layers (input processing)
-2. Meta output uncertainty (entropy over answer/delegate) should appear in **middle** layers (decision computation)
-3. Meta confidence (the output) should appear in **later** layers (output generation)
+**Rationale**: If the model's MC uncertainty causally influences its meta-judgment (e.g., confidence rating) via the identified meta output uncertainty and/or confidence vectors, then
+MC uncertainty signal should appear in **earlier** layers
 
 The script plots R² vs layer for four signals:
 - **D→M transfer**: MC direction applied to meta activations (tests if same direction transfers)

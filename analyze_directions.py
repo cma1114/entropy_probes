@@ -8,6 +8,7 @@ and generates visualizations.
 
 Direction types and their relationships:
 - mc_{metric}_{dataset}: Trained on MC questions to predict uncertainty metric
+- mc_answer_{dataset}: Trained on MC questions to predict answer choice (A/B/C/D)
 - introspection_{metric}_{dataset}: Also trained on MC questions (direct prompts) to
   predict the same uncertainty metric. The introspection experiment additionally tests
   whether these directions transfer to meta-cognition prompts.
@@ -16,6 +17,7 @@ Direction types and their relationships:
 
 Inputs:
     outputs/{base}_mc_{metric}_directions.npz               MC uncertainty directions
+    outputs/{base}_mc_answer_directions.npz                 MC answer (A/B/C/D) directions
     outputs/{base}_nexttoken_{metric}_directions.npz        Next-token uncertainty directions
     outputs/{base}_meta_{task}_confdir_directions.npz   Confidence directions
     outputs/{base}_meta_{task}_mcuncert_directions.npz  Meta→MC uncertainty directions (consolidated)
@@ -60,13 +62,13 @@ from core.plotting import save_figure, GRID_ALPHA
 # =============================================================================
 
 # --- Model & Data ---
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-ADAPTER = "Tristan-Day/ect_20251222_215412_v0uei7y1_2000"#None  # Optional: path to PEFT/LoRA adapter
+MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+ADAPTER = None  # "Tristan-Day/ect_20251222_215412_v0uei7y1_2000" #
 DATASET_FILTER = None#"TriviaMC_difficulty_filtered"  # Only load directions for this dataset (None = all)
 
 # --- Quantization ---
 # Must match the setting used when producing the direction files
-LOAD_IN_4BIT = False  # Set True for 70B+ models
+LOAD_IN_4BIT = True  # Set True for 70B+ models
 LOAD_IN_8BIT = False
 
 # --- Script-specific ---
@@ -95,6 +97,7 @@ DIRECTION_PREFIXES = [
     "introspection_entropy",
     "introspection_logit_gap",
     # MC task directions
+    "mc_answer",
     "mc_entropy",
     "mc_logit_gap",
     "mc_top_prob",
@@ -431,6 +434,24 @@ def find_direction_files(model_short: str, metric_filter: Optional[str] = None, 
             if key not in direction_files:
                 direction_files[key] = path
 
+    # MC answer directions (4-way A/B/C/D classification) from identify_mc_correlate.py:
+    # Pattern: {dataset}_mc_answer_directions.npz
+    # Contains: probe_layer_N, centroid_layer_N
+    mc_answer_pattern = "*_mc_answer_directions.npz"
+    mc_answer_matches = glob_outputs(mc_answer_pattern, model_dir=model_dir)
+    for path in mc_answer_matches:
+        dataset = extract_dataset_from_npz(path)
+        if dataset is None:
+            dataset = extract_dataset_from_filename(path.name, "_mc_answer_directions")
+
+        if dataset:
+            key = f"mc_answer_{dataset}"
+        else:
+            key = "mc_answer"
+
+        if key not in direction_files or path.stat().st_mtime > direction_files[key].stat().st_mtime:
+            direction_files[key] = path
+
     # Orthogonal directions from compute_orthogonal_directions.py:
     # {dataset}_orthogonal_directions.npz
     # Contains: self_confidence_unique_layer_N, other_confidence_unique_layer_N
@@ -468,20 +489,28 @@ def find_direction_files(model_short: str, metric_filter: Optional[str] = None, 
     # Meta confidence directions from test_meta_transfer.py:
     # {dataset}_meta_confidence_confdir_directions_{pos}.npz (d_self_confidence)
     # {dataset}_meta_other_confidence_confdir_directions_{pos}.npz (d_other_confidence)
-    # {dataset}_meta_delegate_confdir_directions_{pos}.npz (d_delegate)
-    for conf_type, label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence"), ("delegate", "d_delegate")]:
-        # Match new per-position format and legacy format
-        for pattern in [f"*_meta_{conf_type}_confdir_directions_*.npz", f"*_meta_{conf_type}_confdir_directions.npz"]:
+    # {dataset}_meta_delegate_confdir_{target}_directions_{pos}.npz (d_delegate_{target}) - target is logit_margin or p_answer
+    for conf_type, base_label in [("confidence", "d_self_confidence"), ("other_confidence", "d_other_confidence"), ("delegate", "d_delegate")]:
+        # Match new per-position format (with optional target suffix for delegate) and legacy format
+        for pattern in [f"*_meta_{conf_type}_confdir*_directions_*.npz", f"*_meta_{conf_type}_confdir_directions.npz"]:
             for path in glob_outputs(pattern, model_dir=model_dir):
                 dataset = extract_dataset_from_npz(path)
-                if dataset is None:
-                    # Try to extract from filename
-                    name = path.name
-                    # Match: {dataset}_meta_{conf_type}_confdir_directions_{pos}.npz or legacy without pos
-                    match = re.match(rf"(.+?)_meta_{conf_type}_confdir_directions(?:_\w+)?\.npz$", name)
-                    if match:
+                target_suffix = None
+
+                # Try to extract dataset and target suffix from filename
+                name = path.name
+                # Match: {dataset}_meta_{conf_type}_confdir{_target}_directions_{pos}.npz
+                match = re.match(rf"(.+?)_meta_{conf_type}_confdir(?:_(logit_margin|p_answer))?_directions(?:_\w+)?\.npz$", name)
+                if match:
+                    if dataset is None:
                         dataset = match.group(1)
                         dataset = strip_adapter_prefix(dataset)
+                    target_suffix = match.group(2)  # logit_margin, p_answer, or None
+
+                # Build label: include target suffix for delegate task
+                label = base_label
+                if conf_type == "delegate" and target_suffix:
+                    label = f"{base_label}_{target_suffix}"
 
                 if dataset:
                     key = f"{label}_{dataset}"

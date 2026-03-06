@@ -25,7 +25,10 @@
       "Bash(do echo \"=== $f ===\" grep -n \"get_model_dir_name\\\\|model_dir.*=\" \"$f\")",
       "Bash(python3 -m py_compile:*)",
       "Bash(gemini)",
-      "Bash(gemini:*)"
+      "Bash(gemini:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(python -m py_compile:*)"
     ]
   },
   "enableAllProjectMcpServers": false

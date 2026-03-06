@@ -49,10 +49,14 @@ def compute_metrics_single(
 
     # Logit-based metrics (linear - better for linear probes)
     if logits is None:
-        logits = np.log(probs + 1e-10)
+        # Use larger epsilon and clip to avoid extreme logit values
+        # This prevents inf values from very confident outputs
+        logits = np.log(np.clip(probs, 1e-8, 1.0))
     else:
         logits = np.asarray(logits)
 
+    # Clip logits to reasonable range to avoid inf in differences
+    logits = np.clip(logits, -100, 100)
     sorted_logits = np.sort(logits)[::-1]
 
     # Logit gap: z(top) - z(second)

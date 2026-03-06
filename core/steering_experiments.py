@@ -55,26 +55,75 @@ class SteeringExperimentConfig:
 def extract_cache_tensors(past_key_values) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """
     Extract raw tensors from past_key_values (tuple or DynamicCache).
-    Uses robust indexing (cache[i]) instead of attribute access.
     Returns (key_tensors, value_tensors) where each is a list of tensors.
+
+    Handles multiple transformers versions:
+    - transformers >= 4.46: .layers contains DynamicLayer objects with .keys/.values attrs
+    - transformers 4.36-4.45: .key_cache/.value_cache lists
+    - transformers < 4.36: tuple of (key, value) tuples (legacy format)
     """
     keys = []
     values = []
 
-    # Robustly determine number of layers
+    # Handle DynamicCache with .layers attribute (transformers >= 4.46)
+    if hasattr(past_key_values, "layers"):
+        layers = past_key_values.layers
+        if layers:
+            first_layer = layers[0]
+            # DynamicLayer objects have .keys and .values attributes
+            if hasattr(first_layer, "keys") and hasattr(first_layer, "values"):
+                for layer in layers:
+                    keys.append(layer.keys)
+                    values.append(layer.values)
+                return keys, values
+            # Fallback: layers might be tuples
+            try:
+                for k, v in layers:
+                    keys.append(k)
+                    values.append(v)
+                return keys, values
+            except (TypeError, ValueError):
+                pass
+
+    # Handle DynamicCache with .key_cache/.value_cache attributes (transformers 4.36-4.45)
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        key_cache = past_key_values.key_cache
+        value_cache = past_key_values.value_cache
+        if key_cache and value_cache:
+            return list(key_cache), list(value_cache)
+
+    # Try to_legacy_cache() for DynamicCache objects
+    if hasattr(past_key_values, "to_legacy_cache"):
+        try:
+            legacy = past_key_values.to_legacy_cache()
+            if legacy is not None and legacy:
+                for k, v in legacy:
+                    keys.append(k)
+                    values.append(v)
+                return keys, values
+        except Exception:
+            pass
+
+    # Handle legacy tuple format or subscriptable cache
     try:
         num_layers = len(past_key_values)
     except TypeError:
-        # Fallback for weird objects (e.g. some PEFT proxies)
-        if hasattr(past_key_values, "to_legacy_cache"):
-            return extract_cache_tensors(past_key_values.to_legacy_cache())
         raise ValueError(f"Cannot determine length of cache: {type(past_key_values)}")
 
     for i in range(num_layers):
-        # Indexing returns (key_state, value_state) for layer i
-        k, v = past_key_values[i]
-        keys.append(k)
-        values.append(v)
+        try:
+            layer = past_key_values[i]
+            if hasattr(layer, "keys") and hasattr(layer, "values"):
+                keys.append(layer.keys)
+                values.append(layer.values)
+            else:
+                k, v = layer
+                keys.append(k)
+                values.append(v)
+        except TypeError:
+            raise TypeError(f"Cache type {type(past_key_values)} layer {i} not extractable. "
+                          f"Layer type: {type(layer)}, "
+                          f"Attrs: {[a for a in dir(layer) if not a.startswith('_')]}")
 
     return keys, values
 
