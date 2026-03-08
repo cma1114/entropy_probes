@@ -321,6 +321,62 @@ class BatchAblationHook:
             self.handle = None
 
 
+class ActivationCaptureHook:
+    """Hook that captures activations (last token) from a layer.
+
+    Used for measuring how ablations affect intermediate representations.
+    Can optionally ablate a direction before capturing (to measure post-ablation state).
+    """
+
+    def __init__(self, ablate_direction: Optional[torch.Tensor] = None):
+        """
+        Args:
+            ablate_direction: Optional (hidden_dim,) direction to ablate before capturing.
+                              If None, captures raw activations without modification.
+        """
+        self.ablate_direction = ablate_direction
+        self.handle = None
+        self.captured = None  # Will hold (batch, hidden_dim) tensor after forward
+
+    def set_ablate_direction(self, direction: Optional[torch.Tensor]):
+        """Set or clear the ablation direction."""
+        self.ablate_direction = direction
+
+    def __call__(self, module, input, output):
+        hs = output[0] if isinstance(output, tuple) else output
+
+        # Extract last token activations
+        last_token = hs[:, -1, :].clone()  # (batch, hidden_dim)
+
+        # Optionally ablate before capturing
+        if self.ablate_direction is not None:
+            d = self.ablate_direction.to(device=last_token.device, dtype=last_token.dtype)
+            # For single direction applied to all examples
+            if d.dim() == 1:
+                dots = torch.einsum('bh,h->b', last_token, d)
+                proj = dots.unsqueeze(-1) * d.unsqueeze(0)
+            else:
+                # Per-example directions (batch, hidden)
+                dots = torch.einsum('bh,bh->b', last_token, d)
+                proj = dots.unsqueeze(-1) * d
+            last_token = last_token - proj
+
+        self.captured = last_token.detach().cpu()
+        return output  # Don't modify the output
+
+    def register(self, layer_module):
+        self.handle = layer_module.register_forward_hook(self)
+
+    def remove(self):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+
+    def clear(self):
+        """Clear captured activations."""
+        self.captured = None
+
+
 # =============================================================================
 # TOKENIZATION UTILITIES
 # =============================================================================

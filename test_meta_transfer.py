@@ -22,6 +22,9 @@ Outputs (per-position, where {pos} = "final", "options_newline", etc.):
     outputs/{model_dir}/results/{dataset}_meta_{task}_confdir_results_{pos}.json    Confidence results
     outputs/{model_dir}/working/{dataset}_meta_{task}_mcuncert_directions_{pos}.npz MC uncertainty dirs
     outputs/{model_dir}/results/{dataset}_meta_{task}_mcuncert_results_{pos}.json   MC uncertainty results
+    outputs/{model_dir}/working/{dataset}_meta_{task}_metamcq_directions_{pos}.npz  Meta-MCQ answer dirs
+    outputs/{model_dir}/results/{dataset}_meta_{task}_metamcq_results_{pos}.json    Meta-MCQ answer results
+    outputs/{model_dir}/results/{dataset}_meta_{task}_metamcq_results_{pos}.png     Meta-MCQ answer plot
     outputs/{model_dir}/results/{dataset}_meta_{task}_position_comparison.png       Position comparison (if multi-position)
 
     where {model_dir} = get_model_dir_name(MODEL, ADAPTER, LOAD_IN_4BIT, LOAD_IN_8BIT)
@@ -66,6 +69,7 @@ from core.answer_directions import (
     apply_answer_classifier_centered,
     apply_answer_classifier_separate,
     encode_answers,
+    find_answer_directions_from_meta,
 )
 from core.confidence_directions import (
     find_confidence_directions_both_methods,
@@ -135,6 +139,12 @@ DELEGATE_CONFDIR_TARGET = "logit_margin"  # "p_answer" or "logit_margin" (only f
 FIND_MC_UNCERTAINTY_DIRECTIONS = True
 MC_UNCERTAINTY_METRICS = ["logit_gap", "entropy"]  # Which MC metrics to predict from meta activations
 
+# --- Meta-MCQ Answer directions from meta activations ---
+# Train classifiers on meta-task activations to predict MC answer (A/B/C/D)
+# Tests whether answer representation is encoded in meta-task context
+# Compares M2M direction to D2D direction (from identify_mc_correlate.py) via cosine similarity
+FIND_META_MCQ_DIRECTIONS = True
+
 # --- Meta Output Entropy directions ---
 # Train probes on meta-task activations to predict meta output entropy
 # (entropy over Answer/Delegate for delegate task, or over S-Z for confidence task)
@@ -148,7 +158,7 @@ META_OUTPUT_UNCERTAINTY_METRICS = ["entropy", "logit_gap"]  # Which meta output 
 # question_newline: newline after "?"
 # options_newline: newline after last MC option (D: ...)
 # final: last token (current behavior)
-PROBE_POSITIONS = ["final"]  # ["question_mark", "question_newline", "options_newline", "final"]
+PROBE_POSITIONS = ["question_mark", "question_newline", "options_newline", "final"]
 
 # --- Output ---
 # Uses centralized path management from core.config_utils
@@ -1037,6 +1047,115 @@ def plot_mc_uncertainty_from_meta_consolidated(
         ax3.set_ylabel('Cosine Similarity')
         ax3.set_ylim(-1.1, 1.1)
         ax3.grid(True, alpha=GRID_ALPHA)
+
+    plt.tight_layout()
+    save_figure(fig, output_path)
+
+
+def plot_metamcq_results(
+    metamcq_results: dict,
+    num_layers: int,
+    output_path: Path,
+    meta_task: str,
+):
+    """
+    Plot meta-MCQ answer direction results (M2M training).
+
+    Creates a 1x3 grid:
+    - Column 1: M2M accuracy by layer (probe and centroid)
+    - Column 2: Probe vs centroid cosine similarity (within M2M)
+    - Column 3: Cosine similarity to D2D directions
+
+    Args:
+        metamcq_results: Dict with fits, comparison_within, comparison_to_mc
+        num_layers: Number of model layers
+        output_path: Where to save the figure
+        meta_task: Name of meta-task for title
+    """
+    layers = list(range(num_layers))
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle(f"Meta-MCQ Answer Directions from {meta_task} Activations (M2M)",
+                 fontsize=14, fontweight='bold', y=1.02)
+
+    # Panel 1: M2M Accuracy by layer
+    ax1 = axes[0]
+    ax1.set_title("M2M Answer Classification Accuracy", fontsize=10)
+
+    for method, color, ls in [("probe", "tab:blue", "-"), ("centroid", "tab:orange", "--")]:
+        fits = metamcq_results.get("fits", {}).get(method, {})
+        if not fits:
+            continue
+
+        train_acc = [fits.get(l, {}).get("train_accuracy", np.nan) for l in layers]
+        test_acc = [fits.get(l, {}).get("test_accuracy", np.nan) for l in layers]
+        ci_low = [fits.get(l, {}).get("test_accuracy_ci_low", np.nan) for l in layers]
+        ci_high = [fits.get(l, {}).get("test_accuracy_ci_high", np.nan) for l in layers]
+
+        best_layer = max(layers, key=lambda l: fits.get(l, {}).get("test_accuracy", 0))
+        best_acc = fits.get(best_layer, {}).get("test_accuracy", 0)
+
+        ax1.plot(layers, test_acc, ls, color=color, linewidth=2,
+                 label=f'{method} test (L{best_layer}: {best_acc:.3f})')
+        ax1.plot(layers, train_acc, ls, color=color, linewidth=1, alpha=0.4)
+
+        if not all(np.isnan(ci_low)):
+            ax1.fill_between(layers, ci_low, ci_high, color=color, alpha=CI_ALPHA)
+
+    ax1.axhline(y=0.25, color='gray', linestyle=':', alpha=0.7, label='Chance (0.25)')
+    ax1.set_xlabel('Layer Index')
+    ax1.set_ylabel('Accuracy')
+    ax1.set_ylim(0, 1)
+    ax1.legend(loc='upper left', fontsize=8)
+    ax1.grid(True, alpha=GRID_ALPHA)
+
+    # Panel 2: Probe vs centroid similarity (within M2M)
+    ax2 = axes[1]
+    ax2.set_title("Probe vs Centroid Similarity (within M2M)", fontsize=10)
+
+    comparison_within = metamcq_results.get("comparison_within", {})
+    if comparison_within:
+        cosine_sims = [comparison_within.get(l, {}).get("cosine_sim", np.nan) for l in layers]
+        ax2.plot(layers, cosine_sims, '-', color='tab:purple', linewidth=2)
+    else:
+        ax2.text(0.5, 0.5, "No comparison\ndata available",
+                 ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+
+    ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    ax2.set_xlabel('Layer Index')
+    ax2.set_ylabel('Cosine Similarity')
+    ax2.set_ylim(-1.1, 1.1)
+    ax2.grid(True, alpha=GRID_ALPHA)
+
+    # Panel 3: Comparison to D2D directions
+    ax3 = axes[2]
+    ax3.set_title("Similarity to D2D Answer Directions", fontsize=10)
+
+    comparison_to_mc = metamcq_results.get("comparison_to_mc", {})
+    if comparison_to_mc:
+        for method, color, ls in [("probe", "tab:blue", "-"), ("centroid", "tab:orange", "--")]:
+            method_comp = comparison_to_mc.get(method, {})
+            if method_comp:
+                sims = [method_comp.get(l, {}).get("cosine_sim", np.nan) for l in layers]
+                if not all(np.isnan(sims)):
+                    fits = metamcq_results.get("fits", {}).get(method, {})
+                    best_layer = max(layers, key=lambda l: fits.get(l, {}).get("test_accuracy", 0))
+                    best_cos = method_comp.get(best_layer, {}).get("cosine_sim", np.nan)
+                    ax3.plot(layers, sims, ls, color=color, linewidth=2,
+                             label=f'{method} (L{best_layer}: {best_cos:.3f})')
+
+        ax3.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+        ax3.axhline(y=0.6, color='green', linestyle='--', alpha=0.3)
+        ax3.axhline(y=-0.6, color='green', linestyle='--', alpha=0.3)
+        ax3.legend(loc='upper left', fontsize=8)
+    else:
+        ax3.text(0.5, 0.5, "D2D directions\nnot available",
+                 ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+
+    ax3.set_xlabel('Layer Index')
+    ax3.set_ylabel('Cosine Similarity')
+    ax3.set_ylim(-1.1, 1.1)
+    ax3.grid(True, alpha=GRID_ALPHA)
 
     plt.tight_layout()
     save_figure(fig, output_path)
@@ -2607,6 +2726,183 @@ def main():
 
                 # Add mcuncert files to output list
                 output_files.extend([mcuncert_dir_path, mcuncert_results_path, mcuncert_plot_path])
+
+        # =================================================================
+        # META-MCQ ANSWER DIRECTIONS FOR THIS POSITION (optional)
+        # =================================================================
+        if FIND_META_MCQ_DIRECTIONS:
+            # Use already-loaded activations for this position
+            meta_activations_by_layer = meta_activations.get(pos, {})
+
+            if not meta_activations_by_layer:
+                print(f"  Skipping meta-MCQ answer probes ({pos}) - no activations available")
+            else:
+                print(f"  Training meta-MCQ answer classifiers ({pos})...")
+
+                # Get model's predicted answers (same labels as D2D)
+                model_answers_raw = [q["predicted_answer"] for q in dataset["questions"]]
+                model_answers, answer_mapping = encode_answers(model_answers_raw)
+
+                # Load D2D directions for comparison
+                mc_directions = None
+                mc_dir_path = find_output_file(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
+                if mc_dir_path and mc_dir_path.exists():
+                    mc_data = np.load(mc_dir_path)
+                    mc_directions = {"probe": {}, "centroid": {}}
+                    for layer in range(num_layers):
+                        for method in ["probe", "centroid"]:
+                            key = f"{method}_layer_{layer}"
+                            if key in mc_data:
+                                mc_directions[method][layer] = mc_data[key]
+                    if not mc_directions["probe"] and not mc_directions["centroid"]:
+                        mc_directions = None
+                        print(f"    Warning: No D2D directions found in {mc_dir_path.name}")
+                else:
+                    print(f"    Warning: D2D answer directions not found, skipping comparison")
+
+                # Train meta-MCQ classifiers
+                metamcq_results = find_answer_directions_from_meta(
+                    meta_activations_by_layer,
+                    model_answers,
+                    train_idx,
+                    test_idx,
+                    mc_directions=mc_directions,
+                    n_components=256,  # Match D2D settings
+                    random_state=SEED,
+                    n_bootstrap=N_BOOTSTRAP,
+                )
+
+                # Prepare output structures
+                all_metamcq_directions = {
+                    "_metadata_input_base": f"{model_dir}/{base_name}",
+                    "_metadata_meta_task": META_TASK,
+                    "_metadata_position": pos,
+                    "_metadata_n_classes": 4,
+                }
+                for method in ["probe", "centroid"]:
+                    for layer, direction in metamcq_results["directions"][method].items():
+                        all_metamcq_directions[f"{method}_layer_{layer}"] = direction
+
+                all_metamcq_probes = {
+                    "metadata": {
+                        "input_base": f"{model_dir}/{base_name}",
+                        "meta_task": META_TASK,
+                        "position": pos,
+                        "n_classes": 4,
+                        "train_split": TRAIN_SPLIT,
+                        "pca_components": 256,
+                        "seed": SEED,
+                    },
+                    "probes": metamcq_results["probes"],
+                }
+
+                all_metamcq_json = {
+                    "config": get_config_dict(
+                        input_base=f"{model_dir}/{base_name}",
+                        meta_task=META_TASK,
+                        position=pos,
+                        n_classes=4,
+                        train_split=TRAIN_SPLIT,
+                        pca_components=256,
+                        n_bootstrap=N_BOOTSTRAP,
+                        seed=SEED,
+                        load_in_4bit=LOAD_IN_4BIT,
+                        load_in_8bit=LOAD_IN_8BIT,
+                    ),
+                    "stats": {
+                        "n_samples": len(train_idx) + len(test_idx),
+                        "n_train": len(train_idx),
+                        "n_test": len(test_idx),
+                        "answer_distribution": {
+                            chr(65 + i): int((model_answers == i).sum())
+                            for i in range(4)
+                        },
+                    },
+                    "results": {},
+                    "comparison_within": {},
+                    "comparison_to_mc": {},
+                }
+
+                # Add per-layer results
+                for method in ["probe", "centroid"]:
+                    all_metamcq_json["results"][method] = {}
+                    for layer in range(num_layers):
+                        if layer in metamcq_results["fits"][method]:
+                            layer_info = {}
+                            for k, v in metamcq_results["fits"][method][layer].items():
+                                if isinstance(v, np.floating):
+                                    layer_info[k] = float(v)
+                                elif isinstance(v, np.integer):
+                                    layer_info[k] = int(v)
+                                else:
+                                    layer_info[k] = v
+                            all_metamcq_json["results"][method][layer] = layer_info
+
+                # Add within-method comparison (probe vs centroid)
+                for layer in range(num_layers):
+                    if layer in metamcq_results["comparison_within"]:
+                        all_metamcq_json["comparison_within"][layer] = {
+                            "cosine_sim": float(metamcq_results["comparison_within"][layer]["cosine_sim"])
+                        }
+
+                # Add comparison to D2D directions
+                if mc_directions is not None:
+                    for method in ["probe", "centroid"]:
+                        all_metamcq_json["comparison_to_mc"][method] = {}
+                        for layer in range(num_layers):
+                            if layer in metamcq_results["comparison_to_mc"].get(method, {}):
+                                all_metamcq_json["comparison_to_mc"][method][layer] = {
+                                    "cosine_sim": float(metamcq_results["comparison_to_mc"][method][layer]["cosine_sim"])
+                                }
+
+                # Compute summary
+                best_layer = None
+                best_accuracy = 0.0
+                for layer in range(num_layers):
+                    if layer in metamcq_results["fits"]["probe"]:
+                        acc = metamcq_results["fits"]["probe"][layer].get("test_accuracy", 0)
+                        if acc > best_accuracy:
+                            best_accuracy = acc
+                            best_layer = layer
+
+                best_cosine_sim = None
+                if mc_directions is not None and best_layer is not None:
+                    if best_layer in metamcq_results["comparison_to_mc"].get("probe", {}):
+                        best_cosine_sim = metamcq_results["comparison_to_mc"]["probe"][best_layer]["cosine_sim"]
+
+                all_metamcq_json["summary"] = {
+                    "best_layer": best_layer,
+                    "best_test_accuracy": float(best_accuracy) if best_accuracy else None,
+                    "best_cosine_sim_to_mc": float(best_cosine_sim) if best_cosine_sim else None,
+                    "chance_accuracy": 0.25,
+                }
+
+                # Save files
+                metamcq_dir_path = get_output_path(f"{base_output}_metamcq_directions_{pos}.npz", model_dir=model_dir)
+                np.savez(metamcq_dir_path, **all_metamcq_directions)
+
+                metamcq_probes_path = get_output_path(f"{base_output}_metamcq_probes_{pos}.joblib", model_dir=model_dir)
+                joblib.dump(all_metamcq_probes, metamcq_probes_path)
+
+                metamcq_results_path = get_output_path(f"{base_output}_metamcq_results_{pos}.json", model_dir=model_dir)
+                with open(metamcq_results_path, "w") as f:
+                    json.dump(all_metamcq_json, f, indent=2)
+
+                print(f"    Best layer: {best_layer}, M2M accuracy: {best_accuracy:.3f} (chance=0.25)")
+                if best_cosine_sim is not None:
+                    print(f"    Cosine sim to D2D: {best_cosine_sim:.3f}")
+
+                # Generate plot
+                metamcq_plot_path = get_output_path(f"{base_output}_metamcq_results_{pos}.png", model_dir=model_dir)
+                plot_metamcq_results(
+                    metamcq_results,
+                    num_layers,
+                    metamcq_plot_path,
+                    META_TASK,
+                )
+
+                # Add to output list
+                output_files.extend([metamcq_dir_path, metamcq_results_path, metamcq_plot_path])
 
         # =================================================================
         # META OUTPUT UNCERTAINTY DIRECTIONS FOR THIS POSITION (optional)

@@ -215,6 +215,67 @@ def apply_answer_classifier_separate(
     }
 
 
+def compute_classifier_confidence(
+    X: np.ndarray,
+    scaler: StandardScaler,
+    pca: PCA,
+    clf: LogisticRegression,
+    use_separate_scaling: bool = False
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute classifier confidence metrics for each sample.
+
+    Classifier confidence measures how peaked the 4-way softmax is:
+    - High confidence: One class dominates (e.g., 90% A, 10% others)
+    - Low confidence: Equal distribution (25% each)
+
+    This tests Hypothesis 2 (Answer Predominance): Does the model's confidence
+    come from how clear the ABCD distribution is?
+
+    Args:
+        X: (n_samples, hidden_dim) activation matrix
+        scaler: Fitted StandardScaler from training
+        pca: Fitted PCA from training
+        clf: Fitted LogisticRegression classifier
+        use_separate_scaling: If True, use X's own statistics for scaling
+
+    Returns:
+        Tuple of:
+        - probs: (n_samples, n_classes) class probabilities
+        - max_probs: (n_samples,) maximum probability per sample (confidence)
+        - entropies: (n_samples,) entropy of probability distribution (uncertainty)
+    """
+    X = _as_float32(X)
+
+    if use_separate_scaling:
+        # Use X's own statistics (domain adaptation)
+        meta_scaler = StandardScaler()
+        meta_scaler.fit(X)
+        meta_scaler.scale_ = _safe_scale(meta_scaler.scale_)
+        X_scaled = meta_scaler.transform(X)
+    else:
+        # Center using X's mean, scale using training's variance
+        X_mean = np.mean(X, axis=0, dtype=np.float32)
+        X_centered = X - X_mean
+        X_scaled = X_centered / _safe_scale(scaler.scale_)
+
+    # Apply PCA and get probabilities
+    X_pca = pca.transform(X_scaled)
+    probs = clf.predict_proba(X_pca)
+
+    # Compute confidence metrics
+    max_probs = probs.max(axis=1)
+
+    # Entropy: -sum(p * log(p)), normalized by log(n_classes)
+    # Clip to avoid log(0)
+    probs_clipped = np.clip(probs, 1e-10, 1.0)
+    entropies = -np.sum(probs * np.log(probs_clipped), axis=1)
+    n_classes = probs.shape[1]
+    entropies_normalized = entropies / np.log(n_classes)  # Normalize to [0, 1]
+
+    return probs, max_probs, entropies_normalized
+
+
 def find_answer_directions(
     activations_by_layer: Dict[int, np.ndarray],
     model_answers: np.ndarray,
@@ -517,5 +578,143 @@ def find_answer_directions_both_methods(
         # Cosine similarity between methods
         cos_sim = float(np.dot(probe_dir, centroid_dir))
         results["comparison"][layer] = {"cosine_sim": cos_sim}
+
+    return results
+
+
+def find_answer_directions_from_meta(
+    meta_activations_by_layer: Dict[int, np.ndarray],
+    model_answers: np.ndarray,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    mc_directions: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
+    n_components: int = 256,
+    random_state: int = 42,
+    n_bootstrap: int = 0,
+) -> Dict:
+    """
+    Find MC answer directions from META-TASK activations.
+
+    This trains classifiers on meta-task activations to predict the model's MC answer.
+    Tests whether answer information is encoded in the meta-task representation.
+
+    Args:
+        meta_activations_by_layer: {layer_idx: (n_samples, hidden_dim)} from meta-task
+        model_answers: (n_samples,) integer labels for model's predicted answers (0-3)
+        train_idx: Indices for training
+        test_idx: Indices for testing
+        mc_directions: Optional D2D directions {"probe": {layer: dir}, "centroid": {layer: dir}}
+                       for cosine similarity comparison
+        n_components: PCA components for classifier
+        random_state: Random seed
+        n_bootstrap: Number of bootstrap iterations for confidence intervals
+
+    Returns:
+        {
+            "directions": {"probe": {layer: dir}, "centroid": {layer: dir}},
+            "probes": {layer: {"scaler", "pca", "clf"}},
+            "fits": {"probe": {layer: metrics}, "centroid": {layer: metrics}},
+            "comparison_within": {layer: {"cosine_sim": float}},  # probe vs centroid
+            "comparison_to_mc": {"probe": {layer: {"cosine_sim": float}}, "centroid": {...}}
+        }
+    """
+    layers = sorted(meta_activations_by_layer.keys())
+    y = np.asarray(model_answers)
+
+    results = {
+        "directions": {"probe": {}, "centroid": {}},
+        "probes": {},
+        "fits": {"probe": {}, "centroid": {}},
+        "comparison_within": {},
+        "comparison_to_mc": {"probe": {}, "centroid": {}},
+    }
+
+    for layer in tqdm(layers, desc="Training meta-MCQ answer classifiers"):
+        X = meta_activations_by_layer[layer]
+
+        # Split
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+
+        # Method 1: Classifier-based direction (probe)
+        scaler, pca, clf = train_mc_answer_classifier(
+            X_train, y_train,
+            n_components=n_components,
+            random_state=random_state
+        )
+
+        # Evaluate classifier
+        X_train_scaled = scaler.transform(_as_float32(X_train))
+        X_test_scaled = scaler.transform(_as_float32(X_test))
+        X_train_pca = pca.transform(X_train_scaled)
+        X_test_pca = pca.transform(X_test_scaled)
+
+        y_pred_train = clf.predict(X_train_pca)
+        y_pred_test = clf.predict(X_test_pca)
+        train_accuracy = accuracy_score(y_train, y_pred_train)
+        test_accuracy = accuracy_score(y_test, y_pred_test)
+
+        probe_dir = extract_answer_direction(scaler, pca, clf)
+
+        probe_fit = {
+            "train_accuracy": float(train_accuracy),
+            "test_accuracy": float(test_accuracy),
+            "pca_variance_explained": float(pca.explained_variance_ratio_.sum()),
+        }
+
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(random_state + 10_000 + layer)
+            m, s = _bootstrap_accuracy_stats_from_preds(y_test, y_pred_test, n_bootstrap, rng)
+            probe_fit["test_accuracy_mean"] = m
+            probe_fit["test_accuracy_std"] = s
+            probe_fit["n_bootstrap"] = int(n_bootstrap)
+
+        results["directions"]["probe"][layer] = probe_dir
+        results["probes"][layer] = {"scaler": scaler, "pca": pca, "clf": clf}
+        results["fits"]["probe"][layer] = probe_fit
+
+        # Method 2: Centroid-based direction
+        centroid_dir = class_centroid_direction(X_train, y_train)
+        results["directions"]["centroid"][layer] = centroid_dir
+
+        # Evaluate centroid direction
+        train_proj = X_train @ centroid_dir
+        test_proj = X_test @ centroid_dir
+
+        simple_clf = LR(max_iter=1000, random_state=random_state)
+        simple_clf.fit(train_proj.reshape(-1, 1), y_train)
+        y_centroid_pred_train = simple_clf.predict(train_proj.reshape(-1, 1))
+        y_centroid_pred_test = simple_clf.predict(test_proj.reshape(-1, 1))
+        centroid_train_acc = accuracy_score(y_train, y_centroid_pred_train)
+        centroid_test_acc = accuracy_score(y_test, y_centroid_pred_test)
+
+        centroid_fit = {
+            "train_accuracy": float(centroid_train_acc),
+            "test_accuracy": float(centroid_test_acc),
+        }
+
+        if n_bootstrap > 0:
+            rng = np.random.default_rng(random_state + 20_000 + layer)
+            m, s = _bootstrap_accuracy_stats_from_preds(y_test, y_centroid_pred_test, n_bootstrap, rng)
+            centroid_fit["test_accuracy_mean"] = m
+            centroid_fit["test_accuracy_std"] = s
+            centroid_fit["n_bootstrap"] = int(n_bootstrap)
+
+        results["fits"]["centroid"][layer] = centroid_fit
+
+        # Cosine similarity within methods (probe vs centroid)
+        cos_sim_within = float(np.dot(probe_dir, centroid_dir))
+        results["comparison_within"][layer] = {"cosine_sim": cos_sim_within}
+
+        # Cosine similarity to MC directions (D2D)
+        if mc_directions is not None:
+            for method in ["probe", "centroid"]:
+                if method in mc_directions and layer in mc_directions[method]:
+                    mc_dir = mc_directions[method][layer]
+                    meta_dir = results["directions"][method][layer]
+                    cos_sim = float(np.dot(meta_dir, mc_dir))
+                    results["comparison_to_mc"][method][layer] = {"cosine_sim": cos_sim}
 
     return results

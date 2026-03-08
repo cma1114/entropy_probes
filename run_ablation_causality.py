@@ -67,6 +67,7 @@ from core.steering import generate_orthogonal_directions
 from core.steering_experiments import (
     SteeringExperimentConfig,
     BatchAblationHook,
+    ActivationCaptureHook,
     pretokenize_prompts,
     build_padded_gpu_batches,
     get_kv_cache,
@@ -105,7 +106,22 @@ PROBE_POSITION = "final"  # Position from test_meta_transfer.py outputs
 # - "answer": Ablate MC answer directions (from identify_mc_correlate.py with FIND_ANSWER_DIRECTIONS=True)
 # - "confidence": Ablate confidence directions (from test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
 # - "metamcuncert": Ablate MC uncertainty directions found from meta activations (test_meta_transfer.py)
-DIRECTION_TYPE = "uncertainty"
+# - "metamcq": Ablate MC answer directions found from meta activations (test_meta_transfer.py)
+DIRECTION_TYPE = "answer"
+
+# For DIRECTION_TYPE="confidence": which target was the confdir trained on?
+# Must match DELEGATE_CONFDIR_TARGET in test_meta_transfer.py
+# - "logit_margin": confdir trained on logit(Answer) - logit(Delegate)
+# - "p_answer": confdir trained on P(Answer)
+# - None: no suffix (for non-delegate tasks like "confidence" or "other_confidence")
+CONFDIR_TARGET = "logit_margin"  # "logit_margin", "p_answer", or None
+
+# --- Mediation Test (Test C) ---
+# When True and DIRECTION_TYPE="answer": also measures how ablating MC_Answer
+# affects projections onto d_delegate (confdir) direction. Tests the causal link:
+# MC_Answer direction → d_delegate_logit_margin direction
+# Requires confdir directions to exist (run test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True)
+MEASURE_MEDIATION = True
 
 # Descriptions for each direction type (used in summary output)
 DIRECTION_DESCRIPTIONS = {
@@ -125,6 +141,10 @@ DIRECTION_DESCRIPTIONS = {
         "trained_on": "MC uncertainty predicted from meta-task activations",
         "interpretation": "Tests if meta-task uses uncertainty direction found in its own activations",
     },
+    "metamcq": {
+        "trained_on": "MC answer (A/B/C/D) predicted from meta-task activations",
+        "interpretation": "Tests if meta-task contains answer representation in its own context",
+    },
 }
 
 # Confidence signal used as the meta-task output target.
@@ -141,7 +161,7 @@ LOAD_IN_8BIT = False
 
 # --- Experiment ---
 SEED = 42                    # Must match across scripts
-BATCH_SIZE = 16
+BATCH_SIZE = 4
 NUM_QUESTIONS = 100          # How many questions (ignored if USE_TRANSFER_SPLIT=True)
 NUM_CONTROLS = 25            # Random orthogonal directions per layer for null distribution
 
@@ -158,7 +178,7 @@ TRAIN_SPLIT = 0.8            # Must match across scripts
 # Expanded batch target for batched ablation.
 # When ablating k directions (1 primary + NUM_CONTROLS), we expand each base batch by k.
 # Higher values = better GPU utilization but more memory.
-EXPANDED_BATCH_TARGET = 128
+EXPANDED_BATCH_TARGET = 96
 
 # Optional: specify layers to test (None = all layers from directions file)
 LAYERS = None  # e.g., [20, 25, 30] for quick testing
@@ -181,6 +201,11 @@ BOOTSTRAP_CI_ALPHA = 0.05  # 95% CI
 # Layer selection from transfer results (for non-final positions)
 TRANSFER_R2_THRESHOLD = 0.3  # Layers with R² >= this are tested for non-final positions
 TRANSFER_RESULTS_PATH = None  # Auto-detect from MODEL/DATASET if None
+
+# Layer selection for answer directions (based on D2D accuracy)
+# When DIRECTION_TYPE="answer", only test layers where answer classifier works
+ANSWER_LAYER_SELECTION = True  # Auto-select layers from answer transfer results
+ANSWER_D2D_THRESHOLD = 0.8  # D2D accuracy threshold (0.25 = chance for 4-way)
 
 # Control count for non-final positions (final uses NUM_CONTROLS)
 NUM_CONTROLS_NONFINAL = 10
@@ -268,6 +293,47 @@ def get_layers_from_transfer(
     return sorted(selected)
 
 
+def load_answer_transfer_results(base_name: str, meta_task: str, model_dir: str) -> Optional[Dict]:
+    """
+    Load answer transfer results JSON to get per-layer D2D accuracy.
+
+    Returns None if file not found.
+    """
+    path = find_output_file(f"{base_name}_meta_{meta_task}_answer_transfer_results_final.json", model_dir=model_dir)
+
+    if path is None or not path.exists():
+        return None
+
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def get_layers_from_answer_transfer(
+    answer_transfer_data: Dict,
+    d2d_threshold: float = 0.5,
+) -> List[int]:
+    """
+    Get layers where answer classifier works (D2D accuracy >= threshold).
+
+    Args:
+        answer_transfer_data: Loaded answer transfer results JSON
+        d2d_threshold: Minimum D2D accuracy to include layer (0.25 = chance for 4-way)
+
+    Returns:
+        Sorted list of layer indices meeting threshold
+    """
+    if "by_layer" not in answer_transfer_data:
+        return []
+
+    selected = []
+    for layer_str, layer_data in answer_transfer_data["by_layer"].items():
+        d2d = layer_data.get("d2d_accuracy", 0)
+        if d2d >= d2d_threshold:
+            selected.append(int(layer_str))
+
+    return sorted(selected)
+
+
 # =============================================================================
 # DIRECTION LOADING
 # =============================================================================
@@ -277,7 +343,8 @@ def load_directions(
     direction_type: str = "uncertainty",
     metric: str = "entropy",
     meta_task: str = "delegate",
-    model_dir: str = None
+    model_dir: str = None,
+    confdir_target: str = None,
 ) -> Dict[str, Dict[int, np.ndarray]]:
     """
     Load direction vectors based on direction type.
@@ -288,6 +355,8 @@ def load_directions(
         metric: Uncertainty metric (only used for direction_type="uncertainty")
         meta_task: Meta task (only used for direction_type="confidence" or "metamcuncert")
         model_dir: Model directory name
+        confdir_target: For direction_type="confidence" with meta_task="delegate":
+                        "logit_margin" or "p_answer" (adds suffix to filename)
 
     Returns:
         Dict mapping method name -> {layer: direction_vector}
@@ -300,10 +369,15 @@ def load_directions(
     elif direction_type == "answer":
         path = find_output_file(f"{base_name}_mc_answer_directions.npz", model_dir=model_dir)
     elif direction_type == "confidence":
-        path = find_output_file(f"{base_name}_meta_{meta_task}_confdir_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
+        # For delegate task, confdir files have a target suffix (_logit_margin or _p_answer)
+        confdir_suffix = f"_{confdir_target}" if confdir_target else ""
+        path = find_output_file(f"{base_name}_meta_{meta_task}_confdir{confdir_suffix}_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     elif direction_type == "metamcuncert":
         # Consolidated file with keys like probe_{metric}_layer_0
         path = find_output_file(f"{base_name}_meta_{meta_task}_mcuncert_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
+    elif direction_type == "metamcq":
+        # MC answer directions from meta activations (keys like probe_layer_0, centroid_layer_0)
+        path = find_output_file(f"{base_name}_meta_{meta_task}_metamcq_directions_{PROBE_POSITION}.npz", model_dir=model_dir)
     else:
         raise ValueError(f"Unknown direction type: {direction_type}")
 
@@ -437,6 +511,32 @@ def load_directions(
 
             # Only include if metric matches
             if key_metric != metric:
+                continue
+
+            direction = data[key].astype(np.float32)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+
+            if method_name not in methods:
+                methods[method_name] = {}
+            methods[method_name][layer] = direction
+
+    elif direction_type == "metamcq":
+        # MC answer directions from meta activations
+        # Keys are like "probe_layer_0", "centroid_layer_5"
+        for key in data.files:
+            if key.startswith("_"):
+                continue  # Skip metadata keys
+
+            parts = key.rsplit("_layer_", 1)
+            if len(parts) != 2:
+                continue
+
+            method_name, layer_str = parts
+            try:
+                layer = int(layer_str)
+            except ValueError:
                 continue
 
             direction = data[key].astype(np.float32)
@@ -1713,6 +1813,148 @@ def plot_method_comparison(analyses: Dict[str, Dict], output_path: Path):
 
 
 # =============================================================================
+# MEDIATION TEST (Test C: MC_Answer → d_delegate)
+# =============================================================================
+
+def run_mediation_test(
+    model,
+    tokenizer,
+    questions: List[Dict],
+    mc_answer_directions: Dict[int, np.ndarray],
+    confdir_directions: Dict[int, np.ndarray],
+    meta_task: str,
+    use_chat_template: bool,
+    layers: List[int],
+    original_indices: np.ndarray,
+) -> Dict:
+    """
+    Test whether ablating MC_Answer direction affects projections onto d_delegate.
+
+    For each layer:
+    1. Run baseline (no ablation), capture activations, project onto confdir
+    2. Run with MC_Answer ablated, capture activations, project onto confdir
+    3. Compute delta = ablated_projection - baseline_projection
+
+    If MC_Answer causally affects d_delegate, we expect ablation to change projections.
+
+    Returns:
+        {
+            "layers": [...],
+            "per_layer": {
+                layer: {
+                    "baseline_projections": [...],  # Per-question
+                    "ablated_projections": [...],
+                    "delta_mean": float,
+                    "delta_std": float,
+                    "pearson_r": float,  # Correlation between baseline and ablated
+                }
+            }
+        }
+    """
+    from scipy.stats import pearsonr
+
+    # Get layer modules
+    if hasattr(model, 'get_base_model'):
+        base_model = model.get_base_model()
+        layer_modules = base_model.model.layers
+    else:
+        layer_modules = model.model.layers
+
+    device = next(model.parameters()).device
+
+    # Format prompts
+    if meta_task == "delegate":
+        format_fn = format_answer_or_delegate_prompt
+    elif meta_task == "confidence":
+        format_fn = format_stated_confidence_prompt
+    else:
+        format_fn = format_other_confidence_prompt
+
+    results = {"layers": layers, "per_layer": {}}
+
+    # Get model dtype for direction conversion (quantized models use float16)
+    model_dtype = next(model.parameters()).dtype
+
+    for layer in tqdm(layers, desc="Mediation test layers"):
+        if layer not in mc_answer_directions or layer not in confdir_directions:
+            continue
+
+        # Convert directions to model dtype to avoid dtype mismatch in dot products
+        mc_dir = torch.from_numpy(mc_answer_directions[layer]).to(device=device, dtype=model_dtype)
+        confdir_cpu = torch.from_numpy(confdir_directions[layer]).to(dtype=model_dtype)  # CPU, model dtype
+
+        baseline_projs = []
+        ablated_projs = []
+
+        # Create capture hook (we'll use its built-in ablation for the ablated case)
+        capture_hook = ActivationCaptureHook(ablate_direction=None)
+
+        for q_idx, q in enumerate(questions):
+            orig_idx = int(original_indices[q_idx])  # Convert numpy int to Python int
+
+            # Format prompt (all format functions return tuples; extract just the prompt string)
+            if meta_task == "delegate":
+                result = format_fn(q, tokenizer, trial_index=orig_idx, use_chat_template=use_chat_template)
+            else:
+                result = format_fn(q, tokenizer, use_chat_template=use_chat_template)
+            prompt = result[0]  # First element is always the prompt string
+
+            inputs = tokenizer(prompt, return_tensors="pt", padding=False).to(device)
+
+            # --- Baseline: capture without ablation ---
+            capture_hook.set_ablate_direction(None)
+            capture_hook.register(layer_modules[layer])
+            with torch.no_grad():
+                _ = model(**inputs)
+            capture_hook.remove()
+
+            if capture_hook.captured is None:
+                raise RuntimeError(f"No activations captured at layer {layer}")
+            baseline_act = capture_hook.captured.squeeze(0)  # (1, hidden_dim) -> (hidden_dim) on CPU
+            baseline_proj = float(torch.dot(baseline_act, confdir_cpu).item())
+            baseline_projs.append(baseline_proj)
+            capture_hook.clear()
+
+            # --- Ablated: capture after MC_Answer ablation ---
+            # Use capture hook's built-in ablation (ablates THEN captures in single hook)
+            # This avoids the hook ordering bug where separate hooks see original output
+            capture_hook.set_ablate_direction(mc_dir)
+            capture_hook.register(layer_modules[layer])
+
+            with torch.no_grad():
+                _ = model(**inputs)
+
+            capture_hook.remove()
+
+            if capture_hook.captured is None:
+                raise RuntimeError(f"No activations captured at layer {layer} (ablated pass)")
+            ablated_act = capture_hook.captured.squeeze(0)  # (1, hidden_dim) -> (hidden_dim) on CPU
+            ablated_proj = float(torch.dot(ablated_act, confdir_cpu).item())
+            ablated_projs.append(ablated_proj)
+            capture_hook.clear()
+
+        # Compute statistics
+        baseline_arr = np.array(baseline_projs)
+        ablated_arr = np.array(ablated_projs)
+        deltas = ablated_arr - baseline_arr
+
+        corr, p_val = pearsonr(baseline_arr, ablated_arr)
+
+        results["per_layer"][layer] = {
+            "baseline_projections": baseline_projs,
+            "ablated_projections": ablated_projs,
+            "delta_mean": float(deltas.mean()),
+            "delta_std": float(deltas.std()),
+            "baseline_mean": float(baseline_arr.mean()),
+            "ablated_mean": float(ablated_arr.mean()),
+            "pearson_r": float(corr),
+            "pearson_p": float(p_val),
+        }
+
+    return results
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1751,7 +1993,8 @@ def main():
         direction_type=DIRECTION_TYPE,
         metric=METRIC,
         meta_task=META_TASK,
-        model_dir=model_dir
+        model_dir=model_dir,
+        confdir_target=CONFDIR_TARGET if DIRECTION_TYPE == "confidence" else None,
     )
     available_methods = list(all_directions.keys())
 
@@ -1799,6 +2042,24 @@ def main():
     # Load transfer results for layer selection (non-final positions)
     transfer_data = load_transfer_results(base_name, META_TASK, model_dir)
 
+    # Load answer transfer results for layer selection (answer directions)
+    answer_transfer_data = None
+    answer_selected_layers = None
+    if DIRECTION_TYPE == "answer" and ANSWER_LAYER_SELECTION:
+        answer_transfer_data = load_answer_transfer_results(base_name, META_TASK, model_dir)
+        if answer_transfer_data is not None:
+            answer_selected_layers = get_layers_from_answer_transfer(
+                answer_transfer_data, ANSWER_D2D_THRESHOLD
+            )
+            if answer_selected_layers:
+                print(f"Answer layer selection: {len(answer_selected_layers)} layers with D2D >= {ANSWER_D2D_THRESHOLD}")
+                print(f"  Layers: {answer_selected_layers[0]}-{answer_selected_layers[-1]}")
+            else:
+                print(f"Warning: No layers meet D2D >= {ANSWER_D2D_THRESHOLD}, using all layers")
+                answer_selected_layers = None  # Reset so fallback to all_available_layers kicks in
+        else:
+            print("Warning: Answer transfer results not found, using all layers")
+
     # Determine base layers (all available)
     all_available_layers = sorted(all_directions[methods[0]].keys())
 
@@ -1828,6 +2089,9 @@ def main():
             if LAYERS is not None:
                 # Explicit override applies to all positions/methods
                 method_layers = LAYERS
+            elif answer_selected_layers is not None:
+                # Answer direction: use layers with significant D2D accuracy
+                method_layers = answer_selected_layers
             elif position == "final":
                 # Final position: use all layers
                 method_layers = all_available_layers
@@ -1942,6 +2206,9 @@ def main():
                 load_in_8bit=LOAD_IN_8BIT,
                 method=method,
                 positions_tested=PROBE_POSITIONS,
+                answer_layer_selection=ANSWER_LAYER_SELECTION if DIRECTION_TYPE == "answer" else None,
+                answer_d2d_threshold=ANSWER_D2D_THRESHOLD if DIRECTION_TYPE == "answer" and ANSWER_LAYER_SELECTION else None,
+                answer_layers_selected=answer_selected_layers,
             ),
             "by_position": {},
         }
@@ -1972,6 +2239,88 @@ def main():
             json.dump(output_json, f, indent=2)
         print(f"  Saved {results_path.name}")
         output_files.append(results_path)
+
+    # --- Mediation Test (Test C) ---
+    # Only run when MEASURE_MEDIATION=True and DIRECTION_TYPE="answer"
+    if MEASURE_MEDIATION and DIRECTION_TYPE == "answer":
+        print("\n" + "="*60)
+        print("MEDIATION TEST: MC_Answer → d_delegate")
+        print("="*60)
+
+        # Load confdir (d_delegate) directions
+        try:
+            confdir_directions = load_directions(
+                direction_base,
+                direction_type="confidence",
+                metric=METRIC,
+                meta_task=META_TASK,
+                model_dir=model_dir,
+                confdir_target=CONFDIR_TARGET,
+            )
+            # Use probe method from confdir (or mean_diff if available)
+            confdir_method = "probe" if "probe" in confdir_directions else list(confdir_directions.keys())[0]
+            confdir_dirs = confdir_directions[confdir_method]
+
+            # Use mean_diff from mc_answer directions (or first available method)
+            answer_method = "centroid" if "centroid" in all_directions else list(all_directions.keys())[0]
+            answer_dirs = all_directions[answer_method]
+
+            # Run mediation test on layers where we have both directions
+            mediation_layers = sorted(set(answer_dirs.keys()) & set(confdir_dirs.keys()))
+            if LAYERS is not None:
+                mediation_layers = [l for l in mediation_layers if l in LAYERS]
+
+            print(f"  Testing {len(mediation_layers)} layers with {answer_method} (answer) → {confdir_method} (confdir)")
+
+            mediation_results = run_mediation_test(
+                model=model,
+                tokenizer=tokenizer,
+                questions=questions,
+                mc_answer_directions=answer_dirs,
+                confdir_directions=confdir_dirs,
+                meta_task=META_TASK,
+                use_chat_template=use_chat_template,
+                layers=mediation_layers,
+                original_indices=original_indices,
+            )
+
+            # Save mediation results
+            mediation_path = get_output_path(
+                f"{base_name}_mediation_answer_to_confdir_{CONFDIR_TARGET}_results.json",
+                model_dir=model_dir
+            )
+            mediation_output = {
+                "config": get_config_dict(
+                    model=MODEL,
+                    dataset=base_name,
+                    model_dir=model_dir,
+                    answer_method=answer_method,
+                    confdir_method=confdir_method,
+                    confdir_target=CONFDIR_TARGET,
+                    meta_task=META_TASK,
+                    num_questions=len(questions),
+                    seed=SEED,
+                    load_in_4bit=LOAD_IN_4BIT,
+                    load_in_8bit=LOAD_IN_8BIT,
+                ),
+                "layers": mediation_results["layers"],
+                "per_layer": mediation_results["per_layer"],
+            }
+            with open(mediation_path, "w") as f:
+                json.dump(mediation_output, f, indent=2)
+            print(f"  Saved {mediation_path.name}")
+            output_files.append(mediation_path)
+
+            # Print summary
+            for layer in mediation_results["layers"]:
+                if layer in mediation_results["per_layer"]:
+                    lr = mediation_results["per_layer"][layer]
+                    print(f"    Layer {layer}: Δproj = {lr['delta_mean']:.4f} ± {lr['delta_std']:.4f}, "
+                          f"r(baseline,ablated) = {lr['pearson_r']:.3f}")
+
+        except FileNotFoundError as e:
+            print(f"  Skipping mediation test: {e}")
+            print("  (Run test_meta_transfer.py with FIND_CONFIDENCE_DIRECTIONS=True first)")
 
     # Generate plots - one per method per position
     print("\nGenerating plots...")
