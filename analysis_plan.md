@@ -722,4 +722,49 @@
  | Token positions            | test_meta_transfer.py            | PROBE_POSITIONS         | Per-position results                      |
  | Cross-direction causality  | run_cross_direction_causality.py | DIRECTION_TYPES         | Effect matrix                             |
  | d_answer confidence        | core/answer_directions.py + new  | Extract softmax entropy | Correlation analysis                      |
+
+---
+Empirical Finding: Orthogonal Uncertainty Direction Analysis
+
+Script: analyze_uncertainty_direction_orthogonalization.py
+
+This analysis tests whether d_mcuncert (the MCQ-trained uncertainty direction, representing "pure" internal difficulty) contains different information than d_metamcuncert (trained on meta-task activations to predict MCQ uncertainty).
+
+Method:
+- Orthogonalize each direction against the other
+- Test how well each orthogonal component predicts meta-task outputs
+- Compare unique contributions across delegate, confidence, and other_confidence tasks
+
+Results (Llama-3.3-70B, TriviaMC_difficulty_filtered, logit_gap metric):
+
+| Task             | Output        | d_mcuncert R² | d_metamcuncert R² | d_mc⊥metamc R² | d_metamc⊥mc R² | Unique mc | Unique metamc |
+|------------------|---------------|---------------|-------------------|----------------|----------------|-----------|---------------|
+| delegate         | logit_margins | 0.255         | 0.203             | 0.096          | 0.196          | 0.079     | 0.027         |
+| confidence       | confidences   | 0.125         | 0.223             | 0.172          | 0.249          | 0.102     | 0.200         |
+| other_confidence | confidences   | 0.230         | 0.466             | 0.062          | 0.450          | 0.038     | 0.273         |
+
+Key observations:
+
+1. Delegate task: d_mcuncert outperforms d_metamcuncert (0.255 vs 0.203), and d_mcuncert has more unique contribution (0.079 vs 0.027). The "pure" MCQ uncertainty direction captures most of what's needed for predicting delegation behavior.
+
+2. Confidence task: d_metamcuncert outperforms d_mcuncert (0.223 vs 0.125). Remarkably, d_metamcuncert⊥d_mcuncert is MORE predictive (R²=0.249) than raw d_metamcuncert. This means the component of d_metamcuncert that's orthogonal to the pure uncertainty signal is highly predictive of stated confidence.
+
+3. Other_confidence task: d_metamcuncert dominates (0.466 vs 0.230). The orthogonal component d_metamcuncert⊥d_mcuncert retains nearly all predictive power (R²=0.450 vs 0.466). d_mcuncert⊥d_metamcuncert is very weak (0.062). Almost everything useful for predicting other-confidence is in the part of d_metamcuncert that's orthogonal to d_mcuncert.
+
+Cross-task pattern:
+- Strongest unique signal in d_metamcuncert beyond d_mcuncert: other_confidence (0.273) > confidence (0.200) > delegate (0.027)
+- Strongest unique signal in d_mcuncert beyond d_metamcuncert: confidence (0.102) > delegate (0.079) > other_confidence (0.038)
+
+Interpretation:
+
+This supports a nuanced version of the transfer vs re-computation hypothesis:
+
+1. Delegation behavior aligns with "pure" internal uncertainty (d_mcuncert wins). When the model decides whether to delegate, it primarily uses the uncertainty representation that transfers from the MCQ task. This suggests delegation is driven by genuine introspection about competence.
+
+2. Confidence outputs depend heavily on something beyond MCQ uncertainty (d_metamcuncert⊥d_mcuncert wins for confidence/other_confidence). The stated confidence is driven by factors that d_metamcuncert captures but d_mcuncert doesn't—possibly surface cues, task-specific representations, or calibration signals not present in the original MCQ uncertainty encoding.
+
+3. The asymmetry is striking: for other_confidence (estimating human difficulty), nearly ALL the predictive signal is in the orthogonal component. This suggests the model's representation of "how hard is this for humans" is almost entirely separate from "how uncertain am I about the answer."
+
+This finding connects to the introspection vs surface features question: delegation may reflect true introspection (accessing internal uncertainty state), while stated confidence may rely more on learned correlates of difficulty that d_metamcuncert picks up during the meta-task.
+
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌

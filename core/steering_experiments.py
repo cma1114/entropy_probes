@@ -287,26 +287,41 @@ class BatchAblationHook:
         hs = output[0] if isinstance(output, tuple) else output
         dirs = self.directions_bh.to(device=hs.device, dtype=hs.dtype)
 
+        def project_out(vectors: torch.Tensor, directions: torch.Tensor) -> torch.Tensor:
+            """Project vectors out of either a single direction or an orthonormal basis."""
+            if directions.dim() == 2:
+                dots = torch.einsum('bh,bh->b', vectors, directions)
+                proj = dots.unsqueeze(-1) * directions
+                return vectors - proj
+            if directions.dim() == 3:
+                coeffs = torch.einsum('bh,bkh->bk', vectors, directions)
+                proj = torch.einsum('bk,bkh->bh', coeffs, directions)
+                return vectors - proj
+            raise ValueError(f"Unsupported ablation direction shape: {tuple(directions.shape)}")
+
         if self.intervention_position == "last":
             hs = hs.clone()
             last_token = hs[:, -1, :]
-            dots = torch.einsum('bh,bh->b', last_token, dirs)
-            proj = dots.unsqueeze(-1) * dirs
-            hs[:, -1, :] = last_token - proj
+            hs[:, -1, :] = project_out(last_token, dirs)
         elif self.intervention_position == "indexed" and self.position_indices is not None:
             # Per-example position indices
             hs = hs.clone()
             batch_indices = torch.arange(hs.shape[0], device=hs.device)
             pos_indices = self.position_indices.to(device=hs.device)
             target_tokens = hs[batch_indices, pos_indices, :]  # (batch, hidden)
-            dots = torch.einsum('bh,bh->b', target_tokens, dirs)
-            proj = dots.unsqueeze(-1) * dirs
-            hs[batch_indices, pos_indices, :] = target_tokens - proj
+            hs[batch_indices, pos_indices, :] = project_out(target_tokens, dirs)
         else:
             # "all" positions
-            dots = torch.einsum('bsh,bh->bs', hs, dirs)
-            proj = dots.unsqueeze(-1) * dirs.unsqueeze(1)
-            hs = hs - proj
+            if dirs.dim() == 2:
+                dots = torch.einsum('bsh,bh->bs', hs, dirs)
+                proj = dots.unsqueeze(-1) * dirs.unsqueeze(1)
+                hs = hs - proj
+            elif dirs.dim() == 3:
+                coeffs = torch.einsum('bsh,bkh->bsk', hs, dirs)
+                proj = torch.einsum('bsk,bkh->bsh', coeffs, dirs)
+                hs = hs - proj
+            else:
+                raise ValueError(f"Unsupported ablation direction shape: {tuple(dirs.shape)}")
 
         if isinstance(output, tuple):
             return (hs,) + output[1:]
